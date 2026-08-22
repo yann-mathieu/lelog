@@ -1,0 +1,704 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<title>Log</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  :root {
+    --bg: #0f1115;
+    --surface: #171a21;
+    --surface-2: #1d212a;
+    --border: #262b36;
+    --text: #e6e8ec;
+    --muted: #8b93a3;
+    --faint: #5c6473;
+    --accent: #8b9df2;
+    --accent-dim: #3a4372;
+    --danger: #e07a7a;
+    --ok: #7fd1a6;
+    --radius: 14px;
+  }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 16px; line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    overscroll-behavior-y: contain;
+  }
+  body { padding-bottom: env(safe-area-inset-bottom); }
+  #app { max-width: 720px; margin: 0 auto; padding: 0 16px 96px; }
+
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 0 14px; position: sticky; top: 0; z-index: 20;
+    background: linear-gradient(var(--bg) 76%, transparent);
+    padding-top: calc(18px + env(safe-area-inset-top));
+  }
+  .brand { display: flex; align-items: baseline; gap: 10px; }
+  .brand h1 { font-size: 19px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+  .brand .count { font-size: 13px; color: var(--faint); font-variant-numeric: tabular-nums; }
+  .iconbtn {
+    background: none; border: 1px solid var(--border); color: var(--muted);
+    width: 38px; height: 38px; border-radius: 10px; cursor: pointer;
+    display: grid; place-items: center; padding: 0; flex: none;
+  }
+  .iconbtn:active { background: var(--surface-2); }
+  .iconbtn svg { width: 18px; height: 18px; }
+
+  /* Capture */
+  .capture {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 4px; margin-bottom: 18px;
+    transition: border-color .15s;
+  }
+  .capture:focus-within { border-color: var(--accent-dim); }
+  .capture textarea {
+    width: 100%; background: none; border: none; color: var(--text);
+    font: inherit; resize: none; padding: 14px 14px 6px; outline: none;
+    min-height: 84px; line-height: 1.55;
+  }
+  .capture textarea::placeholder { color: var(--faint); }
+  .capture-bar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 4px 10px 8px; gap: 10px;
+  }
+  .hint { font-size: 12px; color: var(--faint); }
+  .btn {
+    background: var(--accent); color: #10131c; border: none;
+    padding: 9px 20px; border-radius: 9px; font: inherit; font-weight: 600;
+    font-size: 15px; cursor: pointer; flex: none;
+  }
+  .btn:disabled { background: var(--surface-2); color: var(--faint); cursor: default; }
+  .btn.ghost { background: none; border: 1px solid var(--border); color: var(--muted); font-weight: 500; }
+  .btn.ghost:active { background: var(--surface-2); }
+
+  /* Search */
+  .search { position: relative; margin-bottom: 14px; }
+  .search input {
+    width: 100%; background: var(--surface); border: 1px solid var(--border);
+    color: var(--text); font: inherit; font-size: 15px;
+    padding: 10px 36px 10px 38px; border-radius: 11px; outline: none;
+  }
+  .search input:focus { border-color: var(--accent-dim); }
+  .search input::placeholder { color: var(--faint); }
+  .search .mag {
+    position: absolute; left: 13px; top: 50%; transform: translateY(-50%);
+    width: 16px; height: 16px; color: var(--faint); pointer-events: none;
+  }
+  .search .clear {
+    position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+    background: none; border: none; color: var(--faint); cursor: pointer;
+    padding: 6px; line-height: 0; display: none;
+  }
+
+  /* Entries */
+  .daygroup { margin-top: 22px; }
+  .daylabel {
+    font-size: 12px; font-weight: 600; color: var(--faint);
+    text-transform: uppercase; letter-spacing: .07em; margin: 0 0 8px 2px;
+  }
+  .entry {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 13px 15px; margin-bottom: 9px;
+    cursor: pointer; word-break: break-word;
+  }
+  .entry:active { background: var(--surface-2); }
+  .entry .raw { white-space: pre-wrap; }
+  .entry .meta {
+    font-size: 12px; color: var(--faint); margin-top: 7px;
+    display: flex; gap: 9px; align-items: center;
+  }
+  .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent-dim); flex: none; }
+  .entry mark { background: var(--accent-dim); color: var(--text); border-radius: 3px; padding: 0 2px; }
+  .entry.editing { border-color: var(--accent-dim); background: var(--surface-2); }
+  .entry textarea {
+    width: 100%; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 9px; color: var(--text); font: inherit; resize: vertical;
+    padding: 11px; outline: none; min-height: 90px;
+  }
+  .entry-actions { display: flex; gap: 8px; margin-top: 10px; }
+  .entry-actions .btn { padding: 7px 15px; font-size: 14px; }
+  .linkbtn {
+    background: none; border: none; color: var(--danger); font: inherit;
+    font-size: 14px; cursor: pointer; padding: 7px 6px; margin-left: auto;
+  }
+
+  .empty { text-align: center; color: var(--faint); padding: 54px 20px; font-size: 15px; line-height: 1.7; }
+
+  /* Banner */
+  .banner {
+    background: var(--surface-2); border: 1px solid var(--accent-dim);
+    border-radius: 11px; padding: 12px 14px; margin-bottom: 16px;
+    font-size: 14px; color: var(--muted); display: flex; gap: 12px; align-items: center;
+  }
+  .banner .btn { padding: 6px 13px; font-size: 13px; margin-left: auto; }
+
+  /* Sheet */
+  .scrim {
+    position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 40;
+    display: none; backdrop-filter: blur(2px);
+  }
+  .scrim.open { display: block; }
+  .sheet {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
+    background: var(--surface); border-top: 1px solid var(--border);
+    border-radius: 20px 20px 0 0; padding: 8px 18px calc(26px + env(safe-area-inset-bottom));
+    transform: translateY(100%); transition: transform .22s cubic-bezier(.2,.7,.3,1);
+    max-height: 86vh; overflow-y: auto; max-width: 720px; margin: 0 auto;
+  }
+  .sheet.open { transform: translateY(0); }
+  .grabber { width: 36px; height: 4px; background: var(--border); border-radius: 2px; margin: 6px auto 16px; }
+  .sheet-close {
+    position: absolute; top: 14px; right: 14px;
+    background: var(--surface-2); border: 1px solid var(--border); color: var(--muted);
+    width: 34px; height: 34px; border-radius: 50%; cursor: pointer;
+    display: grid; place-items: center; padding: 0;
+  }
+  .sheet-close:active { background: var(--border); }
+  .sheet h2 { font-size: 16px; margin: 0 0 4px; font-weight: 600; }
+  .sheet section { padding: 15px 0; border-bottom: 1px solid var(--border); }
+  .sheet section:last-of-type { border-bottom: none; }
+  .sheet p { font-size: 13.5px; color: var(--muted); margin: 5px 0 11px; line-height: 1.6; }
+  .row { display: flex; gap: 9px; flex-wrap: wrap; }
+  .stat { display: flex; justify-content: space-between; font-size: 14px; padding: 5px 0; color: var(--muted); }
+  .stat b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .pill { font-size: 12px; padding: 2px 9px; border-radius: 20px; font-weight: 600; }
+  .pill.on { background: rgba(127,209,166,.14); color: var(--ok); }
+  .pill.off { background: rgba(224,122,122,.14); color: var(--danger); }
+
+  .toast {
+    position: fixed; bottom: 26px; left: 50%; transform: translate(-50%, 90px);
+    background: var(--surface-2); border: 1px solid var(--border); color: var(--text);
+    padding: 11px 20px; border-radius: 30px; font-size: 14px; z-index: 60;
+    transition: transform .25s cubic-bezier(.2,.7,.3,1); box-shadow: 0 8px 30px rgba(0,0,0,.4);
+  }
+  .toast.show { transform: translate(-50%, 0); }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="brand">
+      <h1>Log</h1>
+      <span class="count" id="count"></span>
+    </div>
+    <button class="iconbtn" id="settingsBtn" aria-label="Settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+        <circle cx="12" cy="12" r="3"/>
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.14.34.4.62.73.79H21a2 2 0 1 1 0 4h-.09c-.36.02-.7.16-.96.4z"/>
+      </svg>
+    </button>
+  </header>
+
+  <div id="backupBanner"></div>
+
+  <div class="capture">
+    <textarea id="input" rows="3" placeholder="What do you want to remember?" autocapitalize="sentences" enterkeyhint="enter"></textarea>
+    <div class="capture-bar">
+      <span class="hint" id="hint"></span>
+      <button class="btn" id="saveBtn" disabled>Save</button>
+    </div>
+  </div>
+
+  <div class="search">
+    <svg class="mag" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+      <circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>
+    </svg>
+    <input id="search" type="search" placeholder="Search everything" autocomplete="off">
+    <button class="clear" id="clearSearch" aria-label="Clear">
+      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+    </button>
+  </div>
+
+  <div id="list"></div>
+</div>
+
+<div class="scrim" id="scrim"></div>
+<div class="sheet" id="sheet">
+  <div class="grabber"></div>
+  <button class="sheet-close" id="closeSheetBtn" aria-label="Close">
+    <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+  </button>
+
+  <section>
+    <h2>Your data</h2>
+    <p>Everything lives on this phone only. Nothing is uploaded anywhere. That also means <strong>this device is the only copy</strong> — export regularly until sync exists.</p>
+    <div class="row">
+      <button class="btn" id="exportBtn">Export backup</button>
+      <button class="btn ghost" id="importBtn">Import</button>
+      <input type="file" id="fileInput" accept="application/json,.json" hidden>
+    </div>
+  </section>
+
+  <section>
+    <h2>Storage</h2>
+    <div class="stat"><span>Entries</span><b id="sEntries">0</b></div>
+    <div class="stat"><span>First entry</span><b id="sFirst">—</b></div>
+    <div class="stat"><span>Last backup</span><b id="sBackup">Never</b></div>
+    <div class="stat"><span>Persistent storage</span><span id="sPersist" class="pill off">Unknown</span></div>
+    <p id="persistNote" style="margin-bottom:0"></p>
+  </section>
+
+  <section>
+    <h2>Danger zone</h2>
+    <p>Deletes every entry on this device. Export first — this cannot be undone.</p>
+    <button class="btn ghost" id="wipeBtn" style="color:var(--danger);border-color:#4a2a2a">Delete everything</button>
+  </section>
+
+  <section>
+    <p style="margin:0;color:var(--faint);font-size:12.5px">v0.1 — capture, search, export. No AI, no sync, no accounts. Entries are stored in the schema the full app expects, so nothing here needs migrating later.</p>
+  </section>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ---------- storage ----------
+  var DB_NAME = 'memvault', STORE = 'memories', DB_VERSION = 1;
+  var db = null;
+
+  function openDB() {
+    return new Promise(function (resolve, reject) {
+      var req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = function (e) {
+        var d = e.target.result;
+        if (!d.objectStoreNames.contains(STORE)) {
+          var s = d.createObjectStore(STORE, { keyPath: 'id' });
+          s.createIndex('capturedAt', 'capturedAt');
+        }
+      };
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error); };
+    });
+  }
+
+  function tx(mode) { return db.transaction(STORE, mode).objectStore(STORE); }
+
+  function put(rec) {
+    return new Promise(function (resolve, reject) {
+      var r = tx('readwrite').put(rec);
+      r.onsuccess = function () { resolve(rec); };
+      r.onerror = function () { reject(r.error); };
+    });
+  }
+
+  function getAll() {
+    return new Promise(function (resolve, reject) {
+      var r = tx('readonly').getAll();
+      r.onsuccess = function () { resolve(r.result || []); };
+      r.onerror = function () { reject(r.error); };
+    });
+  }
+
+  function clearAll() {
+    return new Promise(function (resolve, reject) {
+      var r = tx('readwrite').clear();
+      r.onsuccess = function () { resolve(); };
+      r.onerror = function () { reject(r.error); };
+    });
+  }
+
+  // ---------- ids ----------
+  var B32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
+  function ulid() {
+    var t = Date.now(), ts = '';
+    for (var i = 9; i >= 0; i--) { ts = B32[t % 32] + ts; t = Math.floor(t / 32); }
+    var rnd = '', bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    for (var j = 0; j < 16; j++) rnd += B32[bytes[j] % 32];
+    return 'mem_' + ts + rnd;
+  }
+
+  // ---------- model ----------
+  // Deliberately matches the full architecture's schema so v0 data never needs migrating.
+  function newRecord(raw) {
+    var now = new Date().toISOString();
+    return {
+      id: ulid(),
+      schemaVersion: 2,
+      raw: raw,
+      capturedAt: now,
+      captureSource: 'text',
+      enrichment: { status: 'pending', model: null, at: null, confidence: null },
+      type: null, title: null, occurredAt: null,
+      tags: [], rating: null, details: {}, links: [],
+      userEdited: [], media: [],
+      createdAt: now, updatedAt: now, deleted: false
+    };
+  }
+
+  // ---------- state ----------
+  var all = [], query = '', editingId = null;
+
+  var $ = function (id) { return document.getElementById(id); };
+  var input = $('input'), saveBtn = $('saveBtn'), listEl = $('list'),
+      searchEl = $('search'), countEl = $('count'), hintEl = $('hint');
+
+  // ---------- helpers ----------
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function highlight(text, q) {
+    var safe = esc(text);
+    if (!q) return safe;
+    var terms = q.trim().split(/\s+/).filter(Boolean)
+      .map(function (t) { return t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); });
+    if (!terms.length) return safe;
+    return safe.replace(new RegExp('(' + terms.join('|') + ')', 'gi'), '<mark>$1</mark>');
+  }
+
+  function dayKey(iso) { return new Date(iso).toDateString(); }
+
+  function dayLabel(iso) {
+    var d = new Date(iso), now = new Date();
+    var startOf = function (x) { return new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime(); };
+    var diff = Math.round((startOf(now) - startOf(d)) / 86400000);
+    if (diff === 0) return 'Today';
+    if (diff === 1) return 'Yesterday';
+    if (diff < 7) return d.toLocaleDateString(undefined, { weekday: 'long' });
+    var opts = { day: 'numeric', month: 'long' };
+    if (d.getFullYear() !== now.getFullYear()) opts.year = 'numeric';
+    return d.toLocaleDateString(undefined, opts);
+  }
+
+  function timeLabel(iso) {
+    return new Date(iso).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  }
+
+  var toastTimer = null;
+  function toast(msg) {
+    var t = $('toast');
+    t.textContent = msg;
+    t.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { t.classList.remove('show'); }, 2600);
+  }
+
+  // ---------- rendering ----------
+  function visible() {
+    var live = all.filter(function (r) { return !r.deleted; });
+    if (query.trim()) {
+      var terms = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
+      live = live.filter(function (r) {
+        var hay = r.raw.toLowerCase();
+        return terms.every(function (t) { return hay.indexOf(t) !== -1; });
+      });
+    }
+    return live.sort(function (a, b) { return b.capturedAt.localeCompare(a.capturedAt); });
+  }
+
+  function render() {
+    var rows = visible();
+    var total = all.filter(function (r) { return !r.deleted; }).length;
+    countEl.textContent = total ? total + (total === 1 ? ' entry' : ' entries') : '';
+
+    if (!rows.length) {
+      listEl.innerHTML = '<div class="empty">' + (query.trim()
+        ? 'Nothing matches “' + esc(query.trim()) + '”.'
+        : total ? 'No entries.' : 'Nothing logged yet.<br>Write a line above — a book, a meal,<br>someone you met.<br><br><span style="color:var(--faint);font-size:13px">One sentence is plenty.</span>') + '</div>';
+      return;
+    }
+
+    var html = '', lastDay = null;
+    rows.forEach(function (r) {
+      var k = dayKey(r.capturedAt);
+      if (k !== lastDay) {
+        if (lastDay !== null) html += '</div>';
+        html += '<div class="daygroup"><div class="daylabel">' + esc(dayLabel(r.capturedAt)) + '</div>';
+        lastDay = k;
+      }
+      if (r.id === editingId) {
+        html += '<div class="entry editing" data-id="' + r.id + '">' +
+          '<textarea class="edit-area">' + esc(r.raw) + '</textarea>' +
+          '<div class="entry-actions">' +
+            '<button class="btn act-save">Save</button>' +
+            '<button class="btn ghost act-cancel">Cancel</button>' +
+            '<button class="linkbtn act-delete">Delete</button>' +
+          '</div></div>';
+      } else {
+        html += '<div class="entry" data-id="' + r.id + '">' +
+          '<div class="raw">' + highlight(r.raw, query) + '</div>' +
+          '<div class="meta"><span>' + timeLabel(r.capturedAt) + '</span></div></div>';
+      }
+    });
+    if (lastDay !== null) html += '</div>';
+    listEl.innerHTML = html;
+
+    var ta = listEl.querySelector('.edit-area');
+    if (ta) { ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); autosize(ta); }
+  }
+
+  function autosize(el) {
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 400) + 'px';
+  }
+
+  // ---------- actions ----------
+  function save() {
+    var raw = input.value.trim();
+    if (!raw) return;
+    var rec = newRecord(raw);
+    put(rec).then(function () {
+      all.push(rec);
+      input.value = '';
+      input.style.height = 'auto';
+      saveBtn.disabled = true;
+      hintEl.textContent = '';
+      render();
+      refreshStats();
+      maybeBanner();
+      toast('Saved');
+      input.focus();
+    }).catch(function (e) {
+      toast('Could not save — storage may be full');
+      console.error(e);
+    });
+  }
+
+  function commitEdit(id, text) {
+    var rec = all.find(function (r) { return r.id === id; });
+    if (!rec) return;
+    var t = text.trim();
+    if (!t) { editingId = null; render(); return; }
+    rec.raw = t;
+    rec.updatedAt = new Date().toISOString();
+    put(rec).then(function () { editingId = null; render(); toast('Updated'); });
+  }
+
+  function removeEntry(id) {
+    var rec = all.find(function (r) { return r.id === id; });
+    if (!rec) return;
+    rec.deleted = true;
+    rec.deletedAt = new Date().toISOString();
+    rec.updatedAt = rec.deletedAt;
+    put(rec).then(function () {
+      editingId = null; render(); refreshStats(); toast('Deleted');
+    });
+  }
+
+  // ---------- backup ----------
+  function exportBackup() {
+    var payload = {
+      app: 'memvault', schemaVersion: 2,
+      exportedAt: new Date().toISOString(),
+      count: all.length, memories: all
+    };
+    var blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    var d = new Date();
+    var pad = function (n) { return String(n).padStart(2, '0'); };
+    a.href = url;
+    a.download = 'log-backup-' + d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) + '.json';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+    localStorage.setItem('lastBackup', new Date().toISOString());
+    refreshStats(); maybeBanner();
+    toast('Backup downloaded');
+  }
+
+  function importBackup(file) {
+    var reader = new FileReader();
+    reader.onload = function () {
+      var data;
+      try { data = JSON.parse(reader.result); }
+      catch (e) { toast('Not a valid backup file'); return; }
+      var incoming = data && Array.isArray(data.memories) ? data.memories
+                   : Array.isArray(data) ? data : null;
+      if (!incoming) { toast('No entries found in that file'); return; }
+
+      var byId = {};
+      all.forEach(function (r) { byId[r.id] = r; });
+      var added = 0, updated = 0;
+      var writes = [];
+      incoming.forEach(function (r) {
+        if (!r || !r.id || typeof r.raw !== 'string') return;
+        var existing = byId[r.id];
+        if (!existing) { byId[r.id] = r; writes.push(put(r)); added++; }
+        else if ((r.updatedAt || '') > (existing.updatedAt || '')) {
+          byId[r.id] = r; writes.push(put(r)); updated++;
+        }
+      });
+      Promise.all(writes).then(function () {
+        all = Object.keys(byId).map(function (k) { return byId[k]; });
+        render(); refreshStats();
+        toast(added + ' added, ' + updated + ' updated');
+      });
+    };
+    reader.readAsText(file);
+  }
+
+  // ---------- stats & persistence ----------
+  function refreshStats() {
+    var live = all.filter(function (r) { return !r.deleted; });
+    $('sEntries').textContent = live.length;
+    if (live.length) {
+      var first = live.slice().sort(function (a, b) { return a.capturedAt.localeCompare(b.capturedAt); })[0];
+      $('sFirst').textContent = new Date(first.capturedAt).toLocaleDateString();
+    } else { $('sFirst').textContent = '—'; }
+    var lb = localStorage.getItem('lastBackup');
+    $('sBackup').textContent = lb ? new Date(lb).toLocaleDateString() : 'Never';
+  }
+
+  function checkPersistence() {
+    var el = $('sPersist'), note = $('persistNote');
+    if (!navigator.storage || !navigator.storage.persist) {
+      el.textContent = 'Unsupported'; el.className = 'pill off';
+      note.textContent = 'This browser cannot guarantee storage. Export often.';
+      return;
+    }
+    navigator.storage.persisted().then(function (already) {
+      if (already) { mark(true); return; }
+      navigator.storage.persist().then(mark);
+    });
+    function mark(granted) {
+      el.textContent = granted ? 'Granted' : 'Not granted';
+      el.className = 'pill ' + (granted ? 'on' : 'off');
+      note.textContent = granted
+        ? 'Android will not evict your entries to reclaim space.'
+        : 'Android may clear this data under storage pressure. Installing the app to your home screen usually fixes this — until then, export often.';
+    }
+  }
+
+  function maybeBanner() {
+    var el = $('backupBanner');
+    var live = all.filter(function (r) { return !r.deleted; }).length;
+    var lb = localStorage.getItem('lastBackup');
+    var stale = !lb || (Date.now() - new Date(lb).getTime()) > 7 * 86400000;
+    if (live >= 15 && stale) {
+      el.innerHTML = '<div class="banner"><span>' +
+        (lb ? 'No backup in over a week.' : 'You have ' + live + ' entries and no backup yet.') +
+        '</span><button class="btn" id="bannerExport">Export</button></div>';
+      $('bannerExport').onclick = exportBackup;
+    } else { el.innerHTML = ''; }
+  }
+
+  // ---------- sheet ----------
+  var sheet = $('sheet'), scrim = $('scrim');
+
+  function hideSheet() { sheet.classList.remove('open'); scrim.classList.remove('open'); }
+
+  function openSheet() {
+    refreshStats();
+    sheet.classList.add('open');
+    scrim.classList.add('open');
+    // Push a history entry so Android's back button dismisses the sheet
+    // rather than leaving the app entirely.
+    history.pushState({ sheet: true }, '');
+  }
+
+  function closeSheet() {
+    if (history.state && history.state.sheet) history.back();
+    else hideSheet();
+  }
+
+  window.addEventListener('popstate', hideSheet);
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && sheet.classList.contains('open')) closeSheet();
+  });
+
+  $('settingsBtn').onclick = openSheet;
+  $('closeSheetBtn').onclick = closeSheet;
+  scrim.onclick = closeSheet;
+
+  // ---------- wiring ----------
+  input.addEventListener('input', function () {
+    autosize(input);
+    var n = input.value.trim().length;
+    saveBtn.disabled = n === 0;
+    hintEl.textContent = n > 0 ? n + ' characters' : '';
+  });
+
+  input.addEventListener('keydown', function (e) {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); save(); }
+  });
+
+  saveBtn.onclick = save;
+
+  searchEl.addEventListener('input', function () {
+    query = searchEl.value;
+    $('clearSearch').style.display = query ? 'block' : 'none';
+    render();
+  });
+  $('clearSearch').onclick = function () {
+    searchEl.value = ''; query = ''; this.style.display = 'none'; render(); searchEl.focus();
+  };
+
+  listEl.addEventListener('click', function (e) {
+    var entry = e.target.closest('.entry');
+    if (!entry) return;
+    var id = entry.getAttribute('data-id');
+
+    if (e.target.closest('.act-save')) {
+      commitEdit(id, entry.querySelector('.edit-area').value); return;
+    }
+    if (e.target.closest('.act-cancel')) { editingId = null; render(); return; }
+    if (e.target.closest('.act-delete')) {
+      if (confirm('Delete this entry?')) removeEntry(id);
+      return;
+    }
+    if (entry.classList.contains('editing')) return;
+    editingId = id;
+    render();
+  });
+
+  listEl.addEventListener('input', function (e) {
+    if (e.target.classList.contains('edit-area')) autosize(e.target);
+  });
+
+  $('exportBtn').onclick = exportBackup;
+  $('importBtn').onclick = function () { $('fileInput').click(); };
+  $('fileInput').onchange = function () {
+    if (this.files && this.files[0]) importBackup(this.files[0]);
+    this.value = '';
+  };
+  $('wipeBtn').onclick = function () {
+    var live = all.filter(function (r) { return !r.deleted; }).length;
+    if (!live) { toast('Nothing to delete'); return; }
+    var lb = localStorage.getItem('lastBackup');
+    var warn = 'Permanently delete all ' + live + ' entries?\n\n' +
+      (lb ? 'Last backup: ' + new Date(lb).toLocaleDateString() + '.'
+          : 'You have never exported a backup.') +
+      '\nThis cannot be undone.';
+    if (!confirm(warn)) return;
+    clearAll().then(function () {
+      all = []; editingId = null; render(); refreshStats(); maybeBanner(); closeSheet();
+      toast('Everything deleted');
+    });
+  };
+
+  // ---------- boot ----------
+  openDB().then(function (d) {
+    db = d;
+    return getAll();
+  }).then(function (rows) {
+    all = rows;
+    render(); refreshStats(); checkPersistence(); maybeBanner();
+    if (window.matchMedia('(min-width: 700px)').matches) input.focus();
+  }).catch(function (e) {
+    listEl.innerHTML = '<div class="empty">Storage unavailable in this browser.<br>The app needs IndexedDB over https.</div>';
+    console.error(e);
+  });
+
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', function () {
+      navigator.serviceWorker.register('sw.js').catch(function () {});
+    });
+  }
+})();
+</script>
+</body>
+</html>
