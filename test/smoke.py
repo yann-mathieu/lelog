@@ -499,6 +499,160 @@ def test_import_rejects_junk_without_losing_data(page, base_url, tmp_files):
 
 
 @test
+def test_sync_stores_exist_and_records_stay_clean(page, base_url):
+    """Sync bookkeeping gets its own stores, beside the records not inside them."""
+    boot(page, base_url)
+    capture(page, "a record that must not grow sync fields")
+
+    names = page.evaluate("""
+        () => new Promise((resolve, reject) => {
+            const req = indexedDB.open('memvault');
+            req.onsuccess = () => resolve(Array.from(req.result.objectStoreNames));
+            req.onerror = () => reject(req.error);
+        })
+    """)
+    assert set(names) == {"memories", "syncmeta", "syncstate"}, names
+
+    # The record itself is untouched by the new stores existing.
+    rec = records(page)[0]
+    assert set(rec) - V2_KEYS - OPTIONAL_KEYS == set()
+
+
+@test
+def test_upgrade_from_v1_preserves_entries(page, base_url):
+    """A v0 device upgrading to the sync build must not lose a single entry.
+
+    This is the one migration where a mistake is unrecoverable: until sync
+    works the phone is the only copy, so the upgrade is exercised directly
+    rather than trusted.
+    """
+    # Set up the old database from a same-origin page that is not the app, so
+    # no app connection is open to block the write. A 404 serves fine.
+    page.goto(base_url + "__origin__")
+
+    seeded = page.evaluate("""
+        () => new Promise((resolve, reject) => {
+            // Exactly the v0 shape: version 1, memories store only.
+            const req = indexedDB.open('memvault', 1);
+            req.onupgradeneeded = () => {
+                const s = req.result.createObjectStore('memories', { keyPath: 'id' });
+                s.createIndex('capturedAt', 'capturedAt');
+            };
+            req.onerror = () => reject(req.error);
+            req.onsuccess = () => {
+                const db = req.result;
+                const now = '2026-08-19T10:00:00.000Z';
+                const rec = {
+                    id: 'mem_LEGACYV1RECORD00000000000', schemaVersion: 2,
+                    raw: 'written before sync existed', capturedAt: now,
+                    captureSource: 'text',
+                    enrichment: { status: 'pending', model: null, at: null, confidence: null },
+                    type: null, title: null, occurredAt: null,
+                    tags: [], rating: null, details: {}, links: [],
+                    userEdited: [], media: [],
+                    createdAt: now, updatedAt: now, deleted: false
+                };
+                const w = db.transaction('memories', 'readwrite')
+                            .objectStore('memories').put(rec);
+                w.onsuccess = () => { db.close(); resolve(rec.id); };
+                w.onerror = () => reject(w.error);
+            };
+        })
+    """)
+    assert seeded == "mem_LEGACYV1RECORD00000000000"
+
+    # Now load the app, which opens at version 2 and triggers the upgrade.
+    boot(page, base_url)
+
+    assert texts(page) == ["written before sync existed"]
+
+    rows = records(page)
+    assert len(rows) == 1, "the upgrade lost the entry"
+    assert rows[0]["id"] == seeded
+    assert rows[0]["raw"] == "written before sync existed"
+    assert rows[0]["capturedAt"] == "2026-08-19T10:00:00.000Z"
+
+    version, names = page.evaluate("""
+        () => new Promise((resolve, reject) => {
+            const req = indexedDB.open('memvault');
+            req.onsuccess = () => resolve([
+                req.result.version, Array.from(req.result.objectStoreNames)
+            ]);
+            req.onerror = () => reject(req.error);
+        })
+    """)
+    assert version == 2, version
+    assert set(names) == {"memories", "syncmeta", "syncstate"}, names
+
+    # And the upgraded record still exports whole.
+    payload, _, _ = export_backup(page)
+    assert payload["memories"][0]["raw"] == "written before sync existed"
+    assert set(payload["memories"][0]) - V2_KEYS - OPTIONAL_KEYS == set()
+
+
+@test
+def test_wipe_clears_sync_bookkeeping(page, base_url):
+    """Wiping must reset the delta cursor, or Dropbox's copy never comes back.
+
+    Clearing records while keeping a cursor would make the next pull a no-op:
+    the remote files still exist but the delta reports no changes, so the data
+    would look permanently gone.
+    """
+    boot(page, base_url)
+    capture(page, "about to be wiped")
+
+    # Plant sync state the way a real sync would have.
+    page.evaluate("""
+        () => new Promise((resolve, reject) => {
+            const req = indexedDB.open('memvault');
+            req.onerror = () => reject(req.error);
+            req.onsuccess = () => {
+                const db = req.result;
+                const t = db.transaction(['syncmeta', 'syncstate'], 'readwrite');
+                t.objectStore('syncmeta').put({
+                    id: 'mem_SOMETHING', path: '/memories/2026/mem_SOMETHING.json',
+                    rev: '0123456789abcdef', syncedUpdatedAt: '2026-08-19T10:00:00.000Z'
+                });
+                t.objectStore('syncstate').put({ key: 'cursor', value: 'AAEjhg...' });
+                t.objectStore('syncstate').put({ key: 'auth', value: { refresh: 'keep-me' } });
+                t.oncomplete = () => resolve();
+                t.onerror = () => reject(t.error);
+            };
+        })
+    """)
+
+    open_sheet(page)
+    page.once("dialog", lambda d: d.accept())
+    page.click("#wipeBtn")
+    page.wait_for_function("() => document.querySelectorAll('.entry').length === 0")
+
+    left = page.evaluate("""
+        () => new Promise((resolve, reject) => {
+            const req = indexedDB.open('memvault');
+            req.onerror = () => reject(req.error);
+            req.onsuccess = () => {
+                const db = req.result;
+                const t = db.transaction(['memories', 'syncmeta', 'syncstate'], 'readonly');
+                const out = {};
+                const m = t.objectStore('memories').getAll();
+                const s = t.objectStore('syncmeta').getAll();
+                const c = t.objectStore('syncstate').get('cursor');
+                const a = t.objectStore('syncstate').get('auth');
+                t.oncomplete = () => resolve({
+                    memories: m.result.length, syncmeta: s.result.length,
+                    cursor: c.result || null, auth: a.result || null
+                });
+                t.onerror = () => reject(t.error);
+            };
+        })
+    """)
+    assert left["memories"] == 0
+    assert left["syncmeta"] == 0, "stale revs survived the wipe"
+    assert left["cursor"] is None, "the delta cursor survived the wipe"
+    assert left["auth"], "the wipe should not disconnect Dropbox"
+
+
+@test
 def test_service_worker_registers(page, base_url):
     boot(page, base_url)
 
@@ -536,8 +690,8 @@ def test_shell_assets_are_precached(page, base_url):
         }
     """, timeout=10000).json_value()
 
-    for asset in ["/index.html", "/manifest.webmanifest",
-                  "/icon-192.png", "/icon-512.png"]:
+    for asset in ["/index.html", "/manifest.webmanifest", "/icon-192.png",
+                  "/icon-512.png", "/icon-512-maskable.png"]:
         assert any(p.endswith(asset) for p in cached), \
             f"{asset} was not precached: {cached}"
 

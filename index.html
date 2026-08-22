@@ -264,7 +264,15 @@
   'use strict';
 
   // ---------- storage ----------
-  var DB_NAME = 'memvault', STORE = 'memories', DB_VERSION = 1;
+  var DB_NAME = 'memvault', STORE = 'memories', DB_VERSION = 2;
+
+  // Dropbox bookkeeping lives in its own stores, never inside a memory record.
+  // A record must serialise to exactly the v2 schema, because export is a
+  // straight dump of these objects and the backup file has to stay a faithful
+  // copy of the data — not the data plus whatever sync happens to need.
+  var SYNCMETA = 'syncmeta',    // id  -> { id, path, rev, syncedUpdatedAt }
+      SYNCSTATE = 'syncstate';  // key -> { key, value }  (cursor, tokens)
+
   var db = null;
 
   function openDB() {
@@ -276,36 +284,67 @@
           var s = d.createObjectStore(STORE, { keyPath: 'id' });
           s.createIndex('capturedAt', 'capturedAt');
         }
+        // v1 -> v2 is purely additive: the memories store is never opened,
+        // rewritten, or migrated, so an upgrade cannot lose an entry.
+        if (!d.objectStoreNames.contains(SYNCMETA)) {
+          d.createObjectStore(SYNCMETA, { keyPath: 'id' });
+        }
+        if (!d.objectStoreNames.contains(SYNCSTATE)) {
+          d.createObjectStore(SYNCSTATE, { keyPath: 'key' });
+        }
       };
       req.onsuccess = function () { resolve(req.result); };
       req.onerror = function () { reject(req.error); };
     });
   }
 
-  function tx(mode) { return db.transaction(STORE, mode).objectStore(STORE); }
+  function tx(mode, store) {
+    var name = store || STORE;
+    return db.transaction(name, mode).objectStore(name);
+  }
+
+  function idb(request) {
+    return new Promise(function (resolve, reject) {
+      request.onsuccess = function () { resolve(request.result); };
+      request.onerror = function () { reject(request.error); };
+    });
+  }
 
   function put(rec) {
-    return new Promise(function (resolve, reject) {
-      var r = tx('readwrite').put(rec);
-      r.onsuccess = function () { resolve(rec); };
-      r.onerror = function () { reject(r.error); };
-    });
+    return idb(tx('readwrite').put(rec)).then(function () { return rec; });
   }
 
   function getAll() {
-    return new Promise(function (resolve, reject) {
-      var r = tx('readonly').getAll();
-      r.onsuccess = function () { resolve(r.result || []); };
-      r.onerror = function () { reject(r.error); };
-    });
+    return idb(tx('readonly').getAll()).then(function (r) { return r || []; });
   }
 
   function clearAll() {
-    return new Promise(function (resolve, reject) {
-      var r = tx('readwrite').clear();
-      r.onsuccess = function () { resolve(); };
-      r.onerror = function () { reject(r.error); };
+    // Wiping the device must also reset the delta cursor. Clearing records
+    // while keeping the cursor would make the next pull a no-op, so Dropbox's
+    // copy would never come back down and the data would look permanently
+    // gone. Auth survives, so you stay connected.
+    return idb(tx('readwrite').clear())
+      .then(function () { return idb(tx('readwrite', SYNCMETA).clear()); })
+      .then(function () { return syncStateDelete('cursor'); });
+  }
+
+  // ---------- sync bookkeeping ----------
+  function syncMetaGet(id) { return idb(tx('readonly', SYNCMETA).get(id)); }
+  function syncMetaPut(m) { return idb(tx('readwrite', SYNCMETA).put(m)); }
+  function syncMetaAll() {
+    return idb(tx('readonly', SYNCMETA).getAll()).then(function (r) { return r || []; });
+  }
+
+  function syncStateGet(key) {
+    return idb(tx('readonly', SYNCSTATE).get(key)).then(function (row) {
+      return row ? row.value : null;
     });
+  }
+  function syncStateSet(key, value) {
+    return idb(tx('readwrite', SYNCSTATE).put({ key: key, value: value }));
+  }
+  function syncStateDelete(key) {
+    return idb(tx('readwrite', SYNCSTATE)['delete'](key));
   }
 
   // ---------- ids ----------
