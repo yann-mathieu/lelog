@@ -1,3 +1,4 @@
 lelogfiles.zip
 __pycache__/
 .venv/
+test/.tmp/
