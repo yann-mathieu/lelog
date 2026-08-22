@@ -20,7 +20,9 @@ Setup, once:
     python3 -m playwright install chromium
 """
 
+import base64
 import functools
+import hashlib
 import http.server
 import json
 import socket
@@ -28,6 +30,7 @@ import socketserver
 import sys
 import threading
 from pathlib import Path
+from urllib.parse import parse_qsl, urlparse
 
 try:
     from playwright.sync_api import sync_playwright
@@ -650,6 +653,286 @@ def test_wipe_clears_sync_bookkeeping(page, base_url):
     assert left["syncmeta"] == 0, "stale revs survived the wipe"
     assert left["cursor"] is None, "the delta cursor survived the wipe"
     assert left["auth"], "the wipe should not disconnect Dropbox"
+
+
+# ---------- dropbox oauth ----------
+#
+# The Dropbox endpoints are intercepted, so these run offline and never touch
+# a real account. The consent screen is faked by redirecting straight back to
+# the app with a code, which is exactly what Dropbox does after you approve.
+
+APP_KEY = "ajrhuiu0r1aexyx"
+
+
+def stub_dropbox(page, seen, *, token_status=200, token_body=None):
+    """Intercept the authorize redirect and the token endpoint."""
+
+    def on_authorize(route):
+        q = dict(parse_qsl(urlparse(route.request.url).query))
+        seen.append(("authorize", q))
+        back = f"{q.get('redirect_uri', '')}?code=test-auth-code"
+        if "state" in q:
+            back += "&state=" + q["state"]
+        route.fulfill(status=302, headers={"Location": back})
+
+    def on_token(route):
+        body = dict(parse_qsl(route.request.post_data or ""))
+        seen.append(("token", body))
+        if token_status != 200:
+            route.fulfill(status=token_status, body='{"error":"invalid_grant"}')
+            return
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(token_body or {
+                "access_token": "sl.short-lived-token",
+                "refresh_token": "refresh-token-abc",
+                "expires_in": 14400,
+                "token_type": "bearer",
+                "account_id": "dbid:TESTACCOUNT",
+                "scope": "files.content.read files.content.write files.metadata.read",
+            }),
+        )
+
+    page.route("https://www.dropbox.com/oauth2/authorize*", on_authorize)
+    page.route("https://api.dropboxapi.com/oauth2/token", on_token)
+
+
+def connect_dropbox(page, timeout=15000):
+    """Run the connect flow to completion.
+
+    Returns with the app freshly loaded and the settings sheet closed: the
+    Dropbox redirect is a real navigation, so coming back is a page load and
+    the sheet does not survive it. Callers that need settings reopen it.
+    """
+    open_sheet(page)
+    page.click("#connectBtn")
+    page.wait_for_function(
+        "() => document.querySelector('#disconnectBtn')"
+        "      && !document.querySelector('#disconnectBtn').hidden",
+        timeout=timeout,
+    )
+    assert not page.locator("#sheet").evaluate("el => el.classList.contains('open')"), \
+        "the sheet is expected to be closed after the redirect"
+
+
+def stored_auth(page):
+    return page.evaluate("""
+        () => new Promise((resolve, reject) => {
+            const req = indexedDB.open('memvault');
+            req.onerror = () => reject(req.error);
+            req.onsuccess = () => {
+                const r = req.result.transaction('syncstate', 'readonly')
+                          .objectStore('syncstate').get('auth');
+                r.onsuccess = () => resolve(r.result ? r.result.value : null);
+                r.onerror = () => reject(r.error);
+            };
+        })
+    """)
+
+
+@test
+def test_oauth_pkce_round_trip(page, base_url):
+    seen = []
+    stub_dropbox(page, seen)
+
+    boot(page, base_url)
+    open_sheet(page)
+    assert "Not connected" in page.inner_text("#syncNote")
+
+    page.click("#connectBtn")
+    # The redirect leaves and comes back to the app, which then exchanges.
+    page.wait_for_function(
+        "() => document.querySelector('#disconnectBtn')"
+        "      && !document.querySelector('#disconnectBtn').hidden",
+        timeout=15000,
+    )
+
+    kinds = [k for k, _ in seen]
+    assert kinds == ["authorize", "token"], kinds
+    authorize = seen[0][1]
+    token = seen[1][1]
+
+    # PKCE, public client: a challenge goes up front, no secret ever.
+    assert authorize["client_id"] == APP_KEY
+    assert authorize["response_type"] == "code"
+    assert authorize["code_challenge_method"] == "S256"
+    assert authorize["token_access_type"] == "offline", \
+        "without offline we get no refresh token and reauthorise every 4h"
+    assert authorize["state"]
+    assert authorize["redirect_uri"] == base_url
+    assert "client_secret" not in authorize
+
+    # The challenge really is S256 of the verifier that was later sent.
+    verifier = token["code_verifier"]
+    digest = hashlib.sha256(verifier.encode()).digest()
+    expected = base64.urlsafe_b64encode(digest).decode().rstrip("=")
+    assert authorize["code_challenge"] == expected, "code_challenge is not S256(verifier)"
+    assert 43 <= len(verifier) <= 128, f"verifier length {len(verifier)} out of spec"
+
+    assert token["grant_type"] == "authorization_code"
+    assert token["code"] == "test-auth-code"
+    assert token["client_id"] == APP_KEY
+    assert token["redirect_uri"] == base_url
+    assert "client_secret" not in token
+
+    # Tokens are persisted where sync will look for them.
+    saved = stored_auth(page)
+    assert saved["refreshToken"] == "refresh-token-abc"
+    assert saved["accessToken"] == "sl.short-lived-token"
+    assert saved["accountId"] == "dbid:TESTACCOUNT"
+    assert saved["expiresAt"] > 0
+
+    # The authorization code is scrubbed from the URL so a reload cannot
+    # replay it and it never lingers in history.
+    assert "code=" not in page.url
+    assert page.url.rstrip("/") == base_url.rstrip("/")
+
+    assert "Connected to Dropbox" in page.inner_text("#syncNote")
+
+
+@test
+def test_connection_survives_a_reload(page, base_url):
+    seen = []
+    stub_dropbox(page, seen)
+    boot(page, base_url)
+    connect_dropbox(page)
+
+    page.reload()
+    boot(page, base_url)
+    open_sheet(page)
+    page.wait_for_function(
+        "() => !document.querySelector('#disconnectBtn').hidden", timeout=10000
+    )
+    assert stored_auth(page)["refreshToken"] == "refresh-token-abc"
+    # No second trip to Dropbox just to know we are connected.
+    assert [k for k, _ in seen] == ["authorize", "token"]
+
+
+@test
+def test_oauth_rejects_a_mismatched_state(page, base_url):
+    """A code arriving with the wrong state is not ours — refuse to exchange it."""
+    seen = []
+    stub_dropbox(page, seen)
+    boot(page, base_url)
+    open_sheet(page)
+
+    # Start a real connect so a verifier is pending, then hand the app a code
+    # carrying a state we never issued.
+    page.evaluate("""
+        () => localStorage.setItem('dbxPending', JSON.stringify(
+            { verifier: 'a'.repeat(64), state: 'the-real-state', manual: false }))
+    """)
+    page.goto(base_url + "?code=attacker-code&state=some-other-state")
+    page.wait_for_selector("#toast.show")
+
+    assert "try again" in page.inner_text("#toast")
+    assert stored_auth(page) is None, "exchanged a code with a mismatched state"
+    assert not any(k == "token" for k, _ in seen), "token endpoint was called anyway"
+    # The pending verifier is burned either way, so it cannot be reused.
+    assert page.evaluate("() => localStorage.getItem('dbxPending')") is None
+
+
+@test
+def test_oauth_handles_a_declined_consent(page, base_url):
+    boot(page, base_url)
+    page.goto(base_url + "?error=access_denied&error_description=denied")
+    page.wait_for_selector("#toast.show")
+
+    assert "cancelled" in page.inner_text("#toast")
+    assert stored_auth(page) is None
+    assert "code=" not in page.url and "error=" not in page.url
+
+    open_sheet(page)
+    assert "Not connected" in page.inner_text("#syncNote")
+    assert page.locator("#connectBtn").is_visible()
+
+
+@test
+def test_disconnect_forgets_the_tokens(page, base_url):
+    seen = []
+    stub_dropbox(page, seen)
+    page.route(
+        "https://api.dropboxapi.com/2/auth/token/revoke",
+        lambda route: (seen.append(("revoke", {})), route.fulfill(status=200, body="{}")),
+    )
+
+    boot(page, base_url)
+    capture(page, "an entry that must survive disconnecting")
+    connect_dropbox(page)
+
+    open_sheet(page)
+    page.once("dialog", lambda d: d.accept())
+    page.click("#disconnectBtn")
+    page.wait_for_function("() => !document.querySelector('#connectBtn').hidden")
+
+    assert stored_auth(page) is None
+    assert any(k == "revoke" for k, _ in seen), "the token was not revoked upstream"
+    assert "Not connected" in page.inner_text("#syncNote")
+
+    # Disconnecting is not a delete.
+    close_sheet(page)
+    assert texts(page) == ["an entry that must survive disconnecting"]
+    assert len(records(page)) == 1
+
+
+@test
+def test_a_refused_token_exchange_leaves_the_app_usable(page, base_url):
+    seen = []
+    stub_dropbox(page, seen, token_status=400)
+
+    boot(page, base_url)
+    capture(page, "still here after a failed connect")
+    open_sheet(page)
+    page.click("#connectBtn")
+    page.wait_for_selector("#toast.show", timeout=15000)
+
+    assert "Could not connect" in page.inner_text("#toast")
+    assert stored_auth(page) is None
+    assert "Not connected" in page.inner_text("#syncNote")
+    assert page.locator("#connectBtn").is_hidden() is False
+
+    # The failure is confined to the sync section: entries and export are fine.
+    assert texts(page) == ["still here after a failed connect"]
+    payload, _, _ = export_backup(page)
+    assert payload["memories"][0]["raw"] == "still here after a failed connect"
+
+
+@test
+def test_connecting_does_not_change_the_export(page, base_url):
+    """Auth state must never leak into the backup file."""
+    seen = []
+    stub_dropbox(page, seen)
+
+    boot(page, base_url)
+    capture(page, "one")
+    capture(page, "two")
+
+    before, _, _ = export_backup(page)
+
+    connect_dropbox(page)
+
+    after, _, _ = export_backup(page)
+
+    assert after["memories"] == before["memories"], \
+        "connecting Dropbox changed the exported records"
+    assert set(after) == set(before), "connecting Dropbox changed the export envelope"
+    blob = json.dumps(after)
+    for secret in ["refresh-token-abc", "sl.short-lived-token", APP_KEY, "dbid:"]:
+        assert secret not in blob, f"{secret!r} leaked into the export"
+
+
+@test
+def test_capture_works_while_disconnected_and_offline(page, base_url):
+    """Invariant 4: capture never waits on the network."""
+    # Every Dropbox call fails, as it would on a plane.
+    page.route("https://www.dropbox.com/**", lambda r: r.abort())
+    page.route("https://api.dropboxapi.com/**", lambda r: r.abort())
+
+    boot(page, base_url)
+    capture(page, "written with no network at all")
+    assert texts(page) == ["written with no network at all"]
+    assert len(records(page)) == 1
 
 
 @test

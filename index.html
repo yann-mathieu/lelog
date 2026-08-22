@@ -238,6 +238,27 @@
   </section>
 
   <section>
+    <h2>Sync</h2>
+    <p id="syncNote">Not connected. Entries stay on this phone only.</p>
+    <div class="row">
+      <button class="btn" id="connectBtn">Connect Dropbox</button>
+      <button class="btn ghost" id="disconnectBtn" hidden>Disconnect</button>
+    </div>
+    <p id="manualHint" style="margin-bottom:0">
+      <button class="linkbtn" id="manualBtn"
+              style="color:var(--faint);margin:0;padding:8px 0">Trouble connecting? Paste a code instead</button>
+    </p>
+    <div id="manualBox" hidden>
+      <p>Approve the app in the tab that opened, then paste the code Dropbox shows you.</p>
+      <div class="row">
+        <input id="manualCode" type="text" placeholder="Paste code here" autocomplete="off"
+               style="flex:1;min-width:0;background:var(--bg);border:1px solid var(--border);color:var(--text);font:inherit;font-size:15px;padding:10px 12px;border-radius:11px;outline:none">
+        <button class="btn" id="manualFinish">Finish</button>
+      </div>
+    </div>
+  </section>
+
+  <section>
     <h2>Storage</h2>
     <div class="stat"><span>Entries</span><b id="sEntries">0</b></div>
     <div class="stat"><span>First entry</span><b id="sFirst">—</b></div>
@@ -345,6 +366,212 @@
   }
   function syncStateDelete(key) {
     return idb(tx('readwrite', SYNCSTATE)['delete'](key));
+  }
+
+  // ---------- dropbox auth ----------
+  // OAuth 2 with PKCE, the public-client flow. There is no client secret:
+  // anything in this file is readable by anyone who loads the page, so a
+  // secret could not be kept. The app key is public by design.
+  //
+  // The app is registered with App folder scope, so every path we ever send
+  // is relative to /Apps/<app>/ and the token is structurally incapable of
+  // reaching the rest of the Dropbox account.
+  var DBX_KEY = 'ajrhuiu0r1aexyx',
+      DBX_AUTH_URL = 'https://www.dropbox.com/oauth2/authorize',
+      DBX_TOKEN_URL = 'https://api.dropboxapi.com/oauth2/token',
+      DBX_REVOKE_URL = 'https://api.dropboxapi.com/2/auth/token/revoke',
+      PENDING = 'dbxPending';  // verifier + state, must survive the redirect
+
+  var auth = null;  // { refreshToken, accessToken, expiresAt, accountId }
+
+  function b64url(buf) {
+    var a = new Uint8Array(buf), s = '';
+    for (var i = 0; i < a.length; i++) s += String.fromCharCode(a[i]);
+    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+
+  function randomB64(bytes) {
+    return b64url(crypto.getRandomValues(new Uint8Array(bytes)));
+  }
+
+  function challengeFor(verifier) {
+    return crypto.subtle
+      .digest('SHA-256', new TextEncoder().encode(verifier))
+      .then(b64url);
+  }
+
+  // The directory the app is served from, which is what must be registered as
+  // the redirect URI. Works unchanged under /lelog/ on Pages and at the root
+  // of a local server.
+  function redirectUri() { return new URL('.', location.href).href; }
+
+  function form(obj) {
+    var p = new URLSearchParams();
+    Object.keys(obj).forEach(function (k) {
+      if (obj[k] !== null && obj[k] !== undefined) p.set(k, obj[k]);
+    });
+    return p;
+  }
+
+  function postForm(url, fields) {
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: form(fields)
+    }).then(function (res) {
+      if (res.ok) return res.json();
+      return res.text().then(function (t) {
+        var e = new Error(t || ('HTTP ' + res.status));
+        e.status = res.status;
+        e.body = t;
+        throw e;
+      });
+    });
+  }
+
+  function storeTokens(t) {
+    auth = {
+      // A refresh token only comes back on the first authorisation. On a
+      // refresh response the field is absent, so keep the one we have.
+      refreshToken: t.refresh_token || (auth && auth.refreshToken) || null,
+      accessToken: t.access_token || null,
+      expiresAt: Date.now() + ((t.expires_in || 14400) * 1000),
+      accountId: t.account_id || (auth && auth.accountId) || null
+    };
+    return syncStateSet('auth', auth).then(function () { return auth; });
+  }
+
+  function beginConnect(manual) {
+    var verifier = randomB64(64), state = randomB64(16);
+    return challengeFor(verifier).then(function (ch) {
+      localStorage.setItem(PENDING, JSON.stringify({
+        verifier: verifier, state: state, manual: !!manual
+      }));
+      var fields = {
+        client_id: DBX_KEY,
+        response_type: 'code',
+        code_challenge: ch,
+        code_challenge_method: 'S256',
+        // Without this we get a short-lived token and you would have to
+        // reauthorise every four hours.
+        token_access_type: 'offline'
+      };
+      if (manual) {
+        // No redirect_uri, so Dropbox shows a code to copy by hand. This is
+        // the escape hatch for an installed PWA, where the redirect can land
+        // in the browser rather than coming back to the app.
+        window.open(DBX_AUTH_URL + '?' + form(fields), '_blank', 'noopener');
+        return 'manual';
+      }
+      fields.redirect_uri = redirectUri();
+      fields.state = state;
+      location.href = DBX_AUTH_URL + '?' + form(fields);
+      return 'redirect';
+    });
+  }
+
+  function finishConnect(code, verifier, withRedirect) {
+    return postForm(DBX_TOKEN_URL, {
+      code: code,
+      grant_type: 'authorization_code',
+      client_id: DBX_KEY,
+      code_verifier: verifier,
+      redirect_uri: withRedirect ? redirectUri() : null
+    }).then(storeTokens);
+  }
+
+  // Every API call goes through here. Refreshes shortly before expiry rather
+  // than waiting for a 401, so a sync in progress does not have to retry.
+  function accessToken() {
+    if (!auth || !auth.refreshToken) {
+      return Promise.reject(new Error('Not connected to Dropbox'));
+    }
+    if (auth.accessToken && Date.now() < auth.expiresAt - 60000) {
+      return Promise.resolve(auth.accessToken);
+    }
+    return postForm(DBX_TOKEN_URL, {
+      grant_type: 'refresh_token',
+      refresh_token: auth.refreshToken,
+      client_id: DBX_KEY
+    }).then(storeTokens).then(function (a) {
+      return a.accessToken;
+    }).catch(function (e) {
+      // A revoked or expired refresh token is permanent: reconnecting is the
+      // only fix, so drop it rather than retrying forever.
+      if (e.status === 400 || e.status === 401) {
+        return forgetAuth().then(function () {
+          refreshSyncUI();
+          throw new Error('Dropbox disconnected — reconnect in settings');
+        });
+      }
+      throw e;
+    });
+  }
+
+  function forgetAuth() {
+    auth = null;
+    localStorage.removeItem(PENDING);
+    return syncStateDelete('auth');
+  }
+
+  function disconnect() {
+    var token = auth && auth.accessToken;
+    // Best effort: if revoking fails the local token is dropped anyway.
+    var revoked = token
+      ? fetch(DBX_REVOKE_URL, {
+          method: 'POST', headers: { Authorization: 'Bearer ' + token }
+        }).catch(function () {})
+      : Promise.resolve();
+    return revoked.then(forgetAuth).then(function () {
+      refreshSyncUI();
+      toast('Dropbox disconnected');
+    });
+  }
+
+  // Called on boot. Handles coming back from the Dropbox consent screen.
+  function handleAuthRedirect() {
+    var params = new URLSearchParams(location.search);
+    var code = params.get('code'), err = params.get('error');
+    if (!code && !err) return Promise.resolve(false);
+
+    // Scrub the URL before anything else, so a reload cannot replay the code
+    // and the authorisation code never sits in history.
+    history.replaceState({}, '', redirectUri());
+
+    var pending = null;
+    try { pending = JSON.parse(localStorage.getItem(PENDING) || 'null'); }
+    catch (e) { pending = null; }
+    localStorage.removeItem(PENDING);
+
+    if (err) {
+      toast(err === 'access_denied'
+        ? 'Dropbox connection cancelled'
+        : 'Dropbox refused the connection');
+      return Promise.resolve(false);
+    }
+    if (!pending || !pending.verifier) {
+      toast('Could not finish connecting — try again');
+      return Promise.resolve(false);
+    }
+    if (pending.state !== params.get('state')) {
+      // Mismatched state means this response did not come from the request we
+      // started. Refuse it rather than exchanging an attacker-supplied code.
+      toast('Could not finish connecting — try again');
+      return Promise.resolve(false);
+    }
+
+    return finishConnect(code, pending.verifier, true).then(function () {
+      toast('Dropbox connected');
+      return true;
+    }).catch(function (e) {
+      console.error(e);
+      toast('Could not connect to Dropbox');
+      return false;
+    });
+  }
+
+  function loadAuth() {
+    return syncStateGet('auth').then(function (a) { auth = a || null; return auth; });
   }
 
   // ---------- ids ----------
@@ -719,6 +946,61 @@
     });
   };
 
+  // ---------- sync ui ----------
+  function refreshSyncUI() {
+    var connected = !!(auth && auth.refreshToken);
+    $('connectBtn').hidden = connected;
+    $('disconnectBtn').hidden = !connected;
+    $('manualHint').hidden = connected;
+    if (connected) $('manualBox').hidden = true;
+    $('syncNote').textContent = connected
+      ? 'Connected to Dropbox. Nothing is uploaded yet — sync lands in the next update.'
+      : 'Not connected. Entries stay on this phone only.';
+  }
+
+  $('connectBtn').onclick = function () {
+    this.disabled = true;
+    beginConnect(false).catch(function (e) {
+      console.error(e);
+      toast('Could not reach Dropbox');
+      $('connectBtn').disabled = false;
+    });
+  };
+
+  $('manualBtn').onclick = function () {
+    $('manualBox').hidden = false;
+    beginConnect(true).catch(function (e) {
+      console.error(e);
+      toast('Could not reach Dropbox');
+    });
+  };
+
+  $('manualFinish').onclick = function () {
+    var code = $('manualCode').value.trim();
+    if (!code) return;
+    var pending = null;
+    try { pending = JSON.parse(localStorage.getItem(PENDING) || 'null'); }
+    catch (e) { pending = null; }
+    if (!pending || !pending.verifier) { toast('Start again from Connect'); return; }
+    this.disabled = true;
+    // No redirect_uri here: it must match the authorise request, which omitted it.
+    finishConnect(code, pending.verifier, false).then(function () {
+      localStorage.removeItem(PENDING);
+      $('manualCode').value = '';
+      $('manualBox').hidden = true;
+      refreshSyncUI();
+      toast('Dropbox connected');
+    }).catch(function (e) {
+      console.error(e);
+      toast('That code was not accepted');
+    }).then(function () { $('manualFinish').disabled = false; });
+  };
+
+  $('disconnectBtn').onclick = function () {
+    if (!confirm('Disconnect Dropbox?\n\nEntries stay on this phone.')) return;
+    disconnect();
+  };
+
   // ---------- boot ----------
   openDB().then(function (d) {
     db = d;
@@ -727,6 +1009,13 @@
     all = rows;
     render(); refreshStats(); checkPersistence(); maybeBanner();
     if (window.matchMedia('(min-width: 700px)').matches) input.focus();
+    // Auth work happens after the first render: capture must never wait on it.
+    // Kept off the boot chain's catch as well, so a Dropbox problem can never
+    // present itself as "storage unavailable" and hide the entries.
+    loadAuth().then(handleAuthRedirect).then(refreshSyncUI).catch(function (e) {
+      console.error(e);
+      refreshSyncUI();
+    });
   }).catch(function (e) {
     listEl.innerHTML = '<div class="empty">Storage unavailable in this browser.<br>The app needs IndexedDB over https.</div>';
     console.error(e);
