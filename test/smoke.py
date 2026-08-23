@@ -1007,11 +1007,26 @@ def sync_meta(page):
 
 def do_push(page, expect_toast=True):
     """Click Upload now from an open sheet and wait for it to settle."""
+    # Clear any toast still on screen from an earlier action, so waiting for
+    # one below cannot match the previous message.
+    page.evaluate("() => document.querySelector('#toast').classList.remove('show')")
     page.click("#syncBtn")
     if expect_toast:
         page.wait_for_selector("#toast.show", timeout=15000)
     page.wait_for_function(
         "() => !document.querySelector('#syncBtn').disabled", timeout=15000
+    )
+
+
+def wait_pending(page, n):
+    """Wait for the pending-upload count to settle on n.
+
+    The sheet refreshes this asynchronously, so reading it straight after
+    opening the sheet is a race.
+    """
+    page.wait_for_function(
+        "n => document.querySelector('#sPending').textContent === String(n)",
+        arg=n, timeout=10000,
     )
 
 
@@ -1093,7 +1108,7 @@ def test_push_is_incremental_and_uses_the_stored_rev(page, base_url):
     page.wait_for_selector(".entry.editing", state="detached")
 
     open_sheet(page)
-    assert page.inner_text("#sPending") == "1"
+    wait_pending(page, 1)
     do_push(page)
 
     assert len(dbx.uploads) == 3, dbx.uploads
@@ -1104,7 +1119,7 @@ def test_push_is_incremental_and_uses_the_stored_rev(page, base_url):
 
     changed = dbx.json_at(last["path"])
     assert changed["raw"] == "second, revised"
-    assert page.inner_text("#sPending") == "0"
+    wait_pending(page, 0)
 
 
 @test
@@ -1112,32 +1127,63 @@ def test_push_path_is_stable_across_an_edit(page, base_url):
     """The path comes from capturedAt, which never moves.
 
     Deriving it from anything the user can edit would leave the old file
-    orphaned in Dropbox on every edit.
+    orphaned in Dropbox on every edit. The edit has to cross a year boundary
+    to catch it: an edit on the same day as capture looks identical either
+    way, which is exactly how this regression would slip through.
     """
     seen, dbx = [], FakeDropbox()
     stub_dropbox(page, seen)
     dbx.install(page)
 
     boot(page, base_url)
-    capture(page, "original")
+    capture(page, "captured last year")
+
+    # Backdate the record so the later edit lands in a different year.
+    rec_id = page.evaluate("""
+        () => new Promise((resolve, reject) => {
+            const req = indexedDB.open('memvault');
+            req.onerror = () => reject(req.error);
+            req.onsuccess = () => {
+                const store = req.result.transaction('memories', 'readwrite')
+                                .objectStore('memories');
+                const all = store.getAll();
+                all.onsuccess = () => {
+                    const rec = all.result[0];
+                    const then = '2025-03-04T09:00:00.000Z';
+                    rec.capturedAt = rec.createdAt = rec.updatedAt = then;
+                    const w = store.put(rec);
+                    w.onsuccess = () => resolve(rec.id);
+                    w.onerror = () => reject(w.error);
+                };
+            };
+        })
+    """)
+    page.reload()
+    boot(page, base_url)
+
     connect_dropbox(page)
     page.once("dialog", lambda d: d.dismiss())
     open_sheet(page)
     do_push(page)
-    first_path = dbx.uploads[0]["path"]
 
+    first_path = dbx.uploads[0]["path"]
+    assert first_path == f"/memories/2025/{rec_id}.json", first_path
+
+    # Edit it today, which moves updatedAt into another year.
     close_sheet(page)
     page.click(".entry .raw")
     page.wait_for_selector(".edit-area")
-    page.fill(".edit-area", "edited, much later")
+    page.fill(".edit-area", "edited this year")
     page.click(".act-save")
     page.wait_for_selector(".entry.editing", state="detached")
 
     open_sheet(page)
     do_push(page)
 
-    assert dbx.uploads[-1]["path"] == first_path
-    assert len(dbx.files) == 1, "the edit created a second file"
+    assert dbx.uploads[-1]["path"] == first_path, \
+        "the edit moved the file — the path is not derived from capturedAt"
+    assert len(dbx.files) == 1, "the edit orphaned the original file"
+    assert dbx.json_at(first_path)["raw"] == "edited this year"
 
 
 @test
@@ -1190,7 +1236,7 @@ def test_push_failure_leaves_the_record_dirty(page, base_url):
 
     assert "failed to upload" in page.inner_text("#toast")
     assert sync_meta(page) == [], "a failed upload must not be recorded as synced"
-    assert page.inner_text("#sPending") == "1", "the record must stay dirty"
+    wait_pending(page, 1)  # the record must stay dirty
 
     # Nothing local was touched, and the safety net still works.
     close_sheet(page)
@@ -1203,7 +1249,7 @@ def test_push_failure_leaves_the_record_dirty(page, base_url):
     open_sheet(page)
     do_push(page)
     assert len(dbx.files) == 1
-    assert page.inner_text("#sPending") == "0"
+    wait_pending(page, 0)
 
 
 @test
@@ -1222,7 +1268,7 @@ def test_push_retries_a_rate_limit(page, base_url):
 
     assert len(dbx.uploads) == 2, "a 429 should be retried, not abandoned"
     assert len(dbx.files) == 1
-    assert page.inner_text("#sPending") == "0"
+    wait_pending(page, 0)
 
 
 @test
@@ -1256,7 +1302,7 @@ def test_push_does_not_clobber_a_conflicting_remote_copy(page, base_url):
     assert "merging" in page.inner_text("#toast")
     assert json.loads(dbx.files[path][1])["raw"] == "theirs", \
         "the remote copy was clobbered instead of the conflict being reported"
-    assert page.inner_text("#sPending") == "1", "the conflict must stay pending"
+    wait_pending(page, 1)  # the conflict must stay pending
 
 
 @test
