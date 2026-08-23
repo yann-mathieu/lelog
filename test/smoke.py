@@ -1810,6 +1810,44 @@ def test_a_file_deleted_in_dropbox_is_restored_not_obeyed(page, base_url):
 
 
 @test
+def test_a_deletion_arriving_as_a_delta_is_also_restored(page, base_url):
+    """The same rule as above, but reached through list_folder/continue.
+
+    A full listing reports a deletion by omission; a delta reports it as an
+    explicit deleted entry. Both paths must refuse to delete local data, and
+    they are different code.
+    """
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+    rid = "mem_DELTADELETION00000000001"
+    path = dbx.seed(remote_record(rid, "arrived from the laptop", NEW))
+
+    boot(page, base_url)
+    connect_dropbox(page)
+    open_sheet(page)
+    do_push(page)
+
+    # A cursor now exists, so the next sync is a delta rather than a listing.
+    assert dbx.lists == ["fresh"]
+    assert local_record(page, rid)["raw"] == "arrived from the laptop"
+
+    # The file is deleted directly in Dropbox.
+    dbx.remove(path)
+    do_push(page)
+
+    assert dbx.lists == ["fresh", "continue"], dbx.lists
+    close_sheet(page)
+
+    assert texts(page) == ["arrived from the laptop"], "the local record was deleted"
+    assert local_record(page, rid) is not None
+    assert local_record(page, rid)["deleted"] is False, \
+        "a missing file was treated as a tombstone"
+    assert len(dbx.files) == 1, "the file was not restored"
+    assert dbx.records()[rid]["raw"] == "arrived from the laptop"
+
+
+@test
 def test_sync_uses_the_cursor_for_later_runs(page, base_url):
     seen, dbx = [], FakeDropbox()
     stub_dropbox(page, seen)
