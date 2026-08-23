@@ -747,18 +747,33 @@
   }
 
   // The first upload is the one moment where a bug could take the only copy of
-  // the data with it. Offer the backup before it, once.
-  function firstPushGate() {
+  // the data with it, so it is always a deliberate act.
+  //
+  // A background sync will never make it. Pulling is safe unprompted — it
+  // cannot delete anything local — but the first push waits for you to press
+  // Sync now. That also keeps the backup prompt out of the background, where a
+  // modal appearing on its own would be indefensible.
+  var firstUploadHeld = false;
+
+  function firstUploadAllowed(quiet) {
     return syncStateGet('firstPushAt').then(function (done) {
-      if (done) return;
-      if (!all.filter(function (r) { return !r.deleted; }).length) return;
-      if (localStorage.getItem('lastBackup')) return;
-      var msg = 'First upload to Dropbox.\n\n' +
-        'You have never exported a backup, and until sync is proven the ' +
-        'export is still your only safety net.\n\n' +
-        'OK — export a backup first, then upload\n' +
-        'Cancel — upload without exporting';
-      if (confirm(msg)) exportBackup();
+      if (done) return true;
+      if (!all.filter(function (r) { return !r.deleted; }).length) return true;
+      if (quiet) {
+        firstUploadHeld = true;
+        refreshSyncUI();
+        return false;
+      }
+      firstUploadHeld = false;
+      if (!localStorage.getItem('lastBackup')) {
+        var msg = 'First upload to Dropbox.\n\n' +
+          'You have never exported a backup, and until sync is proven the ' +
+          'export is still your only safety net.\n\n' +
+          'OK — export a backup first, then upload\n' +
+          'Cancel — upload without exporting';
+        if (confirm(msg)) exportBackup();
+      }
+      return true;
     });
   }
 
@@ -979,10 +994,14 @@
   // ---------- sync ----------
   var syncing = false;
 
-  function sync() {
+  // `quiet` is for syncs the user did not ask for. They still report entries
+  // arriving from another device, because that changes what is on screen, but
+  // they stay silent otherwise — a toast on every launch and every failed
+  // sync on a flaky connection would train you to ignore toasts entirely.
+  function sync(quiet) {
     if (syncing) return Promise.resolve(null);
     if (!auth || !auth.refreshToken) {
-      toast('Connect Dropbox first');
+      if (!quiet) toast('Connect Dropbox first');
       return Promise.resolve(null);
     }
     syncing = true;
@@ -993,7 +1012,7 @@
     // itself: the pull brings down the remote copy and its current rev, the
     // merge picks a winner, and the push then writes with a rev Dropbox
     // accepts. No conflict is ever surfaced to the user.
-    return firstPushGate().then(pull).then(function (res) {
+    return pull().then(function (res) {
       down = res;
       return getAll();
     }).then(function (rows) {
@@ -1001,32 +1020,92 @@
       render();
       refreshStats();
       maybeBanner();
-      return pushChanges();
+      return firstUploadAllowed(quiet);
+    }).then(function (allowed) {
+      return allowed ? pushChanges() : { ok: 0, failed: [] };
     }).then(function (up) {
       var failed = down.failed.length + up.failed.length;
       if (failed) {
         console.error('sync failures', down.failed, up.failed);
-        toast(failed + (failed === 1 ? ' change' : ' changes') + ' failed, will retry');
+        // A background failure is left to the next attempt. The pending count
+        // in settings is the honest signal; it does not need a popup.
+        if (!quiet) {
+          toast(failed + (failed === 1 ? ' change' : ' changes') + ' failed, will retry');
+        }
       } else if (!down.ok && !up.ok) {
-        toast('Up to date');
-      } else {
-        var parts = [];
-        if (down.ok) parts.push(down.ok + ' down');
+        if (!quiet) toast('Up to date');
+      } else if (down.ok) {
+        // Worth saying even when quiet: entries just appeared on screen.
+        var parts = [down.ok + ' down'];
         if (up.ok) parts.push(up.ok + ' up');
         toast('Synced — ' + parts.join(', '));
+      } else if (!quiet) {
+        toast('Synced — ' + up.ok + ' up');
       }
       if (down.skipped) console.warn(down.skipped + ' unreadable file(s) skipped');
       return { down: down, up: up };
     }).catch(function (e) {
       console.error(e);
-      toast(e && e.message === 'Not connected to Dropbox'
-        ? 'Connect Dropbox first' : 'Could not reach Dropbox');
+      if (!quiet) {
+        toast(e && e.message === 'Not connected to Dropbox'
+          ? 'Connect Dropbox first' : 'Could not reach Dropbox');
+      }
       return null;
     }).then(function (res) {
       syncing = false;
       return refreshSyncStats().then(function () { return res; });
     });
   }
+
+  // ---------- automatic sync ----------
+  // Two triggers, deliberately different.
+  //
+  // Change-driven: debounced, so writing three entries in a row uploads once
+  // rather than three times, and so an edit made straight after a save does
+  // not race its own upload. Never throttled — a change should always reach
+  // Dropbox.
+  //
+  // Opportunistic: launch, returning to the app, regaining a connection.
+  // Throttled, because switching apps back and forth would otherwise sync
+  // continuously for no benefit.
+  var SYNC_DEBOUNCE = 2500, AUTO_MIN_GAP = 30000;
+  var syncTimer = null, lastAutoSync = 0;
+
+  function canSync() {
+    return !!(auth && auth.refreshToken) && navigator.onLine !== false;
+  }
+
+  function autoSync() {
+    if (!canSync()) return Promise.resolve(null);
+    if (syncing) { scheduleSync(); return Promise.resolve(null); }
+    lastAutoSync = Date.now();
+    return sync(true);
+  }
+
+  function scheduleSync() {
+    if (!canSync()) return;
+    clearTimeout(syncTimer);
+    syncTimer = setTimeout(function () {
+      syncTimer = null;
+      autoSync();
+    }, SYNC_DEBOUNCE);
+  }
+
+  function opportunisticSync() {
+    if (!canSync()) return;
+    if (Date.now() - lastAutoSync < AUTO_MIN_GAP) return;
+    autoSync();
+  }
+
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) opportunisticSync();
+  });
+  window.addEventListener('online', function () {
+    // Coming back from offline is the one case worth syncing immediately:
+    // there is very likely something waiting to go up.
+    lastAutoSync = 0;
+    opportunisticSync();
+  });
 
   // ---------- ids ----------
   var B32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
@@ -1182,6 +1261,7 @@
       maybeBanner();
       toast('Saved');
       input.focus();
+      scheduleSync();
     }).catch(function (e) {
       toast('Could not save — storage may be full');
       console.error(e);
@@ -1195,7 +1275,9 @@
     if (!t) { editingId = null; render(); return; }
     rec.raw = t;
     rec.updatedAt = new Date().toISOString();
-    put(rec).then(function () { editingId = null; render(); toast('Updated'); });
+    put(rec).then(function () {
+      editingId = null; render(); toast('Updated'); scheduleSync();
+    });
   }
 
   function removeEntry(id) {
@@ -1205,7 +1287,7 @@
     rec.deletedAt = new Date().toISOString();
     rec.updatedAt = rec.deletedAt;
     put(rec).then(function () {
-      editingId = null; render(); refreshStats(); toast('Deleted');
+      editingId = null; render(); refreshStats(); toast('Deleted'); scheduleSync();
     });
   }
 
@@ -1256,6 +1338,7 @@
         all = Object.keys(byId).map(function (k) { return byId[k]; });
         render(); refreshStats();
         toast(added + ' added, ' + updated + ' updated');
+        scheduleSync();
       });
     };
     reader.readAsText(file);
@@ -1393,7 +1476,15 @@
     var warn = 'Permanently delete all ' + live + ' entries?\n\n' +
       (lb ? 'Last backup: ' + new Date(lb).toLocaleDateString() + '.'
           : 'You have never exported a backup.') +
-      '\nThis cannot be undone.';
+      '\nThis cannot be undone.' +
+      // Without this the button looks broken: it wipes the device, then the
+      // next sync pulls everything back from Dropbox, which is correct but
+      // baffling if you were not told.
+      (auth && auth.refreshToken
+        ? '\n\nThis clears this device only. Your entries are still in ' +
+          'Dropbox and will come back on the next sync — disconnect first ' +
+          'if you do not want that.'
+        : '');
     if (!confirm(warn)) return;
     clearAll().then(function () {
       all = []; editingId = null; render(); refreshStats(); maybeBanner(); closeSheet();
@@ -1412,9 +1503,13 @@
     if (connected) $('manualBox').hidden = true;
     $('syncBtn').disabled = syncing;
     $('syncBtn').textContent = syncing ? 'Syncing…' : 'Sync now';
-    $('syncNote').textContent = connected
-      ? 'Connected to Dropbox. One JSON file per entry, under memories/.'
-      : 'Not connected. Entries stay on this phone only.';
+    $('syncNote').textContent = !connected
+      ? 'Not connected. Entries stay on this phone only.'
+      : firstUploadHeld
+        ? 'Connected. Press Sync now to make the first upload — after that it '
+          + 'syncs on its own.'
+        : 'Connected to Dropbox. Syncs on its own; one JSON file per entry, '
+          + 'under memories/.';
   }
 
   function refreshSyncStats() {
@@ -1471,7 +1566,7 @@
     disconnect();
   };
 
-  $('syncBtn').onclick = function () { sync(); };
+  $('syncBtn').onclick = function () { sync(false); };
 
   // ---------- boot ----------
   openDB().then(function (d) {
@@ -1486,6 +1581,7 @@
     // present itself as "storage unavailable" and hide the entries.
     loadAuth().then(handleAuthRedirect).then(refreshSyncUI)
       .then(refreshSyncStats)
+      .then(opportunisticSync)
       .catch(function (e) {
         console.error(e);
         refreshSyncUI();

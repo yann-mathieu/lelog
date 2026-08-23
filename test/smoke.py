@@ -29,6 +29,7 @@ import socket
 import socketserver
 import sys
 import threading
+import time
 from pathlib import Path
 from urllib.parse import parse_qsl, urlparse
 
@@ -1121,6 +1122,12 @@ class FakeDropbox:
             }),
         )
 
+    def reset_counters(self):
+        """Forget call history, so a test can count only what follows."""
+        self.uploads.clear()
+        self.downloads.clear()
+        self.lists.clear()
+
     def json_at(self, path):
         match = next(p for p in self.files if p.lower() == path.lower())
         return json.loads(self.files[match][1])
@@ -1159,6 +1166,20 @@ def do_push(page, expect_toast=True):
         page.wait_for_selector("#toast.show", timeout=15000)
     page.wait_for_function(
         "() => !document.querySelector('#syncBtn').disabled", timeout=15000
+    )
+
+
+def quiesce(page, ms=4000):
+    """Wait out the sync debounce and any sync already running.
+
+    Background syncs make exact call counts meaningless unless the test waits
+    for things to go quiet first.
+    """
+    page.wait_for_timeout(ms)
+    page.wait_for_function(
+        "() => { const b = document.querySelector('#syncBtn');"
+        "        return !b || !b.disabled; }",
+        timeout=20000,
     )
 
 
@@ -1590,11 +1611,13 @@ def test_pull_brings_down_another_devices_entries(page, base_url):
 
     boot(page, base_url)
     connect_dropbox(page)
-    open_sheet(page)
-    do_push(page)
 
-    assert "2 down" in page.inner_text("#toast")
-    close_sheet(page)
+    # No button pressed: connecting is enough, the sync on launch fetches them.
+    page.wait_for_function(
+        "() => document.querySelectorAll('.entry').length === 2", timeout=20000
+    )
+    assert "2 down" in page.inner_text("#toast"), \
+        "arriving entries should be announced even on a background sync"
     assert sorted(texts(page)) == ["and this one too", "written on the laptop"]
 
     # They land as full records, not as fragments.
@@ -1825,18 +1848,20 @@ def test_a_deletion_arriving_as_a_delta_is_also_restored(page, base_url):
 
     boot(page, base_url)
     connect_dropbox(page)
-    open_sheet(page)
-    do_push(page)
+    quiesce(page)
 
-    # A cursor now exists, so the next sync is a delta rather than a listing.
-    assert dbx.lists == ["fresh"]
+    # The sync on launch did a full listing and stored a cursor, so anything
+    # from here on is a delta.
+    assert dbx.lists == ["fresh"], dbx.lists
     assert local_record(page, rid)["raw"] == "arrived from the laptop"
+    dbx.reset_counters()
 
     # The file is deleted directly in Dropbox.
     dbx.remove(path)
+    open_sheet(page)
     do_push(page)
 
-    assert dbx.lists == ["fresh", "continue"], dbx.lists
+    assert dbx.lists == ["continue"], dbx.lists
     close_sheet(page)
 
     assert texts(page) == ["arrived from the laptop"], "the local record was deleted"
@@ -1856,20 +1881,23 @@ def test_sync_uses_the_cursor_for_later_runs(page, base_url):
 
     boot(page, base_url)
     connect_dropbox(page)
-    open_sheet(page)
-    do_push(page)
-    assert dbx.lists == ["fresh"]
+    quiesce(page)
+
+    # The sync on launch listed the folder and fetched the one record.
+    assert dbx.lists == ["fresh"], dbx.lists
     assert len(dbx.downloads) == 1
+    dbx.reset_counters()
 
     # Nothing changed remotely: the delta is empty and nothing is downloaded.
+    open_sheet(page)
     do_push(page)
-    assert dbx.lists == ["fresh", "continue"]
-    assert len(dbx.downloads) == 1, "an unchanged record was downloaded again"
+    assert dbx.lists == ["continue"], dbx.lists
+    assert dbx.downloads == [], "an unchanged record was downloaded again"
 
     # One new record appears remotely; only that one comes down.
     dbx.seed(remote_record("mem_CURSORTEST000000000000002", "second remote", NEW))
     do_push(page)
-    assert len(dbx.downloads) == 2, dbx.downloads
+    assert len(dbx.downloads) == 1, dbx.downloads
     close_sheet(page)
     assert sorted(texts(page)) == ["first remote", "second remote"]
 
@@ -1883,14 +1911,16 @@ def test_a_reset_cursor_falls_back_to_a_full_list(page, base_url):
 
     boot(page, base_url)
     connect_dropbox(page)
-    open_sheet(page)
-    do_push(page)
+    quiesce(page)
+    dbx.reset_counters()
+
     # Dropbox forgets the cursor. Re-listing must recover rather than fail.
     dbx.reset_cursor_once = True
     dbx.seed(remote_record("mem_RESETTEST0000000000000002", "after the reset", NEW))
+    open_sheet(page)
     do_push(page)
 
-    assert dbx.lists == ["fresh", "continue", "fresh"], dbx.lists
+    assert dbx.lists == ["continue", "fresh"], dbx.lists
     close_sheet(page)
     assert sorted(texts(page)) == ["after the reset", "before the reset"]
 
@@ -1964,6 +1994,267 @@ def test_sync_leaves_the_export_intact(page, base_url):
     blob = json.dumps(payload)
     for secret in ["rev0000", "refresh-token-abc", "sl.short-lived-token", "cursor"]:
         assert secret not in blob, f"{secret!r} leaked into the export"
+
+
+# ---------- automatic sync ----------
+#
+# The debounce in the app is 2.5s, so these wait on the effect rather than
+# guessing at timing.
+
+def prime_sync(page, dbx, text="priming entry"):
+    """Get past the first-upload gate, then reset call counts.
+
+    A background sync deliberately never makes the first upload — that has to
+    be a deliberate act — so any test of automatic uploading has to press
+    Sync now once before automatic behaviour is available at all.
+    """
+    capture(page, text)
+    open_sheet(page)
+    do_push(page)
+    close_sheet(page)
+    quiesce(page)
+    dbx.reset_counters()
+
+
+def wait_for_upload(page, n, timeout=20000):
+    """Wait until the fake has received n uploads, without polling the app."""
+    deadline = time.time() + timeout / 1000
+    while time.time() < deadline:
+        if len(page._dbx.uploads) >= n:
+            return True
+        page.wait_for_timeout(200)
+    return False
+
+
+@test
+def test_capture_syncs_by_itself(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+    page._dbx = dbx
+
+    boot(page, base_url)
+    export_backup(page)
+    connect_dropbox(page)
+    prime_sync(page, dbx)
+
+    capture(page, "typed and forgotten about")
+
+    assert wait_for_upload(page, 1), "capture never reached Dropbox on its own"
+    assert len(dbx.files) == 2
+    assert "typed and forgotten about" in [
+        r["raw"] for r in dbx.records().values()
+    ]
+
+
+@test
+def test_capture_does_not_wait_for_the_network(page, base_url):
+    """Invariant 4: save is instant even when Dropbox is unreachable."""
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+    # Every upload hangs for longer than the test will wait.
+    page.route(
+        "https://content.dropboxapi.com/2/files/upload",
+        lambda route: page.wait_for_timeout(30000),
+    )
+
+    boot(page, base_url)
+    export_backup(page)
+    connect_dropbox(page)
+
+    start = time.time()
+    capture(page, "saved while the network hangs")
+    elapsed = time.time() - start
+
+    assert elapsed < 5, f"save blocked for {elapsed:.1f}s"
+    assert texts(page) == ["saved while the network hangs"]
+    assert len(records(page)) == 1
+
+    # And a second capture still works while the first upload is stuck.
+    capture(page, "and another one")
+    assert len(records(page)) == 2
+
+
+@test
+def test_rapid_captures_debounce_into_one_sync(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+    page._dbx = dbx
+
+    boot(page, base_url)
+    export_backup(page)
+    connect_dropbox(page)
+    prime_sync(page, dbx)
+
+    capture(page, "one")
+    capture(page, "two")
+    capture(page, "three")
+
+    assert wait_for_upload(page, 3), "not everything was uploaded"
+    page.wait_for_timeout(4000)  # let any extra sync fire
+
+    # Three new records, three uploads — one sync, not one per capture.
+    assert len(dbx.uploads) == 3, \
+        f"expected one sync uploading 3 records, got {len(dbx.uploads)} uploads"
+    raws = sorted(r["raw"] for r in dbx.records().values())
+    assert raws == ["one", "priming entry", "three", "two"], raws
+
+
+@test
+def test_edit_and_delete_sync_by_themselves(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+    page._dbx = dbx
+
+    boot(page, base_url)
+    export_backup(page)
+    connect_dropbox(page)
+    prime_sync(page, dbx)
+
+    capture(page, "before")
+    assert wait_for_upload(page, 1)
+    path = dbx.uploads[0]["path"]
+
+    page.click(".entry .raw")
+    page.wait_for_selector(".edit-area")
+    page.fill(".edit-area", "after")
+    page.click(".act-save")
+    page.wait_for_selector(".entry.editing", state="detached")
+
+    assert wait_for_upload(page, 2), "an edit did not sync on its own"
+    assert dbx.json_at(path)["raw"] == "after"
+
+    page.once("dialog", lambda d: d.accept())
+    page.click(f".entry:has-text('after') .raw")
+    page.wait_for_selector(".edit-area")
+    page.click(".act-delete")
+    page.wait_for_function("() => document.querySelectorAll('.entry').length === 1")
+
+    assert wait_for_upload(page, 3), "a delete did not sync on its own"
+    assert dbx.json_at(path)["deleted"] is True
+
+
+@test
+def test_launch_pulls_changes_made_elsewhere(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+
+    boot(page, base_url)
+    connect_dropbox(page)
+
+    # Another device adds an entry while this one is closed.
+    dbx.seed(remote_record("mem_WHILEYOUWEREAWAY000000001", "added on the laptop", NEW))
+
+    page.reload()
+    boot(page, base_url)
+
+    # No button pressed: launching is enough.
+    page.wait_for_function(
+        "() => document.querySelectorAll('.entry').length === 1", timeout=20000
+    )
+    assert texts(page) == ["added on the laptop"]
+
+
+@test
+def test_nothing_syncs_while_disconnected(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+
+    boot(page, base_url)
+    capture(page, "no dropbox here")
+    page.wait_for_timeout(4000)
+
+    assert dbx.uploads == [], "uploaded without a connection"
+    assert dbx.lists == [], "listed without a connection"
+    assert texts(page) == ["no dropbox here"]
+
+
+@test
+def test_a_background_sync_failure_stays_quiet_and_keeps_data(page, base_url):
+    """A failed background sync must not nag, and must not lose anything."""
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+    boot(page, base_url)
+    export_backup(page)
+    connect_dropbox(page)
+    prime_sync(page, dbx)
+
+    # Only now does a background sync actually attempt uploads.
+    dbx.fail_next = (99, 500, '{"error_summary":"internal_error/."}')
+    capture(page, "will not upload yet")
+    page.wait_for_timeout(6000)
+
+    # Silent: no error toast for something the user did not ask for.
+    toast_shown = page.evaluate(
+        "() => document.querySelector('#toast').classList.contains('show')"
+    )
+    assert not toast_shown, "a background failure raised a toast"
+
+    # Data intact, and settings tells the truth about what is outstanding.
+    assert "will not upload yet" in texts(page)
+    open_sheet(page)
+    wait_pending(page, 1)
+
+    # Manual sync, by contrast, does report the failure.
+    do_push(page)
+    assert "failed" in page.inner_text("#toast")
+
+    # And it recovers once Dropbox does.
+    dbx.fail_next = None
+    do_push(page)
+    wait_pending(page, 0)
+    assert len(dbx.files) == 2
+
+
+@test
+def test_manual_sync_still_reports_up_to_date(page, base_url):
+    """The explicit button stays chatty even though background syncs are not."""
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+    page._dbx = dbx
+
+    boot(page, base_url)
+    export_backup(page)
+    connect_dropbox(page)
+    prime_sync(page, dbx)
+
+    capture(page, "already synced")
+    assert wait_for_upload(page, 1)
+    quiesce(page)
+
+    open_sheet(page)
+    do_push(page)
+    assert "up to date" in page.inner_text("#toast").lower()
+
+
+@test
+def test_wipe_warns_that_dropbox_will_restore(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+
+    boot(page, base_url)
+    export_backup(page)
+    connect_dropbox(page)
+    capture(page, "still in dropbox")
+
+    open_sheet(page)
+    messages = []
+    page.once("dialog", lambda d: (messages.append(d.message), d.dismiss()))
+    page.click("#wipeBtn")
+    page.wait_for_timeout(500)
+
+    assert messages, "no confirmation shown"
+    assert "come back on the next sync" in messages[0], messages[0]
+    # Dismissed, so nothing was deleted.
+    assert len(records(page)) == 1
 
 
 @test
