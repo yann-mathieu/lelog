@@ -935,6 +935,427 @@ def test_capture_works_while_disconnected_and_offline(page, base_url):
     assert len(records(page)) == 1
 
 
+# ---------- push ----------
+
+class FakeDropbox:
+    """A minimal stand-in for the app folder: path -> (rev, content)."""
+
+    def __init__(self):
+        self.files = {}
+        self.uploads = []      # every upload arg, in order
+        self.fail_next = None  # (count, status, body) to fail with
+        self._rev = 0
+
+    def install(self, page):
+        page.route("https://content.dropboxapi.com/2/files/upload", self._upload)
+
+    def _upload(self, route):
+        arg = json.loads(route.request.headers["dropbox-api-arg"])
+        body = route.request.post_data or ""
+        self.uploads.append(arg)
+
+        if self.fail_next and self.fail_next[0] > 0:
+            n, status, err = self.fail_next
+            self.fail_next = (n - 1, status, err)
+            route.fulfill(
+                status=status, body=err,
+                headers={"Retry-After": "0"} if status == 429 else {},
+            )
+            return
+
+        path, mode = arg["path"], arg["mode"]
+        existing = self.files.get(path)
+        if isinstance(mode, dict) and mode.get(".tag") == "update":
+            if not existing or existing[0] != mode["update"]:
+                route.fulfill(status=409, body='{"error_summary":"path/conflict/file/."}')
+                return
+        elif mode == "add" and existing:
+            route.fulfill(status=409, body='{"error_summary":"path/conflict/file/."}')
+            return
+
+        self._rev += 1
+        rev = f"rev{self._rev:012d}"
+        self.files[path] = (rev, body)
+        route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({
+                "name": path.rsplit("/", 1)[-1], "path_lower": path.lower(),
+                "path_display": path, "id": "id:" + path, "rev": rev,
+                "size": len(body), "content_hash": "x" * 64,
+                "server_modified": "2026-08-22T10:00:00Z",
+            }),
+        )
+
+    def json_at(self, path):
+        return json.loads(self.files[path][1])
+
+
+def sync_meta(page):
+    return page.evaluate("""
+        () => new Promise((resolve, reject) => {
+            const req = indexedDB.open('memvault');
+            req.onerror = () => reject(req.error);
+            req.onsuccess = () => {
+                const r = req.result.transaction('syncmeta', 'readonly')
+                          .objectStore('syncmeta').getAll();
+                r.onsuccess = () => resolve(r.result || []);
+                r.onerror = () => reject(r.error);
+            };
+        })
+    """)
+
+
+def do_push(page, expect_toast=True):
+    """Click Upload now from an open sheet and wait for it to settle."""
+    page.click("#syncBtn")
+    if expect_toast:
+        page.wait_for_selector("#toast.show", timeout=15000)
+    page.wait_for_function(
+        "() => !document.querySelector('#syncBtn').disabled", timeout=15000
+    )
+
+
+@test
+def test_push_writes_one_json_file_per_record(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+
+    boot(page, base_url)
+    capture(page, "bo bun at le petit cambodge")
+    capture(page, "dune, finally")
+    connect_dropbox(page)
+
+    # Never exported, so the first push offers a backup. Decline it here; the
+    # gate itself is tested separately.
+    page.once("dialog", lambda d: d.dismiss())
+    open_sheet(page)
+    do_push(page)
+
+    assert len(dbx.files) == 2, dbx.files
+    year = "2026"
+    for path in dbx.files:
+        assert path.startswith(f"/memories/{year}/"), path
+        assert path.endswith(".json"), path
+
+    # The uploaded bytes are exactly the record, same shape as the export.
+    uploaded = [dbx.json_at(p) for p in dbx.files]
+    raws = sorted(r["raw"] for r in uploaded)
+    assert raws == ["bo bun at le petit cambodge", "dune, finally"]
+    for rec in uploaded:
+        extra = set(rec) - V2_KEYS - OPTIONAL_KEYS
+        assert not extra, f"sync fields leaked into the uploaded file: {sorted(extra)}"
+        assert set(rec) >= V2_KEYS
+
+    # The path is built from the record id, so the file is findable by hand.
+    for rec in uploaded:
+        assert f"/memories/{year}/{rec['id']}.json" in dbx.files
+
+    # First upload of a record uses add, not update.
+    assert all(u["mode"] == "add" for u in dbx.uploads), dbx.uploads
+    assert all(u["autorename"] is False for u in dbx.uploads)
+
+    metas = sync_meta(page)
+    assert len(metas) == 2
+    for m in metas:
+        assert m["rev"].startswith("rev")
+        assert m["syncedUpdatedAt"]
+        assert m["path"].startswith("/memories/")
+
+
+@test
+def test_push_is_incremental_and_uses_the_stored_rev(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+
+    boot(page, base_url)
+    capture(page, "first")
+    capture(page, "second")
+    connect_dropbox(page)
+
+    page.once("dialog", lambda d: d.dismiss())
+    open_sheet(page)
+    do_push(page)
+    assert len(dbx.uploads) == 2
+
+    # Nothing changed: a second push must upload nothing at all.
+    do_push(page)
+    assert len(dbx.uploads) == 2, "unchanged records were re-uploaded"
+    assert "up to date" in page.inner_text("#toast")
+
+    # Edit one, and only that one goes up — with update(rev), not add.
+    close_sheet(page)
+    page.click(".entry:has-text('second') .raw")
+    page.wait_for_selector(".edit-area")
+    page.fill(".edit-area", "second, revised")
+    page.click(".act-save")
+    page.wait_for_selector(".entry.editing", state="detached")
+
+    open_sheet(page)
+    assert page.inner_text("#sPending") == "1"
+    do_push(page)
+
+    assert len(dbx.uploads) == 3, dbx.uploads
+    last = dbx.uploads[-1]
+    assert isinstance(last["mode"], dict), "an edit must use update(rev), not add"
+    assert last["mode"][".tag"] == "update"
+    assert last["mode"]["update"] == "rev000000000002"
+
+    changed = dbx.json_at(last["path"])
+    assert changed["raw"] == "second, revised"
+    assert page.inner_text("#sPending") == "0"
+
+
+@test
+def test_push_path_is_stable_across_an_edit(page, base_url):
+    """The path comes from capturedAt, which never moves.
+
+    Deriving it from anything the user can edit would leave the old file
+    orphaned in Dropbox on every edit.
+    """
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+
+    boot(page, base_url)
+    capture(page, "original")
+    connect_dropbox(page)
+    page.once("dialog", lambda d: d.dismiss())
+    open_sheet(page)
+    do_push(page)
+    first_path = dbx.uploads[0]["path"]
+
+    close_sheet(page)
+    page.click(".entry .raw")
+    page.wait_for_selector(".edit-area")
+    page.fill(".edit-area", "edited, much later")
+    page.click(".act-save")
+    page.wait_for_selector(".entry.editing", state="detached")
+
+    open_sheet(page)
+    do_push(page)
+
+    assert dbx.uploads[-1]["path"] == first_path
+    assert len(dbx.files) == 1, "the edit created a second file"
+
+
+@test
+def test_push_uploads_tombstones(page, base_url):
+    """A delete has to reach Dropbox as a file, not as a missing file."""
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+
+    boot(page, base_url)
+    capture(page, "doomed")
+    connect_dropbox(page)
+    page.once("dialog", lambda d: d.dismiss())
+    open_sheet(page)
+    do_push(page)
+    path = dbx.uploads[0]["path"]
+    assert dbx.json_at(path)["deleted"] is False
+
+    close_sheet(page)
+    page.once("dialog", lambda d: d.accept())
+    page.click(".entry .raw")
+    page.wait_for_selector(".edit-area")
+    page.click(".act-delete")
+    page.wait_for_function("() => document.querySelectorAll('.entry').length === 0")
+
+    open_sheet(page)
+    do_push(page)
+
+    assert len(dbx.files) == 1, "the tombstone should overwrite, not add a file"
+    tomb = dbx.json_at(path)
+    assert tomb["deleted"] is True
+    assert tomb["raw"] == "doomed", "raw must survive into the tombstone"
+    assert tomb["deletedAt"]
+
+
+@test
+def test_push_failure_leaves_the_record_dirty(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+    # Fail more times than withRetry will attempt, so it gives up.
+    dbx.fail_next = (9, 500, '{"error_summary":"internal_error/."}')
+
+    boot(page, base_url)
+    capture(page, "will not upload")
+    connect_dropbox(page)
+    page.once("dialog", lambda d: d.dismiss())
+    open_sheet(page)
+    do_push(page)
+
+    assert "failed to upload" in page.inner_text("#toast")
+    assert sync_meta(page) == [], "a failed upload must not be recorded as synced"
+    assert page.inner_text("#sPending") == "1", "the record must stay dirty"
+
+    # Nothing local was touched, and the safety net still works.
+    close_sheet(page)
+    assert texts(page) == ["will not upload"]
+    payload, _, _ = export_backup(page)
+    assert payload["memories"][0]["raw"] == "will not upload"
+
+    # Once Dropbox recovers, the retry succeeds by itself.
+    dbx.fail_next = None
+    open_sheet(page)
+    do_push(page)
+    assert len(dbx.files) == 1
+    assert page.inner_text("#sPending") == "0"
+
+
+@test
+def test_push_retries_a_rate_limit(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+    dbx.fail_next = (1, 429, '{"error_summary":"too_many_requests/."}')
+
+    boot(page, base_url)
+    capture(page, "rate limited once")
+    connect_dropbox(page)
+    page.once("dialog", lambda d: d.dismiss())
+    open_sheet(page)
+    do_push(page)
+
+    assert len(dbx.uploads) == 2, "a 429 should be retried, not abandoned"
+    assert len(dbx.files) == 1
+    assert page.inner_text("#sPending") == "0"
+
+
+@test
+def test_push_does_not_clobber_a_conflicting_remote_copy(page, base_url):
+    """update(rev) must turn a moved remote copy into an error, not a clobber."""
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+
+    boot(page, base_url)
+    capture(page, "mine")
+    connect_dropbox(page)
+    page.once("dialog", lambda d: d.dismiss())
+    open_sheet(page)
+    do_push(page)
+    path = dbx.uploads[0]["path"]
+
+    # Another device writes the same record, moving the rev.
+    dbx.files[path] = ("rev999999999999", json.dumps({"raw": "theirs"}))
+
+    close_sheet(page)
+    page.click(".entry .raw")
+    page.wait_for_selector(".edit-area")
+    page.fill(".edit-area", "mine, edited")
+    page.click(".act-save")
+    page.wait_for_selector(".entry.editing", state="detached")
+
+    open_sheet(page)
+    do_push(page)
+
+    assert "merging" in page.inner_text("#toast")
+    assert json.loads(dbx.files[path][1])["raw"] == "theirs", \
+        "the remote copy was clobbered instead of the conflict being reported"
+    assert page.inner_text("#sPending") == "1", "the conflict must stay pending"
+
+
+@test
+def test_first_push_offers_a_backup(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+
+    boot(page, base_url)
+    capture(page, "never backed up")
+    connect_dropbox(page)
+    open_sheet(page)
+
+    prompts = []
+    page.once("dialog", lambda d: (prompts.append(d.message), d.accept()))
+    with page.expect_download() as dl:
+        page.click("#syncBtn")
+    page.wait_for_function(
+        "() => !document.querySelector('#syncBtn').disabled", timeout=15000
+    )
+
+    assert prompts, "the first upload did not offer a backup"
+    assert "only safety net" in prompts[0]
+    backup = json.loads(Path(dl.value.path()).read_text(encoding="utf-8"))
+    assert backup["memories"][0]["raw"] == "never backed up"
+    assert len(dbx.files) == 1, "the upload should still happen after exporting"
+
+    # Only ever offered once.
+    close_sheet(page)
+    capture(page, "a second entry")
+    open_sheet(page)
+    second = []
+    page.on("dialog", lambda d: (second.append(d.message), d.dismiss()))
+    do_push(page)
+    assert second == [], "the backup gate fired a second time"
+    assert len(dbx.files) == 2
+
+
+@test
+def test_push_needs_no_export_when_one_already_exists(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+
+    boot(page, base_url)
+    capture(page, "already safe")
+    export_backup(page)  # sets lastBackup
+
+    connect_dropbox(page)
+    open_sheet(page)
+    prompts = []
+    page.on("dialog", lambda d: (prompts.append(d.message), d.dismiss()))
+    do_push(page)
+
+    assert prompts == [], "prompted for a backup that already exists"
+    assert len(dbx.files) == 1
+
+
+@test
+def test_push_leaves_the_export_untouched(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+
+    boot(page, base_url)
+    capture(page, "one")
+    capture(page, "two")
+    before, _, _ = export_backup(page)
+
+    connect_dropbox(page)
+    open_sheet(page)
+    do_push(page)
+    close_sheet(page)
+
+    after, _, _ = export_backup(page)
+    assert after["memories"] == before["memories"], \
+        "uploading changed the exported records"
+
+    blob = json.dumps(after)
+    for secret in ["rev0000", "refresh-token-abc", "sl.short-lived-token"]:
+        assert secret not in blob, f"{secret!r} leaked into the export"
+
+
+@test
+def test_push_without_a_connection_does_nothing(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+
+    boot(page, base_url)
+    capture(page, "not connected")
+    open_sheet(page)
+
+    # The button is not even offered while disconnected.
+    assert page.locator("#syncBtn").is_hidden()
+    assert page.locator("#syncStats").is_hidden()
+    assert dbx.uploads == []
+
+
 @test
 def test_service_worker_registers(page, base_url):
     boot(page, base_url)

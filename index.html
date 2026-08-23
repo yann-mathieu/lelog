@@ -242,7 +242,12 @@
     <p id="syncNote">Not connected. Entries stay on this phone only.</p>
     <div class="row">
       <button class="btn" id="connectBtn">Connect Dropbox</button>
+      <button class="btn" id="syncBtn" hidden>Upload now</button>
       <button class="btn ghost" id="disconnectBtn" hidden>Disconnect</button>
+    </div>
+    <div id="syncStats" hidden>
+      <div class="stat"><span>Waiting to upload</span><b id="sPending">0</b></div>
+      <div class="stat"><span>Last upload</span><b id="sLastPush">Never</b></div>
     </div>
     <p id="manualHint" style="margin-bottom:0">
       <button class="linkbtn" id="manualBtn"
@@ -574,6 +579,194 @@
     return syncStateGet('auth').then(function (a) { auth = a || null; return auth; });
   }
 
+  // ---------- dropbox api ----------
+  var DBX_UPLOAD_URL = 'https://content.dropboxapi.com/2/files/upload';
+
+  // Dropbox-API-Arg travels in an HTTP header, which must be ASCII. Paths are
+  // ASCII today (ULIDs and digits), but media filenames later will not be.
+  function headerArg(obj) {
+    return JSON.stringify(obj).replace(/[\u007f-\uffff]/g, function (c) {
+      return '\\u' + ('000' + c.charCodeAt(0).toString(16)).slice(-4);
+    });
+  }
+
+  function dbxError(res) {
+    return res.text().then(function (t) {
+      var e = new Error(t || ('HTTP ' + res.status));
+      e.status = res.status;
+      e.body = t;
+      e.retryAfter = Number(res.headers.get('Retry-After')) || 0;
+      // 409 is Dropbox's "your write did not apply" — for an update it means
+      // the rev moved under us, for an add it means the file already exists.
+      e.conflict = res.status === 409;
+      return e;
+    });
+  }
+
+  function dbxUpload(path, text, rev) {
+    return accessToken().then(function (token) {
+      return fetch(DBX_UPLOAD_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + token,
+          'Content-Type': 'application/octet-stream',
+          'Dropbox-API-Arg': headerArg({
+            path: path,
+            // update(rev) is what turns a concurrent edit into an error rather
+            // than a silent clobber, and autorename:false keeps that error
+            // visible instead of quietly making a duplicate file.
+            mode: rev ? { '.tag': 'update', update: rev } : 'add',
+            autorename: false,
+            mute: true
+          })
+        },
+        body: text
+      });
+    }).then(function (res) {
+      if (res.ok) return res.json();
+      return dbxError(res).then(function (e) { throw e; });
+    });
+  }
+
+  // ---------- push ----------
+  // capturedAt never changes, so a record's path is fixed for life. Deriving it
+  // from a field the user can edit would orphan the old file on every edit.
+  function recordPath(rec) {
+    return '/memories/' + rec.capturedAt.slice(0, 4) + '/' + rec.id + '.json';
+  }
+
+  // Byte-for-byte the same shape the export writes. One readable JSON file per
+  // record is the whole "data outlives the app" promise.
+  function recordJSON(rec) { return JSON.stringify(rec, null, 2); }
+
+  function pendingPush() {
+    return syncMetaAll().then(function (metas) {
+      var by = {};
+      metas.forEach(function (m) { by[m.id] = m; });
+      return all.filter(function (r) {
+        var m = by[r.id];
+        // Never synced, or changed since the last upload. Tombstones are
+        // included on purpose: a delete has to reach Dropbox as a file whose
+        // deleted flag is true, or it cannot propagate to another device.
+        return !m || m.syncedUpdatedAt !== r.updatedAt;
+      }).map(function (r) { return { rec: r, meta: by[r.id] || null }; });
+    });
+  }
+
+  function pushOne(item) {
+    var rec = item.rec, meta = item.meta;
+    var path = recordPath(rec);
+    return dbxUpload(path, recordJSON(rec), meta && meta.rev).then(function (md) {
+      return syncMetaPut({
+        id: rec.id,
+        path: md.path_lower || path,
+        rev: md.rev,
+        // Recorded from the value we actually uploaded, not from the record as
+        // it stands now — an edit made mid-upload must stay dirty.
+        syncedUpdatedAt: rec.updatedAt
+      });
+    });
+  }
+
+  function delay(ms) {
+    return new Promise(function (r) { setTimeout(r, ms); });
+  }
+
+  // Retries what is worth retrying. A conflict is not: it means the remote
+  // copy moved, and resolving that needs the merge, not another attempt.
+  function withRetry(fn, attempts) {
+    attempts = attempts || 3;
+    return fn().catch(function (e) {
+      var retryable = e.status === 429 || (e.status >= 500 && e.status < 600);
+      if (!retryable || attempts <= 1) throw e;
+      var wait = e.retryAfter ? e.retryAfter * 1000 : (4 - attempts) * 1000 + 500;
+      return delay(wait).then(function () { return withRetry(fn, attempts - 1); });
+    });
+  }
+
+  // Dropbox rate-limits per account, so a few at a time rather than all at once.
+  function pool(items, limit, worker) {
+    var i = 0, ok = 0, failed = [];
+    function next() {
+      if (i >= items.length) return Promise.resolve();
+      var item = items[i++];
+      return worker(item).then(function () { ok++; }, function (e) {
+        failed.push({ item: item, error: e });
+      }).then(next);
+    }
+    var runners = [];
+    for (var k = 0; k < Math.min(limit, items.length); k++) runners.push(next());
+    return Promise.all(runners).then(function () {
+      return { ok: ok, failed: failed };
+    });
+  }
+
+  // The first upload is the one moment where a bug could take the only copy of
+  // the data with it. Offer the backup before it, once.
+  function firstPushGate() {
+    return syncStateGet('firstPushAt').then(function (done) {
+      if (done) return;
+      if (!all.filter(function (r) { return !r.deleted; }).length) return;
+      if (localStorage.getItem('lastBackup')) return;
+      var msg = 'First upload to Dropbox.\n\n' +
+        'You have never exported a backup, and until sync is proven the ' +
+        'export is still your only safety net.\n\n' +
+        'OK — export a backup first, then upload\n' +
+        'Cancel — upload without exporting';
+      if (confirm(msg)) exportBackup();
+    });
+  }
+
+  var syncing = false;
+
+  function push() {
+    if (syncing) return Promise.resolve(null);
+    if (!auth || !auth.refreshToken) {
+      toast('Connect Dropbox first');
+      return Promise.resolve(null);
+    }
+    syncing = true;
+    refreshSyncUI();
+
+    return firstPushGate().then(pendingPush).then(function (items) {
+      if (!items.length) return { ok: 0, failed: [] };
+      return pool(items, 4, function (it) {
+        return withRetry(function () { return pushOne(it); });
+      });
+    }).then(function (res) {
+      if (res.ok) {
+        return syncStateSet('lastPushAt', new Date().toISOString())
+          .then(function () { return syncStateGet('firstPushAt'); })
+          .then(function (f) {
+            return f ? null : syncStateSet('firstPushAt', new Date().toISOString());
+          })
+          .then(function () { return res; });
+      }
+      return res;
+    }).then(function (res) {
+      if (!res.ok && !res.failed.length) toast('Already up to date');
+      else if (!res.failed.length) toast('Uploaded ' + res.ok);
+      else {
+        var conflicts = res.failed.filter(function (f) { return f.error.conflict; }).length;
+        console.error('push failures', res.failed);
+        // A failed record keeps no syncmeta entry, so it stays dirty and the
+        // next sync tries it again. Nothing local is changed or lost.
+        toast(conflicts
+          ? conflicts + ' need merging — coming in the next update'
+          : res.failed.length + ' failed to upload, will retry');
+      }
+      return res;
+    }).catch(function (e) {
+      console.error(e);
+      toast(e && e.message === 'Not connected to Dropbox'
+        ? 'Connect Dropbox first' : 'Could not reach Dropbox');
+      return null;
+    }).then(function (res) {
+      syncing = false;
+      return refreshSyncStats().then(function () { return res; });
+    });
+  }
+
   // ---------- ids ----------
   var B32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
   function ulid() {
@@ -859,6 +1052,7 @@
 
   function openSheet() {
     refreshStats();
+    refreshSyncStats();
     sheet.classList.add('open');
     scrim.classList.add('open');
     // Push a history entry so Android's back button dismisses the sheet
@@ -951,11 +1145,26 @@
     var connected = !!(auth && auth.refreshToken);
     $('connectBtn').hidden = connected;
     $('disconnectBtn').hidden = !connected;
+    $('syncBtn').hidden = !connected;
+    $('syncStats').hidden = !connected;
     $('manualHint').hidden = connected;
     if (connected) $('manualBox').hidden = true;
+    $('syncBtn').disabled = syncing;
+    $('syncBtn').textContent = syncing ? 'Uploading…' : 'Upload now';
     $('syncNote').textContent = connected
-      ? 'Connected to Dropbox. Nothing is uploaded yet — sync lands in the next update.'
+      ? 'Connected to Dropbox. One JSON file per entry, under memories/.'
       : 'Not connected. Entries stay on this phone only.';
+  }
+
+  function refreshSyncStats() {
+    if (!auth || !auth.refreshToken) return Promise.resolve();
+    return pendingPush().then(function (items) {
+      $('sPending').textContent = items.length;
+      return syncStateGet('lastPushAt');
+    }).then(function (at) {
+      $('sLastPush').textContent = at ? new Date(at).toLocaleString() : 'Never';
+      refreshSyncUI();
+    }).catch(function (e) { console.error(e); });
   }
 
   $('connectBtn').onclick = function () {
@@ -1001,6 +1210,8 @@
     disconnect();
   };
 
+  $('syncBtn').onclick = function () { push(); };
+
   // ---------- boot ----------
   openDB().then(function (d) {
     db = d;
@@ -1012,10 +1223,12 @@
     // Auth work happens after the first render: capture must never wait on it.
     // Kept off the boot chain's catch as well, so a Dropbox problem can never
     // present itself as "storage unavailable" and hide the entries.
-    loadAuth().then(handleAuthRedirect).then(refreshSyncUI).catch(function (e) {
-      console.error(e);
-      refreshSyncUI();
-    });
+    loadAuth().then(handleAuthRedirect).then(refreshSyncUI)
+      .then(refreshSyncStats)
+      .catch(function (e) {
+        console.error(e);
+        refreshSyncUI();
+      });
   }).catch(function (e) {
     listEl.innerHTML = '<div class="empty">Storage unavailable in this browser.<br>The app needs IndexedDB over https.</div>';
     console.error(e);
