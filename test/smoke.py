@@ -937,17 +937,154 @@ def test_capture_works_while_disconnected_and_offline(page, base_url):
 
 # ---------- push ----------
 
+def remote_record(rid, raw, updated, captured=None, deleted=False):
+    """A record as another device would have written it."""
+    ts = captured or updated
+    rec = {
+        "id": rid, "schemaVersion": 2, "raw": raw,
+        "capturedAt": ts, "captureSource": "text",
+        "enrichment": {"status": "pending", "model": None,
+                       "at": None, "confidence": None},
+        "type": None, "title": None, "occurredAt": None,
+        "tags": [], "rating": None, "details": {}, "links": [],
+        "userEdited": [], "media": [],
+        "createdAt": ts, "updatedAt": updated, "deleted": deleted,
+    }
+    if deleted:
+        rec["deletedAt"] = updated
+    return rec
+
+
 class FakeDropbox:
-    """A minimal stand-in for the app folder: path -> (rev, content)."""
+    """A stand-in for the app folder, with enough delta support to test cursors.
+
+    Every mutation bumps a version counter and appends to a journal, so
+    list_folder/continue can answer "what changed since this cursor".
+    """
 
     def __init__(self):
-        self.files = {}
+        self.files = {}        # path -> (rev, content)
         self.uploads = []      # every upload arg, in order
-        self.fail_next = None  # (count, status, body) to fail with
+        self.downloads = []    # every downloaded path, in order
+        self.lists = []        # "fresh" / "continue", in order
+        self.fail_next = None  # (count, status, body) applied to uploads
+        self.reset_cursor_once = False
         self._rev = 0
+        self._version = 0
+        self._journal = []     # (version, path, ".tag")
+        self._folders = set()  # folders persist once created, as in Dropbox
+
+    # -- test-side helpers, standing in for another device --
+
+    def seed(self, rec):
+        path = f"/memories/{rec['capturedAt'][:4]}/{rec['id']}.json"
+        self._write(path, json.dumps(rec, indent=2))
+        return path
+
+    def remove(self, path):
+        self.files.pop(path, None)
+        self._version += 1
+        self._journal.append((self._version, path, "deleted"))
+
+    def _write(self, path, content):
+        self._folders.add(path.rsplit("/", 1)[0].lower())
+        self._rev += 1
+        rev = f"rev{self._rev:012d}"
+        self.files[path] = (rev, content)
+        self._version += 1
+        self._journal.append((self._version, path, "file"))
+        return rev
 
     def install(self, page):
         page.route("https://content.dropboxapi.com/2/files/upload", self._upload)
+        page.route("https://content.dropboxapi.com/2/files/download", self._download)
+        page.route("https://api.dropboxapi.com/2/files/list_folder", self._list)
+        page.route(
+            "https://api.dropboxapi.com/2/files/list_folder/continue",
+            self._continue,
+        )
+
+    # -- endpoints --
+
+    def _entry(self, path, tag):
+        name = path.rsplit("/", 1)[-1]
+        if tag == "deleted":
+            return {".tag": "deleted", "name": name,
+                    "path_lower": path.lower(), "path_display": path}
+        rev, content = self.files[path]
+        return {
+            ".tag": "file", "name": name, "path_lower": path.lower(),
+            "path_display": path, "id": "id:" + path, "rev": rev,
+            "size": len(content), "server_modified": "2026-08-22T10:00:00Z",
+            "content_hash": "x" * 64,
+        }
+
+    def _list(self, route):
+        self.lists.append("fresh")
+        body = json.loads(route.request.post_data or "{}")
+        prefix = body.get("path", "").lower()
+        under = [p for p in self.files if p.lower().startswith(prefix + "/")]
+        known = any(f.startswith(prefix) for f in self._folders)
+        if not under and not known:
+            # A folder nothing has ever been written to does not exist. Once it
+            # has, it persists even when emptied.
+            route.fulfill(
+                status=409,
+                body='{"error_summary":"path/not_found/.",'
+                     '"error":{".tag":"path","path":{".tag":"not_found"}}}',
+            )
+            return
+        route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({
+                "entries": [self._entry(p, "file") for p in sorted(under)],
+                "cursor": str(self._version), "has_more": False,
+            }),
+        )
+
+    def _continue(self, route):
+        self.lists.append("continue")
+        if self.reset_cursor_once:
+            self.reset_cursor_once = False
+            route.fulfill(
+                status=409,
+                body='{"error_summary":"reset/.","error":{".tag":"reset"}}',
+            )
+            return
+        since = int(json.loads(route.request.post_data or "{}")["cursor"])
+        latest = {}
+        for version, path, tag in self._journal:
+            if version > since:
+                latest[path] = tag
+        entries = []
+        for path, tag in latest.items():
+            if tag == "file" and path not in self.files:
+                tag = "deleted"
+            entries.append(self._entry(path, tag))
+        route.fulfill(
+            status=200, content_type="application/json",
+            body=json.dumps({
+                "entries": entries, "cursor": str(self._version),
+                "has_more": False,
+            }),
+        )
+
+    def _download(self, route):
+        arg = json.loads(route.request.headers["dropbox-api-arg"])
+        path = arg["path"]
+        self.downloads.append(path)
+        match = next((p for p in self.files if p.lower() == path.lower()), None)
+        if match is None:
+            route.fulfill(status=409, body='{"error_summary":"path/not_found/."}')
+            return
+        rev, content = self.files[match]
+        route.fulfill(
+            status=200, body=content,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Dropbox-API-Result": json.dumps(self._entry(match, "file")),
+            },
+        )
 
     def _upload(self, route):
         arg = json.loads(route.request.headers["dropbox-api-arg"])
@@ -973,9 +1110,7 @@ class FakeDropbox:
             route.fulfill(status=409, body='{"error_summary":"path/conflict/file/."}')
             return
 
-        self._rev += 1
-        rev = f"rev{self._rev:012d}"
-        self.files[path] = (rev, body)
+        rev = self._write(path, body)
         route.fulfill(
             status=200, content_type="application/json",
             body=json.dumps({
@@ -987,7 +1122,16 @@ class FakeDropbox:
         )
 
     def json_at(self, path):
-        return json.loads(self.files[path][1])
+        match = next(p for p in self.files if p.lower() == path.lower())
+        return json.loads(self.files[match][1])
+
+    def records(self):
+        """Every record currently in the fake app folder, by id."""
+        out = {}
+        for path, (_rev, content) in self.files.items():
+            rec = json.loads(content)
+            out[rec["id"]] = rec
+        return out
 
 
 def sync_meta(page):
@@ -1097,7 +1241,7 @@ def test_push_is_incremental_and_uses_the_stored_rev(page, base_url):
     # Nothing changed: a second push must upload nothing at all.
     do_push(page)
     assert len(dbx.uploads) == 2, "unchanged records were re-uploaded"
-    assert "up to date" in page.inner_text("#toast")
+    assert "up to date" in page.inner_text("#toast").lower()
 
     # Edit one, and only that one goes up — with update(rev), not add.
     close_sheet(page)
@@ -1234,7 +1378,7 @@ def test_push_failure_leaves_the_record_dirty(page, base_url):
     open_sheet(page)
     do_push(page)
 
-    assert "failed to upload" in page.inner_text("#toast")
+    assert "failed, will retry" in page.inner_text("#toast")
     assert sync_meta(page) == [], "a failed upload must not be recorded as synced"
     wait_pending(page, 1)  # the record must stay dirty
 
@@ -1299,7 +1443,7 @@ def test_push_does_not_clobber_a_conflicting_remote_copy(page, base_url):
     open_sheet(page)
     do_push(page)
 
-    assert "merging" in page.inner_text("#toast")
+    assert "failed, will retry" in page.inner_text("#toast")
     assert json.loads(dbx.files[path][1])["raw"] == "theirs", \
         "the remote copy was clobbered instead of the conflict being reported"
     wait_pending(page, 1)  # the conflict must stay pending
@@ -1400,6 +1544,388 @@ def test_push_without_a_connection_does_nothing(page, base_url):
     assert page.locator("#syncBtn").is_hidden()
     assert page.locator("#syncStats").is_hidden()
     assert dbx.uploads == []
+
+
+# ---------- pull and merge ----------
+
+OLD = "2026-01-01T00:00:00.000Z"
+NEW = "2026-08-20T12:00:00.000Z"
+
+
+def local_record(page, rid):
+    for r in records(page):
+        if r["id"] == rid:
+            return r
+    return None
+
+
+def set_local(page, rid, **fields):
+    """Rewrite fields on a local record, standing in for an earlier edit."""
+    return page.evaluate("""
+        ([id, fields]) => new Promise((resolve, reject) => {
+            const req = indexedDB.open('memvault');
+            req.onerror = () => reject(req.error);
+            req.onsuccess = () => {
+                const store = req.result.transaction('memories', 'readwrite')
+                                .objectStore('memories');
+                const g = store.get(id);
+                g.onsuccess = () => {
+                    const rec = Object.assign(g.result, fields);
+                    const w = store.put(rec);
+                    w.onsuccess = () => resolve(rec);
+                    w.onerror = () => reject(w.error);
+                };
+            };
+        })
+    """, [rid, fields])
+
+
+@test
+def test_pull_brings_down_another_devices_entries(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+    dbx.seed(remote_record("mem_FROMLAPTOP0000000000000001", "written on the laptop", NEW))
+    dbx.seed(remote_record("mem_FROMLAPTOP0000000000000002", "and this one too", NEW))
+
+    boot(page, base_url)
+    connect_dropbox(page)
+    open_sheet(page)
+    do_push(page)
+
+    assert "2 down" in page.inner_text("#toast")
+    close_sheet(page)
+    assert sorted(texts(page)) == ["and this one too", "written on the laptop"]
+
+    # They land as full records, not as fragments.
+    rec = local_record(page, "mem_FROMLAPTOP0000000000000001")
+    assert set(rec) - V2_KEYS - OPTIONAL_KEYS == set()
+    assert V2_KEYS - set(rec) == set()
+
+    # And they are already accounted for, so nothing bounces straight back up.
+    assert dbx.uploads == []
+
+
+@test
+def test_first_sync_against_an_empty_remote_keeps_everything(page, base_url):
+    """An empty app folder means nothing has been uploaded — never "all deleted".
+
+    This is the specific path by which the only copy of the data could be
+    lost, so it gets its own test.
+    """
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+
+    boot(page, base_url)
+    capture(page, "the only copy")
+    capture(page, "also the only copy")
+    connect_dropbox(page)
+
+    page.once("dialog", lambda d: d.dismiss())
+    open_sheet(page)
+    do_push(page)
+
+    close_sheet(page)
+    assert sorted(texts(page)) == ["also the only copy", "the only copy"]
+    assert len(records(page)) == 2
+    assert len(dbx.files) == 2, "an empty remote should have been filled, not obeyed"
+
+
+@test
+def test_pull_never_deletes_a_local_record(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+    dbx.seed(remote_record("mem_ONLYONEREMOTE00000000000001", "the remote one", NEW))
+
+    boot(page, base_url)
+    capture(page, "local only, never uploaded")
+    connect_dropbox(page)
+
+    page.once("dialog", lambda d: d.dismiss())
+    open_sheet(page)
+    do_push(page)
+    close_sheet(page)
+
+    # The remote knew about one record; the local one must survive and go up.
+    assert sorted(texts(page)) == ["local only, never uploaded", "the remote one"]
+    assert len(records(page)) == 2
+    assert len(dbx.files) == 2
+
+
+@test
+def test_remote_tombstone_propagates(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+    rid = "mem_DELETEDELSEWHERE0000000001"
+    dbx.seed(remote_record(rid, "deleted on the other device", NEW, deleted=True))
+
+    boot(page, base_url)
+    connect_dropbox(page)
+    open_sheet(page)
+    do_push(page)
+    close_sheet(page)
+
+    # Hidden from the list...
+    assert texts(page) == []
+    # ...but present as a tombstone, so it can propagate on from here.
+    rec = local_record(page, rid)
+    assert rec is not None, "the tombstone was dropped instead of stored"
+    assert rec["deleted"] is True
+    assert rec["raw"] == "deleted on the other device"
+
+
+@test
+def test_merge_takes_the_newer_side(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+
+    boot(page, base_url)
+    capture(page, "mine, older")
+    rid = records(page)[0]["id"]
+    set_local(page, rid, updatedAt=OLD)
+    page.reload()
+    boot(page, base_url)
+
+    # The remote copy of the same record is newer.
+    dbx.seed(remote_record(rid, "theirs, newer", NEW,
+                           captured=records(page)[0]["capturedAt"]))
+
+    connect_dropbox(page)
+    page.once("dialog", lambda d: d.dismiss())
+    open_sheet(page)
+    do_push(page)
+    close_sheet(page)
+
+    assert texts(page) == ["theirs, newer"]
+    assert local_record(page, rid)["updatedAt"] == NEW
+    # Both sides agree, so nothing needs uploading.
+    assert dbx.records()[rid]["raw"] == "theirs, newer"
+
+
+@test
+def test_merge_keeps_the_newer_local_side_and_pushes_it(page, base_url):
+    """The other direction, and the path by which a step-3 conflict heals."""
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+
+    boot(page, base_url)
+    capture(page, "mine, newer")
+    rec = records(page)[0]
+    rid = rec["id"]
+
+    dbx.seed(remote_record(rid, "theirs, older", OLD, captured=rec["capturedAt"]))
+
+    connect_dropbox(page)
+    page.once("dialog", lambda d: d.dismiss())
+    open_sheet(page)
+    do_push(page)
+    close_sheet(page)
+
+    # Local wins and is written back up, so the two sides converge.
+    assert texts(page) == ["mine, newer"]
+    assert dbx.records()[rid]["raw"] == "mine, newer", \
+        "the newer local copy was not pushed back"
+    open_sheet(page)
+    wait_pending(page, 0)
+
+
+@test
+def test_a_delete_beats_an_edit_but_keeps_the_newer_text(page, base_url):
+    """Delete wins for the flag only; the newest text is still kept.
+
+    Straight tombstone-wins would honour the delete and silently discard the
+    concurrent edit, losing content that neither side asked to lose.
+    """
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+
+    boot(page, base_url)
+    capture(page, "original text")
+    rec = records(page)[0]
+    rid = rec["id"]
+
+    # Deleted here, at the older time.
+    page.once("dialog", lambda d: d.accept())
+    page.click(".entry .raw")
+    page.wait_for_selector(".edit-area")
+    page.click(".act-delete")
+    page.wait_for_function("() => document.querySelectorAll('.entry').length === 0")
+    set_local(page, rid, updatedAt=OLD, deletedAt=OLD)
+    page.reload()
+    boot(page, base_url)
+
+    # Edited on the other device, later, without knowing about the delete.
+    dbx.seed(remote_record(rid, "edited elsewhere, later", NEW,
+                           captured=rec["capturedAt"]))
+
+    connect_dropbox(page)
+    open_sheet(page)
+    do_push(page)
+    close_sheet(page)
+
+    merged = local_record(page, rid)
+    assert merged["deleted"] is True, "the delete was undone by a newer edit"
+    assert merged["raw"] == "edited elsewhere, later", \
+        "the concurrent edit was discarded"
+    assert texts(page) == []
+
+    # The merged tombstone goes back up, so the other device learns about it.
+    assert dbx.records()[rid]["deleted"] is True
+    assert dbx.records()[rid]["raw"] == "edited elsewhere, later"
+
+
+@test
+def test_a_file_deleted_in_dropbox_is_restored_not_obeyed(page, base_url):
+    """Deleting a file by hand in Dropbox must heal, not destroy."""
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+
+    boot(page, base_url)
+    capture(page, "do not lose me")
+    connect_dropbox(page)
+    page.once("dialog", lambda d: d.dismiss())
+    open_sheet(page)
+    do_push(page)
+    path = dbx.uploads[0]["path"]
+    assert len(dbx.files) == 1
+
+    # Someone deletes the file directly in Dropbox.
+    dbx.remove(path)
+    assert dbx.files == {}
+
+    do_push(page)
+    close_sheet(page)
+
+    assert texts(page) == ["do not lose me"], "the local record was deleted"
+    assert len(records(page)) == 1
+    assert len(dbx.files) == 1, "the file was not restored"
+    assert dbx.json_at(path)["raw"] == "do not lose me"
+
+
+@test
+def test_sync_uses_the_cursor_for_later_runs(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+    dbx.seed(remote_record("mem_CURSORTEST000000000000001", "first remote", NEW))
+
+    boot(page, base_url)
+    connect_dropbox(page)
+    open_sheet(page)
+    do_push(page)
+    assert dbx.lists == ["fresh"]
+    assert len(dbx.downloads) == 1
+
+    # Nothing changed remotely: the delta is empty and nothing is downloaded.
+    do_push(page)
+    assert dbx.lists == ["fresh", "continue"]
+    assert len(dbx.downloads) == 1, "an unchanged record was downloaded again"
+
+    # One new record appears remotely; only that one comes down.
+    dbx.seed(remote_record("mem_CURSORTEST000000000000002", "second remote", NEW))
+    do_push(page)
+    assert len(dbx.downloads) == 2, dbx.downloads
+    close_sheet(page)
+    assert sorted(texts(page)) == ["first remote", "second remote"]
+
+
+@test
+def test_a_reset_cursor_falls_back_to_a_full_list(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+    dbx.seed(remote_record("mem_RESETTEST0000000000000001", "before the reset", NEW))
+
+    boot(page, base_url)
+    connect_dropbox(page)
+    open_sheet(page)
+    do_push(page)
+    # Dropbox forgets the cursor. Re-listing must recover rather than fail.
+    dbx.reset_cursor_once = True
+    dbx.seed(remote_record("mem_RESETTEST0000000000000002", "after the reset", NEW))
+    do_push(page)
+
+    assert dbx.lists == ["fresh", "continue", "fresh"], dbx.lists
+    close_sheet(page)
+    assert sorted(texts(page)) == ["after the reset", "before the reset"]
+
+
+@test
+def test_an_unreadable_remote_file_is_skipped(page, base_url):
+    """One corrupt file must not wedge sync for everything else."""
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+    dbx.seed(remote_record("mem_GOODFILE000000000000000001", "perfectly fine", NEW))
+    dbx._write("/memories/2026/mem_BROKEN000000000000000001.json", "{not json at all")
+
+    boot(page, base_url)
+    connect_dropbox(page)
+    open_sheet(page)
+    do_push(page)
+    close_sheet(page)
+
+    assert texts(page) == ["perfectly fine"]
+    assert len(records(page)) == 1
+
+
+@test
+def test_sync_ignores_files_outside_memories(page, base_url):
+    """meta.json and reviews/ arrive in later phases and must not be parsed."""
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+    dbx.seed(remote_record("mem_REALRECORD00000000000001", "a real record", NEW))
+    dbx._write("/meta.json", json.dumps({"types": ["book"]}))
+    dbx._write("/reviews/2026-08.ndjson", '{"card":"x"}')
+
+    boot(page, base_url)
+    connect_dropbox(page)
+    open_sheet(page)
+    do_push(page)
+    close_sheet(page)
+
+    assert texts(page) == ["a real record"]
+    assert len(records(page)) == 1
+    for p in dbx.downloads:
+        assert p.startswith("/memories/"), p
+
+
+@test
+def test_sync_leaves_the_export_intact(page, base_url):
+    seen, dbx = [], FakeDropbox()
+    stub_dropbox(page, seen)
+    dbx.install(page)
+    dbx.seed(remote_record("mem_FROMREMOTE00000000000001", "came from Dropbox", NEW))
+
+    boot(page, base_url)
+    capture(page, "made here")
+    export_backup(page)
+
+    connect_dropbox(page)
+    open_sheet(page)
+    do_push(page)
+    close_sheet(page)
+
+    payload, _, _ = export_backup(page)
+    raws = sorted(r["raw"] for r in payload["memories"])
+    assert raws == ["came from Dropbox", "made here"]
+
+    for rec in payload["memories"]:
+        extra = set(rec) - V2_KEYS - OPTIONAL_KEYS
+        assert not extra, f"sync fields leaked into the export: {sorted(extra)}"
+        assert V2_KEYS - set(rec) == set()
+
+    blob = json.dumps(payload)
+    for secret in ["rev0000", "refresh-token-abc", "sl.short-lived-token", "cursor"]:
+        assert secret not in blob, f"{secret!r} leaked into the export"
 
 
 @test

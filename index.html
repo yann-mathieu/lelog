@@ -242,12 +242,12 @@
     <p id="syncNote">Not connected. Entries stay on this phone only.</p>
     <div class="row">
       <button class="btn" id="connectBtn">Connect Dropbox</button>
-      <button class="btn" id="syncBtn" hidden>Upload now</button>
+      <button class="btn" id="syncBtn" hidden>Sync now</button>
       <button class="btn ghost" id="disconnectBtn" hidden>Disconnect</button>
     </div>
     <div id="syncStats" hidden>
       <div class="stat"><span>Waiting to upload</span><b id="sPending">0</b></div>
-      <div class="stat"><span>Last upload</span><b id="sLastPush">Never</b></div>
+      <div class="stat"><span>Last sync</span><b id="sLastPush">Never</b></div>
     </div>
     <p id="manualHint" style="margin-bottom:0">
       <button class="linkbtn" id="manualBtn"
@@ -359,6 +359,9 @@
   function syncMetaPut(m) { return idb(tx('readwrite', SYNCMETA).put(m)); }
   function syncMetaAll() {
     return idb(tx('readonly', SYNCMETA).getAll()).then(function (r) { return r || []; });
+  }
+  function syncMetaDelete(id) {
+    return idb(tx('readwrite', SYNCMETA)['delete'](id));
   }
 
   function syncStateGet(key) {
@@ -580,7 +583,11 @@
   }
 
   // ---------- dropbox api ----------
-  var DBX_UPLOAD_URL = 'https://content.dropboxapi.com/2/files/upload';
+  var DBX_UPLOAD_URL = 'https://content.dropboxapi.com/2/files/upload',
+      DBX_DOWNLOAD_URL = 'https://content.dropboxapi.com/2/files/download',
+      DBX_LIST_URL = 'https://api.dropboxapi.com/2/files/list_folder',
+      DBX_CONTINUE_URL = 'https://api.dropboxapi.com/2/files/list_folder/continue',
+      MEMORIES = '/memories';
 
   // Dropbox-API-Arg travels in an HTTP header, which must be ASCII. Paths are
   // ASCII today (ULIDs and digits), but media filenames later will not be.
@@ -625,6 +632,39 @@
     }).then(function (res) {
       if (res.ok) return res.json();
       return dbxError(res).then(function (e) { throw e; });
+    });
+  }
+
+  function dbxRpc(url, body) {
+    return accessToken().then(function (token) {
+      return fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + token,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(body)
+      });
+    }).then(function (res) {
+      if (res.ok) return res.json();
+      return dbxError(res).then(function (e) { throw e; });
+    });
+  }
+
+  function dbxDownload(path) {
+    return accessToken().then(function (token) {
+      return fetch(DBX_DOWNLOAD_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + token,
+          'Dropbox-API-Arg': headerArg({ path: path })
+        }
+      });
+    }).then(function (res) {
+      if (!res.ok) return dbxError(res).then(function (e) { throw e; });
+      var rev = null, api = res.headers.get('Dropbox-API-Result');
+      if (api) { try { rev = JSON.parse(api).rev; } catch (e) { rev = null; } }
+      return res.text().then(function (t) { return { text: t, rev: rev }; });
     });
   }
 
@@ -717,9 +757,224 @@
     });
   }
 
+  function pushChanges() {
+    return pendingPush().then(function (items) {
+      if (!items.length) return { ok: 0, failed: [] };
+      return pool(items, 4, function (it) {
+        return withRetry(function () { return pushOne(it); });
+      });
+    }).then(function (res) {
+      if (!res.ok) return res;
+      return syncStateSet('lastPushAt', new Date().toISOString())
+        .then(function () { return syncStateGet('firstPushAt'); })
+        .then(function (f) {
+          return f ? null : syncStateSet('firstPushAt', new Date().toISOString());
+        })
+        .then(function () { return res; });
+    });
+  }
+
+  // ---------- pull ----------
+  function isRecordPath(p) {
+    return /^\/memories\/[^/]+\/[^/]+\.json$/.test(p || '');
+  }
+
+  function looksLikeRecord(r) {
+    return !!r && typeof r === 'object' &&
+      typeof r.id === 'string' && r.id &&
+      typeof r.raw === 'string' &&
+      typeof r.updatedAt === 'string' && r.updatedAt;
+  }
+
+  // Record-level last-write-wins on updatedAt. Remote wins ties, which is what
+  // makes two devices converge: the one holding the remote copy is already in
+  // that state, so both sides reach the same answer.
+  function mergeRecord(remote, local) {
+    var winner = (!local || remote.updatedAt >= local.updatedAt) ? remote : local;
+    var merged = JSON.parse(JSON.stringify(winner));
+    // A delete beats an edit, but only the delete itself: the newest text is
+    // still kept, so neither side loses content. Straight tombstone-wins would
+    // honour the delete and silently discard a concurrent edit.
+    if ((local && local.deleted) || remote.deleted) {
+      merged.deleted = true;
+      merged.deletedAt = merged.deletedAt ||
+        (local && local.deletedAt) || remote.deletedAt || merged.updatedAt;
+    }
+    return merged;
+  }
+
+  function pullOne(entry) {
+    var path = entry.path_lower || entry.path_display;
+    return dbxDownload(path).then(function (got) {
+      var remote = null;
+      try { remote = JSON.parse(got.text); } catch (e) { remote = null; }
+      if (!looksLikeRecord(remote)) {
+        // Unreadable or not a record. Skipping is permanent, not a failure, so
+        // one bad file cannot wedge sync forever.
+        console.warn('skipping unreadable record at', path);
+        return 'skipped';
+      }
+
+      var local = null;
+      for (var i = 0; i < all.length; i++) {
+        if (all[i].id === remote.id) { local = all[i]; break; }
+      }
+      var merged = mergeRecord(remote, local);
+
+      return put(merged).then(function () {
+        // If the merge produced something other than what Dropbox holds, the
+        // record still owes an upload. Recording a null syncedUpdatedAt leaves
+        // it dirty, so push writes the merged version back.
+        var settled = recordJSON(merged) === got.text.trim() ||
+                      recordJSON(merged) === recordJSON(remote);
+        return syncMetaPut({
+          id: merged.id,
+          path: path,
+          rev: entry.rev || got.rev || null,
+          syncedUpdatedAt: settled ? remote.updatedAt : null
+        });
+      }).then(function () { return 'applied'; });
+    });
+  }
+
+  // A file vanishing from Dropbox is not a tombstone. Drop our record of it so
+  // the local copy re-uploads, which makes deleting a file by hand in Dropbox
+  // heal itself instead of destroying data.
+  function forgetRemoteFile(entry) {
+    var path = (entry.path_lower || entry.path_display || '').toLowerCase();
+    return syncMetaAll().then(function (metas) {
+      var hit = null;
+      metas.forEach(function (m) {
+        if ((m.path || '').toLowerCase() === path) hit = m;
+      });
+      return hit ? syncMetaDelete(hit.id) : null;
+    });
+  }
+
+  // Resolves { page, fresh }. `fresh` matters: a full listing is a complete
+  // picture of the folder, which a delta is not.
+  function listPage() {
+    return syncStateGet('cursor').then(function (cursor) {
+      if (!cursor) {
+        return listFresh().then(function (p) { return { page: p, fresh: true }; });
+      }
+      return dbxRpc(DBX_CONTINUE_URL, { cursor: cursor }).then(function (p) {
+        return { page: p, fresh: false };
+      }).catch(function (e) {
+        // Dropbox can no longer describe the delta from this cursor. Listing
+        // the folder again is safe because applying a record is idempotent.
+        if (e.status === 409 && /reset/.test(e.body || '')) {
+          return listFresh().then(function (p) { return { page: p, fresh: true }; });
+        }
+        throw e;
+      });
+    });
+  }
+
+  // Only valid after a full listing. Anything we believed was synced but is no
+  // longer there has been removed in Dropbox; forgetting it leaves the local
+  // record dirty so it uploads again. A delta cannot support this, because an
+  // absent path there just means "unchanged".
+  function reconcileMissing(paths) {
+    var present = {};
+    paths.forEach(function (p) { present[(p || '').toLowerCase()] = true; });
+    return syncMetaAll().then(function (metas) {
+      var stale = metas.filter(function (m) {
+        return m.path && !present[m.path.toLowerCase()];
+      });
+      return Promise.all(stale.map(function (m) { return syncMetaDelete(m.id); }));
+    });
+  }
+
+  function listFresh() {
+    return dbxRpc(DBX_LIST_URL, {
+      path: MEMORIES,
+      recursive: true,
+      include_deleted: false,
+      include_media_info: false,
+      include_has_explicit_shared_members: false,
+      include_mounted_folders: false
+    }).catch(function (e) {
+      // The folder does not exist because nothing has been uploaded yet. That
+      // is an empty remote, never "everything was deleted".
+      if (e.status === 409 && /not_found/.test(e.body || '')) {
+        return { entries: [], cursor: null, has_more: false };
+      }
+      throw e;
+    });
+  }
+
+  function pull() {
+    var entries = [], fresh = false;
+    function drain(page) {
+      entries = entries.concat(page.entries || []);
+      if (page.has_more) {
+        return dbxRpc(DBX_CONTINUE_URL, { cursor: page.cursor }).then(drain);
+      }
+      return page.cursor;
+    }
+
+    return listPage().then(function (r) {
+      fresh = r.fresh;
+      return drain(r.page);
+    }).then(function (cursor) {
+      var files = [], gone = [];
+      entries.forEach(function (e) {
+        var p = e.path_lower || e.path_display || '';
+        if (!isRecordPath(p)) return;      // leaves room for meta.json, reviews/
+        if (e['.tag'] === 'deleted') gone.push(e);
+        else if (e['.tag'] === 'file') files.push(e);
+      });
+
+      var skipped = 0;
+      return syncMetaAll().then(function (metas) {
+        var revByPath = {};
+        metas.forEach(function (m) {
+          if (m.path) revByPath[m.path.toLowerCase()] = m.rev;
+        });
+        // Reconciliation needs the complete listing, so it runs before the
+        // unchanged files are filtered out.
+        return Promise.resolve(fresh
+          ? reconcileMissing(files.map(function (f) {
+              return f.path_lower || f.path_display;
+            }))
+          : null
+        ).then(function () {
+          // Anything still at the rev we already hold is unchanged. That
+          // includes the files this device uploaded itself, which a full
+          // listing would otherwise hand straight back.
+          return files.filter(function (f) {
+            var p = (f.path_lower || f.path_display || '').toLowerCase();
+            return !(revByPath[p] && revByPath[p] === f.rev);
+          });
+        });
+      }).then(function (changed) {
+        return pool(changed, 4, function (f) {
+          return withRetry(function () { return pullOne(f); }).then(function (r) {
+            if (r === 'skipped') skipped++;
+          });
+        });
+      }).then(function (res) {
+        return Promise.all(gone.map(forgetRemoteFile)).then(function () {
+          return res;
+        });
+      }).then(function (res) {
+        // Only advance the cursor once the whole batch applied. Storing it
+        // after a partial batch would skip the records that failed, for good.
+        if (res.failed.length || !cursor) {
+          return { ok: res.ok, failed: res.failed, skipped: skipped };
+        }
+        return syncStateSet('cursor', cursor).then(function () {
+          return { ok: res.ok, failed: res.failed, skipped: skipped };
+        });
+      });
+    });
+  }
+
+  // ---------- sync ----------
   var syncing = false;
 
-  function push() {
+  function sync() {
     if (syncing) return Promise.resolve(null);
     if (!auth || !auth.refreshToken) {
       toast('Connect Dropbox first');
@@ -728,34 +983,35 @@
     syncing = true;
     refreshSyncUI();
 
-    return firstPushGate().then(pendingPush).then(function (items) {
-      if (!items.length) return { ok: 0, failed: [] };
-      return pool(items, 4, function (it) {
-        return withRetry(function () { return pushOne(it); });
-      });
-    }).then(function (res) {
-      if (res.ok) {
-        return syncStateSet('lastPushAt', new Date().toISOString())
-          .then(function () { return syncStateGet('firstPushAt'); })
-          .then(function (f) {
-            return f ? null : syncStateSet('firstPushAt', new Date().toISOString());
-          })
-          .then(function () { return res; });
+    var down = null;
+    // Pull first, then push. That is what makes a conflicting push heal by
+    // itself: the pull brings down the remote copy and its current rev, the
+    // merge picks a winner, and the push then writes with a rev Dropbox
+    // accepts. No conflict is ever surfaced to the user.
+    return firstPushGate().then(pull).then(function (res) {
+      down = res;
+      return getAll();
+    }).then(function (rows) {
+      all = rows;
+      render();
+      refreshStats();
+      maybeBanner();
+      return pushChanges();
+    }).then(function (up) {
+      var failed = down.failed.length + up.failed.length;
+      if (failed) {
+        console.error('sync failures', down.failed, up.failed);
+        toast(failed + (failed === 1 ? ' change' : ' changes') + ' failed, will retry');
+      } else if (!down.ok && !up.ok) {
+        toast('Up to date');
+      } else {
+        var parts = [];
+        if (down.ok) parts.push(down.ok + ' down');
+        if (up.ok) parts.push(up.ok + ' up');
+        toast('Synced — ' + parts.join(', '));
       }
-      return res;
-    }).then(function (res) {
-      if (!res.ok && !res.failed.length) toast('Already up to date');
-      else if (!res.failed.length) toast('Uploaded ' + res.ok);
-      else {
-        var conflicts = res.failed.filter(function (f) { return f.error.conflict; }).length;
-        console.error('push failures', res.failed);
-        // A failed record keeps no syncmeta entry, so it stays dirty and the
-        // next sync tries it again. Nothing local is changed or lost.
-        toast(conflicts
-          ? conflicts + ' need merging — coming in the next update'
-          : res.failed.length + ' failed to upload, will retry');
-      }
-      return res;
+      if (down.skipped) console.warn(down.skipped + ' unreadable file(s) skipped');
+      return { down: down, up: up };
     }).catch(function (e) {
       console.error(e);
       toast(e && e.message === 'Not connected to Dropbox'
@@ -1150,7 +1406,7 @@
     $('manualHint').hidden = connected;
     if (connected) $('manualBox').hidden = true;
     $('syncBtn').disabled = syncing;
-    $('syncBtn').textContent = syncing ? 'Uploading…' : 'Upload now';
+    $('syncBtn').textContent = syncing ? 'Syncing…' : 'Sync now';
     $('syncNote').textContent = connected
       ? 'Connected to Dropbox. One JSON file per entry, under memories/.'
       : 'Not connected. Entries stay on this phone only.';
@@ -1210,7 +1466,7 @@
     disconnect();
   };
 
-  $('syncBtn').onclick = function () { push(); };
+  $('syncBtn').onclick = function () { sync(); };
 
   // ---------- boot ----------
   openDB().then(function (d) {
