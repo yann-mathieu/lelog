@@ -1,7 +1,7 @@
 /* Log — offline shell.
    Cache-first for the app shell so capture works with no signal.
    Bump CACHE when files change to force an update. */
-var CACHE = 'log-v0-2';
+var CACHE = 'log-v1-0';
 var ASSETS = [
   './',
   './index.html',
