@@ -4,6 +4,8 @@ A private capture app for things worth remembering: books, people, meals, places
 
 Full design rationale lives in **`docs/architecture.md`**. Read it before making architectural changes — most of the non-obvious decisions there have reasons that aren't visible from the code.
 
+Unscheduled ideas live in **`docs/ideas.md`** — things worth building, not yet committed to, with the reasoning attached. Add to it freely; don't treat anything in it as agreed work.
+
 ## Current state
 
 **v0, shipped.** One text box, list, search, edit, soft delete, export/import. Local-only (IndexedDB). Installable PWA, works offline. No AI, no sync, no accounts.
