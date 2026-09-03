@@ -1,8 +1,10 @@
 # Personal Memory Vault — Architecture & Plan
 
-**Status:** Draft v4 for review
-**Date:** 13 August 2026
-**Working name:** MemoryVault *(placeholder)*
+**Status:** Draft v4, with phase 1 corrections
+**Date:** 13 August 2026; corrected 2 September 2026
+**Name:** Le Log *(was MemoryVault; §10 question 1 is settled)*
+
+**Corrections of 2 September 2026.** Phases 0 and 1 are built and in daily use. Where this document and the code disagree, the code is right and the disagreement is marked inline. Three sections were materially wrong: §5.1–5.3 (folder name, merge strategy), §7 (tech stack), §10 (the name). Everything else stands.
 
 **Changes since v4.0:** added §1.1 — this is a log, not a diary or a notes app, and the design consequences that follow (no streaks, no calendar view, no daily prompt).
 
@@ -242,12 +244,12 @@ Substantially unchanged from v3 — the file-per-record design turns out to be e
 
 ### 5.1 Dropbox
 
-An app registered with **App folder** scope: it can only ever see `/Apps/MemoryVault/`, structurally incapable of reading anything else in your Dropbox. OAuth 2 with PKCE (supported for public clients), `token_access_type=offline` for a refresh token so you authorise once.
+An app registered with **App folder** scope: it can only ever see `/Apps/LeLog/`, structurally incapable of reading anything else in your Dropbox. OAuth 2 with PKCE (supported for public clients), `token_access_type=offline` for a refresh token so you authorise once.
 
 ### 5.2 Layout
 
 ```
-/Apps/MemoryVault/
+/Apps/LeLog/
 ├── memories/2026/mem_01J8XQZ4K2N7.json
 ├── reviews/2026-08.ndjson        ← append-only
 ├── media/mem_01J8XQZ4K2N7/cover.jpg
@@ -258,11 +260,21 @@ An app registered with **App folder** scope: it can only ever see `/Apps/MemoryV
 
 ### 5.3 Local cache and sync
 
-Full local copy in IndexedDB via Dexie. Dropbox is the source of truth; the phone is a rebuildable cache — which is precisely why the standard PWA objection about storage eviction doesn't bite.
+Full local copy in IndexedDB, written directly rather than through Dexie — see §7. Dropbox is the source of truth; the phone is a rebuildable cache, which is precisely why the standard PWA objection about storage eviction doesn't bite.
 
-Push uses `WriteMode.update(rev)` so concurrent edits are detected rather than clobbered; conflicts merge field-by-field on `updatedAt`. Pull uses `files/list_folder/continue` with a stored cursor, so only changes come down.
+Push uses `WriteMode.update(rev)` so concurrent edits are detected rather than clobbered. Pull uses `files/list_folder/continue` with a stored cursor, so only changes come down. Sync runs pull-then-push, which is what makes a rejected push heal by itself: the pull brings down the remote copy and its current rev, the merge picks a winner, and the push then writes with a rev Dropbox accepts. No conflict is ever surfaced to the user.
 
-**One new wrinkle:** enrichment produces a second write to every record, a minute or two after capture. Harmless — but sync should debounce so it doesn't upload the same record twice in quick succession.
+**Correction: conflicts do not merge field-by-field.** This paragraph originally specified field-level merge on `updatedAt`. That is not implementable against this schema — a record carries one record-level `updatedAt`, so there are no per-field clocks to compare. The charitable reading, "newer record wins but fill nulls from the older one", is worse than useless: deleting a tag on one device would see it restored from an older copy on another, so removing a *value* could never propagate.
+
+What is built instead is **record-level last-write-wins on `updatedAt`, with remote winning ties.** Remote-wins is what makes two devices converge — the device holding the remote copy is already in that state, so both sides reach the same answer. An early note here proposed breaking ties on `rev`; that was wrong, revs are not meaningfully comparable.
+
+**Deletion is the one departure from plain LWW.** If either side has `deleted: true` the result is deleted, but everything else still follows last-write-wins. Delete on your phone while your laptop edits the text and you get a tombstone carrying the newer text. Strict tombstone-wins would honour the delete and silently discard the edit; since a tombstone retains `raw`, this way neither side loses content.
+
+**What this costs.** Editing the same entry on two offline devices discards one edit rather than merging them, and `updatedAt` is wall-clock time from whichever device wrote it, so a device with a skewed clock systematically wins or loses. Dropbox version history is the recovery path. Per-field clocks would fix both and belong in phase 2, when enrichment starts writing to records concurrently with the user — which is the first time genuinely concurrent field-level writes can occur at all. Until then, field-level merge is machinery for a conflict that cannot happen.
+
+**Three rules the implementation holds to, each with a test.** Pull never deletes a local record; only `deleted: true` inside a file marks a deletion. A file vanishing from Dropbox is not a tombstone — the local copy re-uploads, so deleting a file by hand heals rather than destroys. An empty or missing remote folder means nothing has been uploaded, never that everything was deleted. That last one is the specific path by which the only copy of the data could be lost.
+
+**One new wrinkle:** enrichment will produce a second write to every record, a minute or two after capture. Handled — change-driven syncs are debounced, so a burst of writes uploads once.
 
 ### 5.4 Links, still one-sided
 
@@ -326,14 +338,16 @@ Turn on 2FA for your Dropbox account. Under this architecture it is the security
 
 ## 7. Tech stack
 
-| Layer | Choice | Note |
+**This table describes a plan that was not followed.** Phase 0 shipped as vanilla HTML, CSS and JavaScript in one file, with no build step and no dependencies, and phase 1 kept it that way — the six Dropbox endpoints needed are about 120 lines of `fetch`. That constraint is now recorded in `CLAUDE.md` and has held through two phases. The right-hand column below records what was actually built.
+
+| Layer | Original choice | Built as |
 |---|---|---|
-| Framework | React + TypeScript, Vite | |
-| PWA shell | `vite-plugin-pwa` (Workbox) | |
-| Local DB | Dexie.js over IndexedDB | |
-| Search | MiniSearch | Searches `raw` *and* derived fields, so it works before enrichment |
-| Dropbox | Official `dropbox` SDK | PKCE, delta cursors |
-| UI | Tailwind CSS | |
+| Framework | React + TypeScript, Vite | None. One `index.html`. |
+| PWA shell | `vite-plugin-pwa` (Workbox) | Hand-written `sw.js`, ~50 lines |
+| Local DB | Dexie.js over IndexedDB | IndexedDB directly |
+| Search | MiniSearch | Substring match over `raw`; revisit when enrichment adds fields to search |
+| Dropbox | Official `dropbox` SDK | `fetch` against the HTTP API |
+| UI | Tailwind CSS | Plain CSS with custom properties |
 | **Enrichment** | **Claude API, structured outputs** | Strict schema prevents field invention |
 | **On-device option** | **WebLLM / WebGPU** | Phase 5 experiment; viable but heavy |
 | Spaced repetition | `ts-fsrs` | Shares the question generator with enrichment |
@@ -386,7 +400,7 @@ Twenty cards, two minutes, bounded. A quiz that feels like homework is abandoned
 | Phase | Ships | You get |
 |---|---|---|
 | **0** ✅ | **Built.** One text box, save, edit, search, export/import. Local-only (IndexedDB), installable PWA, offline. No AI, no sync, no accounts. | A usable capture app today |
-| **1** | Dropbox: app registration, OAuth, sync engine. *(~10 min of setup from you.)* | Backup and multi-device |
+| **1** ✅ | **Built.** Dropbox: app registration, OAuth PKCE, sync engine, automatic sync. | Backup and multi-device |
 | **2** | Enrichment: extraction, types, tags, confidence, review queue | The structure appears by itself |
 | **3** | Links + entity resolution, the question queue *(enrichment mode)*, app lock | Connected data, richer notes |
 | **4** | Quiz mode over the same queue, FSRS scheduling | The reason for the project |
@@ -402,7 +416,7 @@ It also means the Memento trial is redundant. Phase 0 *is* the trial, in the rea
 
 ## 10. Open questions
 
-1. **Name?**
+1. ~~**Name?**~~ *Settled: Le Log. The Dropbox app folder is `/Apps/LeLog/`.*
 2. **Whose API key?** Yours pasted into settings (simple, your bill, ~pennies a month) or a small proxy (cleaner, adds a server).
 3. **Default for the social cluster:** cloud enrichment on, or private-by-default with weaker extraction? This is the §6.3 decision and only you can make it.
 4. **Learning a language?** If so, vocabulary moves up — it's the best spaced-repetition fit in the catalogue.

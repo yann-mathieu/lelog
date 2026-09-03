@@ -8,9 +8,11 @@ Unscheduled ideas live in **`docs/ideas.md`** — things worth building, not yet
 
 ## Current state
 
-**v0, shipped.** One text box, list, search, edit, soft delete, export/import. Local-only (IndexedDB). Installable PWA, works offline. No AI, no sync, no accounts.
+**Phases 0 and 1 shipped, in daily use since August 2026.** One text box, list, search, edit, soft delete, export/import, and Dropbox sync. Installable PWA, works offline. No AI, no accounts.
 
-Vanilla HTML/CSS/JS in a single `index.html`. **No build step, no dependencies, no framework.** Keep it that way unless there's a strong reason — the whole thing is seven files and that simplicity is a feature.
+Sync is done: OAuth 2 with PKCE, one JSON file per record under `memories/{year}/`, cursor-based delta pull, `WriteMode.update(rev)` on push, record-level last-write-wins merge, and automatic syncing on change and on launch. §5 of the architecture doc describes the design; §5.3 records where the implementation deliberately departs from the original plan.
+
+Vanilla HTML/CSS/JS in a single `index.html`. **No build step, no dependencies, no framework.** The whole app is six files at the repo root and that simplicity is a feature. Keep it that way — the architecture doc's §7 tech stack table names React, Vite, Dexie and Tailwind, and none of them were used; that section documents an abandoned plan, not the code.
 
 ## Invariants — do not break these
 
@@ -19,14 +21,16 @@ Vanilla HTML/CSS/JS in a single `index.html`. **No build step, no dependencies, 
 3. **Deletes are tombstones** (`deleted: true`), never removals. Required for sync to propagate deletes correctly later.
 4. **Capture never blocks.** No spinner, no network, no required field, no type picker. Save is instant and works offline. Enrichment is always async and always optional.
 5. **This is a log, not a diary.** No streaks, no calendar view, no "how was your day?" prompt, no visible gaps for missed days. The unit is an *encounter*, not a day. See §1.1 of the architecture doc.
-6. **Export must keep working.** Until Dropbox sync exists, the phone is the only copy and export is the entire safety net.
+6. **Export must keep working.** Sync is replication, not backup — it copies a mistake to every device faithfully. Export is still the only thing that recovers from one. Any change touching the record shape must keep the exported JSON exactly the v2 schema; there is a test asserting it.
+7. **Sync never deletes local data.** Only a record whose `deleted` flag is `true` counts as a deletion. A file missing from Dropbox means re-upload it, never delete it locally, and an empty remote folder means nothing has been uploaded yet — never that everything was deleted. Three tests cover this; it is the path by which the only copy of the data could be lost.
+8. **Dropbox bookkeeping stays out of the record.** Revs, cursors and tokens live in the `syncmeta` and `syncstate` stores. Export is a straight dump of the record objects, so anything added to a record lands in the backup file.
 
 ## Roadmap
 
 | Phase | Scope |
 |---|---|
 | 0 ✅ | Capture, search, export. Local-only. |
-| 1 | Dropbox sync (App folder scope, OAuth PKCE, one JSON file per record) |
+| 1 ✅ | Dropbox sync (App folder scope, OAuth PKCE, one JSON file per record) |
 | 2 | AI enrichment: extraction, types, tags, confidence, review queue |
 | 3 | Links + entity resolution, question queue (enrichment mode), app lock |
 | 4 | Quiz mode over the same queue, FSRS scheduling |
@@ -36,8 +40,29 @@ The enrichment questioner and the quiz questioner are **the same component** at 
 
 ## Testing
 
-No test runner. There's a Playwright smoke suite covering capture, edit, tombstone delete, search, export/import round-trip, reload persistence, schema shape, and service worker registration. Serve locally over http (`python3 -m http.server`) — `file://` won't work, since IndexedDB and service workers need a real origin.
+62 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account.
+
+```bash
+python3 test/smoke.py            # all
+python3 test/smoke.py search     # only tests matching "search"
+```
+
+Needs Playwright once: `pip install playwright && python3 -m playwright install chromium`.
+
+**Run it before and after every change.** Several tests exist specifically to catch regressions that would silently destroy data — the export shape, the three sync-never-deletes rules, and the v1→v2 database upgrade. When adding behaviour, add the test that fails without it, then check the test actually fails when you break the code deliberately. That practice has caught two real gaps in this suite already, both in sync paths that looked covered but were not.
+
+`file://` will not work — IndexedDB and service workers need a real origin.
 
 ## Deployment
 
-GitHub Pages from repo root → `https://yann-mathieu.github.io/lelog/`. All paths are relative so the `/lelog/` subdirectory works unchanged. Bump `CACHE` in `sw.js` when shipping changes, or clients keep the old shell.
+`git push` → GitHub Pages redeploys from `main` in a minute or two → `https://yann-mathieu.github.io/lelog/`. All paths are relative so the `/lelog/` subdirectory works unchanged.
+
+**Bump `CACHE` in `sw.js` whenever `index.html` changes**, or the service worker keeps serving the old shell and clients never see the update.
+
+The repo is public because Pages will not serve a private repo on a free plan. `index.html` carries a `noindex` tag so the app stays out of search results. Nothing sensitive is in here: entries live in IndexedDB and the user's Dropbox, and the Dropbox app key in `index.html` is public by design under PKCE. Don't commit backup JSON.
+
+## Working from a phone
+
+Cloud sessions start cold with only this repo, so this file, `docs/architecture.md` and `docs/ideas.md` are the entire context. Keep them true.
+
+The cloud environment needs a setup script to run the tests — see `.claude/cloud-setup.sh`. Point the environment's setup script at it, and allow `cdn.playwright.dev` in the environment's network access or the Chromium download will fail.
