@@ -121,6 +121,7 @@
     display: flex; gap: 9px; align-items: center;
   }
   .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent-dim); flex: none; }
+  .entry .meta .edit-hint { margin-left: auto; display: flex; color: var(--faint); opacity: .6; }
   .entry mark { background: var(--accent-dim); color: var(--text); border-radius: 3px; padding: 0 2px; }
   .entry.editing { border-color: var(--accent-dim); background: var(--surface-2); }
   .entry textarea {
@@ -1138,6 +1139,7 @@
 
   // ---------- state ----------
   var all = [], query = '', editingId = null;
+  var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
 
   var $ = function (id) { return document.getElementById(id); };
   var input = $('input'), saveBtn = $('saveBtn'), listEl = $('list'),
@@ -1230,7 +1232,8 @@
       } else {
         html += '<div class="entry" data-id="' + r.id + '">' +
           '<div class="raw">' + highlight(r.raw, query) + '</div>' +
-          '<div class="meta"><span>' + timeLabel(r.capturedAt) + '</span></div></div>';
+          '<div class="meta"><span>' + timeLabel(r.capturedAt) + '</span>' +
+            '<span class="edit-hint" aria-hidden="true">' + PENCIL_SVG + '</span></div></div>';
       }
     });
     if (lastDay !== null) html += '</div>';

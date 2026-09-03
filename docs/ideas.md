@@ -8,16 +8,6 @@ Add anything, however half-formed. The cost of a bad idea sitting here is nothin
 
 ---
 
-## Show that entries are editable
-
-**Small. Ready to build.**
-
-Editing has worked since v0 — tap an entry, it becomes a text box, with Save / Cancel / Delete. There is no visible cue that this is possible: the row renders the text and a timestamp and nothing else, so you have to already know.
-
-Add an affordance. A pencil, a chevron, or an "Edit" hint in the meta row next to the time. Whatever is quietest while still being visible.
-
----
-
 ## Link one entry to another
 
 **Medium. Shape decided, not scheduled.**
