@@ -299,7 +299,7 @@ In v3 the AI question was a footnote about a future quiz feature. **It is now th
 | 5 | Someone browses your unlocked phone | Plausible | App lock. **Solved.** |
 | 6 | Dropbox breach or insider | Unlikely | Not covered by default. §6.4 |
 | 7 | **LLM provider sees your notes** | **Certain, by design** | **New. This is the trade-off.** §6.3 |
-| 8 | Dropbox account compromised | Unlikely | Turn on 2FA today. |
+| 8 | Dropbox account compromised | Unlikely | **Covered.** 2FA enabled 2 September 2026. |
 
 Note that #3 actually *improved*. Because the model writes alongside your text rather than over it, an AI mistake is recoverable in a way a form-entry mistake never was.
 
@@ -333,6 +333,8 @@ A metadata caveat worth knowing rather than discovering: links *pointing at* an 
 ### 6.5 Today, regardless
 
 Turn on 2FA for your Dropbox account. Under this architecture it is the security boundary for everything.
+
+**Done, 2 September 2026.** Worth noting what this does and does not cover. It protects the account, so a leaked password alone no longer reaches your entries. It does nothing for threats #1 and #5 — a lost phone, or someone picking up your unlocked one — because the local IndexedDB copy is readable by anyone holding the device. App lock, scheduled for phase 3, is what closes those.
 
 ---
 
