@@ -123,6 +123,14 @@
   .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--accent-dim); flex: none; }
   .entry .meta .edit-hint { margin-left: auto; display: flex; color: var(--faint); opacity: .6; }
   .entry mark { background: var(--accent-dim); color: var(--text); border-radius: 3px; padding: 0 2px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .chip {
+    font-size: 12px; color: var(--muted); background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 100px; padding: 2px 9px;
+  }
+  .chip.title { color: var(--text); font-weight: 500; }
+  .chip.rating { color: var(--accent); letter-spacing: 1px; }
+  .chip.review { color: var(--faint); padding: 2px 7px; }
   .entry.editing { border-color: var(--accent-dim); background: var(--surface-2); }
   .entry textarea {
     width: 100%; background: var(--bg); border: 1px solid var(--border);
@@ -267,6 +275,26 @@
         <button class="btn" id="manualFinish">Finish</button>
       </div>
     </div>
+  </section>
+
+  <section>
+    <h2>Enrichment</h2>
+    <p id="enrichNote">On-device AI fills in type, title, tags and details after you save. Nothing leaves your phone.</p>
+    <div class="row">
+      <button class="btn" id="enrichEnableBtn">Turn on</button>
+      <button class="btn ghost" id="enrichDisableBtn" hidden>Turn off</button>
+    </div>
+    <div id="enrichProgress" hidden>
+      <div class="stat"><span>Downloading model</span><b id="enrichPct">0%</b></div>
+    </div>
+    <div id="enrichStats" hidden>
+      <div class="stat"><span>Enriched</span><b id="sEnriched">0</b></div>
+      <div class="stat"><span>Waiting</span><b id="sEnrichPending">0</b></div>
+      <div class="stat"><span>Needs a glance</span><b id="sEnrichReview">0</b></div>
+    </div>
+    <p style="margin-bottom:0">
+      <button class="linkbtn" id="reenrichBtn" hidden style="padding:8px 0">Re-enrich everything</button>
+    </p>
   </section>
 
   <section>
@@ -1108,6 +1136,199 @@
     opportunisticSync();
   });
 
+  // ---------- enrichment ----------
+  // On-device extraction only — nothing here ever leaves the phone. A model
+  // call is seconds-long and GPU/CPU-bound, so unlike sync's pooled network
+  // requests this runs strictly one record at a time (enrichRunning).
+  // Capture never waits on any of this: save() only ever calls enqueueEnrich()
+  // fire-and-forget, exactly like it does with scheduleSync().
+  var CURRENT_MODEL_ID = 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC';
+  var TYPES = ['book', 'person', 'place', 'restaurant', 'podcast', 'film', 'idea', 'conversation', 'note'];
+  var DETAIL_HINTS = {
+    book: ['author', 'genre', 'format'],
+    restaurant: ['cuisine', 'priceLevel', 'neighbourhood', 'dish'],
+    podcast: ['show', 'episode', 'host'],
+    film: ['director', 'genre', 'whereWatched'],
+    person: ['relationship', 'howMet'],
+    place: ['city', 'country', 'category'],
+    conversation: ['withWhom', 'topic'],
+    idea: ['source'],
+    note: []
+  };
+  var CONFIDENCE_HIGH = 0.75, CONFIDENCE_LOW = 0.4;
+
+  var enrichEngine = null; // the loaded WebLLM engine, created once and reused
+  var enrichQueue = [], enrichRunning = false;
+
+  function enrichmentEnabled() {
+    return !!window.__LELOG_TEST_EXTRACTOR__ || localStorage.getItem('enrichmentEnabled') === '1';
+  }
+
+  function enqueueEnrich(id) {
+    if (!enrichmentEnabled() || enrichQueue.indexOf(id) !== -1) return;
+    enrichQueue.push(id);
+    pumpEnrichQueue();
+  }
+
+  function pumpEnrichQueue() {
+    if (enrichRunning || !enrichQueue.length) return;
+    enrichRunning = true;
+    var id = enrichQueue.shift();
+    var rec = all.find(function (r) { return r.id === id; });
+    if (!rec || rec.deleted) { enrichRunning = false; return pumpEnrichQueue(); }
+    runExtraction(rec)
+      .then(function (result) { return applyExtraction(rec, result); })
+      .catch(function (e) { return markEnrichmentFailed(rec, e); })
+      .then(function () { enrichRunning = false; pumpEnrichQueue(); });
+  }
+
+  function tagVocabulary() {
+    var seen = {}, out = [];
+    all.forEach(function (r) {
+      (r.tags || []).forEach(function (t) {
+        if (!seen[t]) { seen[t] = true; out.push(t); }
+      });
+    });
+    return out.slice(0, 200);
+  }
+
+  function buildContext() {
+    return { types: TYPES, tags: tagVocabulary(), detailHints: DETAIL_HINTS };
+  }
+
+  function confidenceBand(confidence) {
+    if (confidence >= CONFIDENCE_HIGH) return 'high';
+    if (confidence >= CONFIDENCE_LOW) return 'medium';
+    return 'low';
+  }
+
+  // Defense in depth even though the model call requests grammar-constrained
+  // JSON: a small model can still return schema-valid-but-wrong output (a
+  // type outside the closed list, a rating out of range). None of this ever
+  // throws — an unrecognised guess degrades to "no guess" (§3.1: uncertainty
+  // is allowed), it never blocks the record from reaching enrichment.status
+  // 'done'.
+  function validateExtraction(result) {
+    var out = {
+      type: TYPES.indexOf(result.type) !== -1 ? result.type : null,
+      title: typeof result.title === 'string' ? result.title : null,
+      occurredAt: typeof result.occurredAt === 'string' ? result.occurredAt : null,
+      tags: Array.isArray(result.tags) ? result.tags.filter(function (t) { return typeof t === 'string'; }) : [],
+      rating: (Number.isInteger(result.rating) && result.rating >= 1 && result.rating <= 5) ? result.rating : null,
+      details: (result.details && typeof result.details === 'object') ? result.details : {},
+      confidence: (typeof result.confidence === 'number' && result.confidence >= 0 && result.confidence <= 1) ? result.confidence : 0
+    };
+    return out;
+  }
+
+  function getExtractor() {
+    return window.__LELOG_TEST_EXTRACTOR__ || realWebLLMExtract;
+  }
+
+  function runExtraction(rec) {
+    // Wrapped in Promise.resolve().then(...) so a test extractor (or a real
+    // model call) that throws synchronously still rejects the promise chain
+    // instead of escaping pumpEnrichQueue uncaught and wedging the queue.
+    return Promise.resolve().then(function () {
+      return getExtractor()(rec, buildContext());
+    }).then(validateExtraction);
+  }
+
+  function loadWebLLM() {
+    return import('https://esm.run/@mlc-ai/web-llm@0.2.79');
+  }
+
+  function getEnrichEngine(onProgress) {
+    if (enrichEngine) return enrichEngine;
+    enrichEngine = loadWebLLM().then(function (webllm) {
+      return webllm.CreateMLCEngine(CURRENT_MODEL_ID, {
+        initProgressCallback: onProgress || function () {}
+      });
+    });
+    return enrichEngine;
+  }
+
+  function extractionSchema() {
+    return JSON.stringify({
+      type: 'object',
+      properties: {
+        type: { enum: TYPES.concat([null]) },
+        title: { type: ['string', 'null'] },
+        occurredAt: { type: ['string', 'null'] },
+        tags: { type: 'array', items: { type: 'string' } },
+        rating: { type: ['integer', 'null'] },
+        details: { type: 'object' },
+        confidence: { type: 'number' }
+      },
+      required: ['type', 'title', 'tags', 'rating', 'details', 'confidence']
+    });
+  }
+
+  function buildPrompt(rec, ctx) {
+    return 'You extract structure from a short personal note. Pick one type from this ' +
+      'closed list or null if none fit: ' + ctx.types.join(', ') + '. ' +
+      'Reuse existing tags where they fit instead of inventing near-duplicates: ' +
+      ctx.tags.join(', ') + '. ' +
+      'For the chosen type, only fill relevant fields in "details" from this guide ' +
+      '(omit fields that do not apply, invent nothing outside it): ' +
+      JSON.stringify(ctx.detailHints) + '. ' +
+      'Give your own confidence (0 to 1) that the extraction is correct. ' +
+      'Note: "' + rec.raw + '"';
+  }
+
+  // The only function in this file that talks to the model. Every other
+  // enrichment function is pure/testable; this one is swapped out entirely
+  // in tests via window.__LELOG_TEST_EXTRACTOR__ (see getExtractor above),
+  // since there is no fetch() here for a test to intercept — WebLLM runs
+  // over WebGPU, client-side, with no network request to stub.
+  function realWebLLMExtract(rec, ctx) {
+    return getEnrichEngine().then(function (engine) {
+      return engine.chat.completions.create({
+        messages: [{ role: 'user', content: buildPrompt(rec, ctx) }],
+        response_format: { type: 'json_object', schema: extractionSchema() }
+      });
+    }).then(function (res) {
+      return JSON.parse(res.choices[0].message.content);
+    });
+  }
+
+  function applyExtraction(rec, result) {
+    var band = confidenceBand(result.confidence);
+    rec.enrichment = {
+      status: 'done', model: CURRENT_MODEL_ID, at: new Date().toISOString(),
+      confidence: result.confidence, needsReview: band === 'medium', suggestion: null
+    };
+    if (band === 'low' || result.type === null) {
+      rec.enrichment.suggestion = result.type === null ? null : result;
+    } else {
+      ['type', 'title', 'occurredAt', 'tags', 'rating', 'details'].forEach(function (field) {
+        if (rec.userEdited.indexOf(field) === -1) rec[field] = result[field];
+      });
+    }
+    rec.updatedAt = new Date().toISOString();
+    return put(rec).then(function () { render(); refreshStats(); scheduleSync(); });
+  }
+
+  function markEnrichmentFailed(rec, err) {
+    rec.enrichment.status = 'failed';
+    rec.enrichment.at = new Date().toISOString();
+    rec.updatedAt = new Date().toISOString();
+    console.error('enrichment failed for', rec.id, err);
+    return put(rec).then(function () { render(); scheduleSync(); });
+  }
+
+  // Test-only orchestration hooks, alongside __LELOG_TEST_EXTRACTOR__ above.
+  // Neither is reachable from the UI; they exist so smoke.py can drive the
+  // queue and the userEdited gate directly, without a fetch() or a real
+  // model to intercept.
+  window.__LELOG_ENQUEUE_ENRICH__ = enqueueEnrich;
+  window.__LELOG_SEED_USER_EDITED__ = function (id, field, value) {
+    var rec = all.find(function (r) { return r.id === id; });
+    rec[field] = value;
+    if (rec.userEdited.indexOf(field) === -1) rec.userEdited.push(field);
+    return put(rec);
+  };
+
   // ---------- ids ----------
   var B32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
   function ulid() {
@@ -1129,7 +1350,7 @@
       raw: raw,
       capturedAt: now,
       captureSource: 'text',
-      enrichment: { status: 'pending', model: null, at: null, confidence: null },
+      enrichment: { status: 'pending', model: null, at: null, confidence: null, needsReview: false, suggestion: null },
       type: null, title: null, occurredAt: null,
       tags: [], rating: null, details: {}, links: [],
       userEdited: [], media: [],
@@ -1194,7 +1415,7 @@
     if (query.trim()) {
       var terms = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
       live = live.filter(function (r) {
-        var hay = r.raw.toLowerCase();
+        var hay = (r.raw + ' ' + (r.title || '') + ' ' + r.tags.join(' ')).toLowerCase();
         return terms.every(function (t) { return hay.indexOf(t) !== -1; });
       });
     }
@@ -1230,8 +1451,15 @@
             '<button class="linkbtn act-delete">Delete</button>' +
           '</div></div>';
       } else {
+        var chips = r.type ? '<div class="chips"><span class="chip">' + esc(r.type) + '</span>' +
+          (r.title ? '<span class="chip title">' + esc(r.title) + '</span>' : '') +
+          r.tags.map(function (t) { return '<span class="chip">' + esc(t) + '</span>'; }).join('') +
+          (r.rating ? '<span class="chip rating">' + '★'.repeat(r.rating) + '</span>' : '') +
+          (r.enrichment.needsReview ? '<span class="chip review" title="Applied with medium confidence">?</span>' : '') +
+          '</div>' : '';
         html += '<div class="entry" data-id="' + r.id + '">' +
           '<div class="raw">' + highlight(r.raw, query) + '</div>' +
+          chips +
           '<div class="meta"><span>' + timeLabel(r.capturedAt) + '</span>' +
             '<span class="edit-hint" aria-hidden="true">' + PENCIL_SVG + '</span></div></div>';
       }
@@ -1265,6 +1493,7 @@
       toast('Saved');
       input.focus();
       scheduleSync();
+      enqueueEnrich(rec.id);
     }).catch(function (e) {
       toast('Could not save — storage may be full');
       console.error(e);
@@ -1400,6 +1629,7 @@
   function openSheet() {
     refreshStats();
     refreshSyncStats();
+    refreshEnrichUI();
     sheet.classList.add('open');
     scrim.classList.add('open');
     // Push a history entry so Android's back button dismisses the sheet
@@ -1526,6 +1756,57 @@
     }).catch(function (e) { console.error(e); });
   }
 
+  function refreshEnrichUI() {
+    var on = enrichmentEnabled();
+    var supported = !!navigator.gpu;
+    $('enrichEnableBtn').hidden = on;
+    $('enrichEnableBtn').disabled = !supported;
+    $('enrichDisableBtn').hidden = !on;
+    $('enrichStats').hidden = !on;
+    $('reenrichBtn').hidden = !on;
+    $('enrichNote').textContent = !supported
+      ? "Your browser doesn't support on-device AI yet — entries still save and sync normally."
+      : 'On-device AI fills in type, title, tags and details after you save. Nothing leaves your phone.';
+    if (!on) return;
+    var live = all.filter(function (r) { return !r.deleted; });
+    $('sEnriched').textContent = live.filter(function (r) { return r.enrichment.status === 'done'; }).length;
+    $('sEnrichPending').textContent = live.filter(function (r) { return r.enrichment.status === 'pending'; }).length;
+    $('sEnrichReview').textContent = live.filter(function (r) { return r.enrichment.needsReview; }).length;
+  }
+
+  $('enrichEnableBtn').onclick = function () {
+    this.disabled = true;
+    localStorage.setItem('enrichmentEnabled', '1');
+    $('enrichProgress').hidden = false;
+    getEnrichEngine(function (p) {
+      $('enrichPct').textContent = Math.round((p.progress || 0) * 100) + '%';
+    }).then(function () {
+      $('enrichProgress').hidden = true;
+      refreshEnrichUI();
+      all.filter(function (r) { return !r.deleted && r.enrichment.status === 'pending'; })
+         .forEach(function (r) { enqueueEnrich(r.id); });
+      toast('On-device AI is ready');
+    }).catch(function (e) {
+      console.error(e);
+      $('enrichProgress').hidden = true;
+      localStorage.removeItem('enrichmentEnabled');
+      this.disabled = false;
+      refreshEnrichUI();
+      toast('Could not load the on-device model');
+    }.bind(this));
+  };
+
+  $('enrichDisableBtn').onclick = function () {
+    localStorage.removeItem('enrichmentEnabled');
+    refreshEnrichUI();
+  };
+
+  $('reenrichBtn').onclick = function () {
+    if (!confirm('Re-run AI extraction on every entry? This can take a while.')) return;
+    all.filter(function (r) { return !r.deleted; }).forEach(function (r) { enqueueEnrich(r.id); });
+    toast('Re-enriching everything');
+  };
+
   $('connectBtn').onclick = function () {
     this.disabled = true;
     beginConnect(false).catch(function (e) {
@@ -1579,6 +1860,10 @@
     all = rows;
     render(); refreshStats(); checkPersistence(); maybeBanner();
     if (window.matchMedia('(min-width: 700px)').matches) input.focus();
+    // A tab closed mid-queue loses nothing: enrichment.status on the record
+    // itself is the queue, so every still-pending record just gets re-enqueued.
+    all.filter(function (r) { return !r.deleted && r.enrichment.status === 'pending'; })
+       .forEach(function (r) { enqueueEnrich(r.id); });
     // Auth work happens after the first render: capture must never wait on it.
     // Kept off the boot chain's catch as well, so a Dropbox problem can never
     // present itself as "storage unavailable" and hide the entries.

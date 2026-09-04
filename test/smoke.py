@@ -56,6 +56,9 @@ V2_KEYS = {
 # Only ever present on a tombstoned record.
 OPTIONAL_KEYS = {"deletedAt"}
 
+# The enrichment sub-object's own keys, from newRecord() in index.html.
+ENRICHMENT_KEYS = {"status", "model", "at", "confidence", "needsReview", "suggestion"}
+
 
 # ---------- server ----------
 
@@ -198,7 +201,8 @@ def test_capture_writes_the_full_v2_schema(page, base_url):
     assert rec["id"].startswith("mem_")
     # Everything the model will later fill is present but empty, never absent.
     assert rec["enrichment"] == {
-        "status": "pending", "model": None, "at": None, "confidence": None
+        "status": "pending", "model": None, "at": None, "confidence": None,
+        "needsReview": False, "suggestion": None
     }
     assert (rec["type"], rec["title"], rec["occurredAt"], rec["rating"]) == \
         (None, None, None, None)
@@ -2312,6 +2316,221 @@ def test_settings_sheet_opens_and_closes(page, base_url):
 
     page.click("#closeSheetBtn")
     page.wait_for_selector("#sheet.open", state="detached")
+
+
+# ---------- enrichment ----------
+#
+# On-device extraction runs entirely client-side over WebGPU — there is no
+# fetch() for a test to intercept the way stub_dropbox intercepts Dropbox.
+# Instead, production exposes window.__LELOG_TEST_EXTRACTOR__ (read by
+# getExtractor() in index.html) plus two narrow orchestration hooks,
+# __LELOG_ENQUEUE_ENRICH__ and __LELOG_SEED_USER_EDITED__, used only below.
+# No test here ever touches real WebGPU or downloads real model weights.
+
+def stub_enrichment(page, fn_js):
+    """Install a fake on-device extractor before the app boots.
+
+    fn_js is a JS expression for a function of the shape (rec, ctx) => result
+    or a promise of one. Must be called before boot()/page.goto(), since
+    add_init_script only applies to future navigations.
+    """
+    page.add_init_script(f"window.__LELOG_TEST_EXTRACTOR__ = {fn_js};")
+
+
+def wait_for_record(page, pred, timeout=5000):
+    """Poll IndexedDB until some record matches pred(record).
+
+    Enrichment runs in the background, off the render/click chain capture()
+    already waits on, so — like wait_for_upload for sync — this polls an
+    observable side effect instead of sleeping a fixed time.
+    """
+    deadline = time.time() + timeout / 1000
+    while time.time() < deadline:
+        match = next((r for r in records(page) if pred(r)), None)
+        if match:
+            return match
+        page.wait_for_timeout(100)
+    return next((r for r in records(page) if pred(r)), None)
+
+
+@test
+def test_capture_does_not_wait_for_enrichment(page, base_url):
+    """Invariant 4: save is instant even when on-device extraction hangs."""
+    stub_enrichment(page, "() => new Promise(() => {})")
+
+    boot(page, base_url)
+
+    start = time.time()
+    capture(page, "saved while enrichment hangs")
+    elapsed = time.time() - start
+
+    assert elapsed < 5, f"save blocked for {elapsed:.1f}s"
+    assert texts(page) == ["saved while enrichment hangs"]
+
+
+@test
+def test_enrichment_applies_high_confidence_silently(page, base_url):
+    stub_enrichment(page, """
+        (rec, ctx) => Promise.resolve({
+            type: 'book', title: 'Klara and the Sun', occurredAt: null,
+            tags: ['fiction'], rating: 5, details: { author: 'Ishiguro' },
+            confidence: 0.9
+        })
+    """)
+
+    boot(page, base_url)
+    capture(page, "finished klara and the sun")
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] != "pending")
+    assert rec["enrichment"]["status"] == "done"
+    assert rec["type"] == "book"
+    assert rec["title"] == "Klara and the Sun"
+    assert rec["tags"] == ["fiction"]
+    assert rec["rating"] == 5
+    assert rec["details"] == {"author": "Ishiguro"}
+    assert rec["enrichment"]["needsReview"] is False
+    assert rec["enrichment"]["suggestion"] is None
+
+    assert page.locator(".chip.title").inner_text() == "Klara and the Sun"
+
+
+@test
+def test_enrichment_flags_medium_confidence(page, base_url):
+    stub_enrichment(page, """
+        (rec, ctx) => Promise.resolve({
+            type: 'restaurant', title: 'Le Petit Cambodge', occurredAt: null,
+            tags: [], rating: null, details: {}, confidence: 0.5
+        })
+    """)
+
+    boot(page, base_url)
+    capture(page, "bo bun with marie")
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] != "pending")
+    assert rec["type"] == "restaurant"
+    assert rec["enrichment"]["needsReview"] is True
+    assert page.locator(".chip.review").count() == 1
+
+
+@test
+def test_enrichment_does_not_apply_low_confidence(page, base_url):
+    stub_enrichment(page, """
+        (rec, ctx) => Promise.resolve({
+            type: 'idea', title: 'maybe something', occurredAt: null,
+            tags: [], rating: null, details: {}, confidence: 0.2
+        })
+    """)
+
+    boot(page, base_url)
+    capture(page, "half formed thought")
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] != "pending")
+    assert rec["type"] is None
+    assert rec["title"] is None
+    assert rec["enrichment"]["suggestion"]["type"] == "idea"
+    assert page.locator(".chips").count() == 0
+
+
+@test
+def test_enrichment_never_overwrites_user_edited_field(page, base_url):
+    boot(page, base_url)
+    capture(page, "a book i am reading")
+    rec_id = records(page)[0]["id"]
+
+    page.evaluate(
+        "id => window.__LELOG_SEED_USER_EDITED__(id, 'title', 'My Own Title')",
+        rec_id,
+    )
+    page.evaluate("""
+        () => { window.__LELOG_TEST_EXTRACTOR__ = (rec, ctx) => Promise.resolve({
+            type: 'book', title: 'Extracted Title', occurredAt: null,
+            tags: ['fiction'], rating: 4, details: {}, confidence: 0.9
+        }); }
+    """)
+    page.evaluate("id => window.__LELOG_ENQUEUE_ENRICH__(id)", rec_id)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+    assert rec["title"] == "My Own Title", "a hand-edited field was overwritten"
+    assert rec["type"] == "book", "a non-edited field was not applied"
+    assert rec["tags"] == ["fiction"]
+
+
+@test
+def test_malformed_extraction_marks_failed(page, base_url):
+    stub_enrichment(page, "(rec, ctx) => Promise.resolve(null)")
+
+    boot(page, base_url)
+    capture(page, "this will not parse")
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] != "pending")
+    assert rec["enrichment"]["status"] == "failed"
+    assert rec["type"] is None
+    assert rec["raw"] == "this will not parse"
+
+
+@test
+def test_out_of_enum_type_degrades_to_null(page, base_url):
+    stub_enrichment(page, """
+        (rec, ctx) => Promise.resolve({
+            type: 'spaceship', title: 'nope', occurredAt: null,
+            tags: [], rating: null, details: {}, confidence: 0.9
+        })
+    """)
+
+    boot(page, base_url)
+    capture(page, "an odd guess")
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] != "pending")
+    assert rec["enrichment"]["status"] == "done", "an unrecognised type must not fail the record"
+    assert rec["type"] is None
+    assert rec["enrichment"]["suggestion"] is None
+
+
+@test
+def test_raw_is_never_modified_by_enrichment(page, base_url):
+    stub_enrichment(page, """
+        (rec, ctx) => Promise.resolve({
+            type: 'note', title: null, occurredAt: null, tags: [], rating: null,
+            details: {}, confidence: 0.9, raw: 'a rogue rewrite'
+        })
+    """)
+
+    boot(page, base_url)
+    capture(page, "the original words")
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] != "pending")
+    assert rec["raw"] == "the original words"
+
+
+@test
+def test_reload_recovers_pending_queue(page, base_url):
+    boot(page, base_url)
+    capture(page, "captured before ai was on")
+    assert records(page)[0]["enrichment"]["status"] == "pending"
+
+    stub_enrichment(page, """
+        (rec, ctx) => Promise.resolve({
+            type: 'idea', title: null, occurredAt: null, tags: [], rating: null,
+            details: {}, confidence: 0.9
+        })
+    """)
+    boot(page, base_url)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] != "pending")
+    assert rec["type"] == "idea", "a pending record was not picked up after reload"
+
+
+@test
+def test_enrichment_shape_in_export(page, base_url):
+    boot(page, base_url)
+    capture(page, "not yet enriched")
+
+    payload, _, _ = export_backup(page)
+    enrichment = payload["memories"][0]["enrichment"]
+    extra = set(enrichment) - ENRICHMENT_KEYS
+    missing = ENRICHMENT_KEYS - set(enrichment)
+    assert not extra, f"enrichment object carries unexpected keys: {sorted(extra)}"
+    assert not missing, f"enrichment object is missing keys: {sorted(missing)}"
 
 
 # ---------- runner ----------

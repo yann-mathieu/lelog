@@ -8,15 +8,17 @@ Unscheduled ideas live in **`docs/ideas.md`** — things worth building, not yet
 
 ## Current state
 
-**Phases 0 and 1 shipped, in daily use since August 2026.** One text box, list, search, edit, soft delete, export/import, and Dropbox sync. Installable PWA, works offline. No AI, no accounts.
+**Phases 0 and 1 shipped, in daily use since August 2026.** One text box, list, search, edit, soft delete, export/import, and Dropbox sync. Installable PWA, works offline.
+
+**Phase 2's first slice shipped 4 September 2026:** on-device extraction (WebLLM/WebGPU, opt-in from Settings), filling type, title, tags, rating and per-type `details`. Nothing leaves the phone — no cloud API. High/medium-confidence extractions apply automatically (medium gets a quiet review marker); low-confidence guesses sit unapplied in `enrichment.suggestion`. No entity resolution, no interactive review queue yet — see the roadmap.
 
 Sync is done: OAuth 2 with PKCE, one JSON file per record under `memories/{year}/`, cursor-based delta pull, `WriteMode.update(rev)` on push, record-level last-write-wins merge, and automatic syncing on change and on launch. §5 of the architecture doc describes the design; §5.3 records where the implementation deliberately departs from the original plan.
 
-Vanilla HTML/CSS/JS in a single `index.html`. **No build step, no dependencies, no framework.** The whole app is six files at the repo root and that simplicity is a feature. Keep it that way — the architecture doc's §7 tech stack table names React, Vite, Dexie and Tailwind, and none of them were used; that section documents an abandoned plan, not the code.
+Vanilla HTML/CSS/JS in a single `index.html`. **No build step, no bundled dependencies, no framework.** The one exception: enrichment lazy-loads WebLLM from a pinned CDN URL, only once turned on in Settings — nothing is vendored into the repo or fetched on a cold load. The whole app is still six files at the repo root and that simplicity is a feature. Keep it that way — the architecture doc's §7 tech stack table names React, Vite, Dexie and Tailwind, and none of them were used; that section documents an abandoned plan, not the code.
 
 ## Invariants — do not break these
 
-1. **`raw` is immutable.** When AI enrichment lands, it writes to separate fields alongside the user's text, never over it. Fields the user edits by hand are recorded in `userEdited` and are never re-derived.
+1. **`raw` is immutable.** AI enrichment writes to separate fields alongside the user's text, never over it. Fields the user edits by hand are recorded in `userEdited` and are never re-derived — there is no UI yet to hand-edit an extracted field, so this gate exists but isn't reachable from the UI.
 2. **Records already use the full v2 schema** — `raw`, `capturedAt`, `enrichment`, `type`, `title`, `occurredAt`, `tags`, `rating`, `details`, `links`, `userEdited`, `media`, timestamps, `deleted`. Everything except the user's text is null/empty in v0. This exists so no captured data ever needs migrating. Don't strip unused fields.
 3. **Deletes are tombstones** (`deleted: true`), never removals. Required for sync to propagate deletes correctly later.
 4. **Capture never blocks.** No spinner, no network, no required field, no type picker. Save is instant and works offline. Enrichment is always async and always optional.
@@ -31,16 +33,16 @@ Vanilla HTML/CSS/JS in a single `index.html`. **No build step, no dependencies, 
 |---|---|
 | 0 ✅ | Capture, search, export. Local-only. |
 | 1 ✅ | Dropbox sync (App folder scope, OAuth PKCE, one JSON file per record) |
-| 2 | AI enrichment: extraction, types, tags, confidence, review queue |
-| 3 | Links + entity resolution, question queue (enrichment mode), app lock |
+| 2 🟡 | AI enrichment: extraction, types, tags, confidence, richer `details` ✅ on-device (WebLLM). Interactive review queue moved to phase 3. |
+| 3 | Links + entity resolution, question queue (enrichment mode + phase 2's deferred review UI), app lock |
 | 4 | Quiz mode over the same queue, FSRS scheduling |
-| 5 | Voice + photo capture, share target, on-device model, selective encryption |
+| 5 | Voice + photo capture, share target, selective encryption |
 
 The enrichment questioner and the quiz questioner are **the same component** at different time offsets — build once.
 
 ## Testing
 
-62 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account.
+72 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
 
 ```bash
 python3 test/smoke.py            # all

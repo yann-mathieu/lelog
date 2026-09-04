@@ -6,6 +6,8 @@
 
 **Corrections of 2 September 2026.** Phases 0 and 1 are built and in daily use. Where this document and the code disagree, the code is right and the disagreement is marked inline. Three sections were materially wrong: §5.1–5.3 (folder name, merge strategy), §7 (tech stack), §10 (the name). Everything else stands.
 
+**Corrections of 4 September 2026.** Phase 2's first slice shipped: on-device extraction (§3.1) and richer per-type `details`, using WebLLM/WebGPU (§6.3(b)) rather than the cloud API §7 originally named — chosen for privacy from the outset, not as a phase 5 fallback. Confidence handling (§3.2) is built as described, except the "review queue" is a passive per-entry marker for now, not an interactive screen — that's still §2.6/§8.2's question queue, not yet built. `links` and entity resolution (§3.3) are untouched; no type proposals (§4) yet either.
+
 **Changes since v4.0:** added §1.1 — this is a log, not a diary or a notes app, and the design consequences that follow (no streaks, no calendar view, no daily prompt).
 
 **Changes since v3:** the capture model is now free text with AI enrichment (§2), which restructures much of the document. Types become emergent rather than chosen (§4). The security model changes materially (§6) because every note now passes through a language model. The quiz engine and the enrichment engine turn out to be the same machine (§8).
@@ -347,11 +349,11 @@ Turn on 2FA for your Dropbox account. Under this architecture it is the security
 | Framework | React + TypeScript, Vite | None. One `index.html`. |
 | PWA shell | `vite-plugin-pwa` (Workbox) | Hand-written `sw.js`, ~50 lines |
 | Local DB | Dexie.js over IndexedDB | IndexedDB directly |
-| Search | MiniSearch | Substring match over `raw`; revisit when enrichment adds fields to search |
+| Search | MiniSearch | Substring match over `raw`, `title` and `tags` |
 | Dropbox | Official `dropbox` SDK | `fetch` against the HTTP API |
 | UI | Tailwind CSS | Plain CSS with custom properties |
-| **Enrichment** | **Claude API, structured outputs** | Strict schema prevents field invention |
-| **On-device option** | **WebLLM / WebGPU** | Phase 5 experiment; viable but heavy |
+| **Enrichment** | **Claude API, structured outputs** | On-device instead (see below); strict schema still prevents field invention |
+| **On-device option** | **WebLLM / WebGPU** | Built in phase 2, not phase 5 — chosen over a cloud API for privacy from the start |
 | Spaced repetition | `ts-fsrs` | Shares the question generator with enrichment |
 | Crypto | Web Crypto (AES-GCM, PBKDF2) | |
 | Hosting | Cloudflare Pages, free tier | |
@@ -403,10 +405,10 @@ Twenty cards, two minutes, bounded. A quiz that feels like homework is abandoned
 |---|---|---|
 | **0** ✅ | **Built.** One text box, save, edit, search, export/import. Local-only (IndexedDB), installable PWA, offline. No AI, no sync, no accounts. | A usable capture app today |
 | **1** ✅ | **Built.** Dropbox: app registration, OAuth PKCE, sync engine, automatic sync. | Backup and multi-device |
-| **2** | Enrichment: extraction, types, tags, confidence, review queue | The structure appears by itself |
-| **3** | Links + entity resolution, the question queue *(enrichment mode)*, app lock | Connected data, richer notes |
+| **2** 🟡 | **Partly built.** On-device extraction (WebLLM), types, tags, confidence, richer `details`, shipped. The interactive review queue moved to phase 3 — landed for now as a passive per-entry marker. | The structure appears by itself |
+| **3** | Links + entity resolution, the question queue *(enrichment mode, now including phase 2's deferred review UI)*, app lock | Connected data, richer notes |
 | **4** | Quiz mode over the same queue, FSRS scheduling | The reason for the project |
-| **5** | Voice + photo capture, share-target, on-device model experiment, Tier 2 encryption | Fast capture; the privacy answer |
+| **5** | Voice + photo capture, share-target, Tier 2 encryption | Fast capture; the privacy answer |
 
 **Phase 0 deliberately has no AI.** It produces raw material — real captures of yours — to build and tune the extractor against in phase 2. Designing prompts against imaginary notes is guesswork; designing them against two hundred of your actual ones is engineering.
 
