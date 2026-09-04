@@ -2323,18 +2323,39 @@ def test_settings_sheet_opens_and_closes(page, base_url):
 # On-device extraction runs entirely client-side over WebGPU — there is no
 # fetch() for a test to intercept the way stub_dropbox intercepts Dropbox.
 # Instead, production exposes window.__LELOG_TEST_EXTRACTOR__ (read by
-# getExtractor() in index.html) plus two narrow orchestration hooks,
-# __LELOG_ENQUEUE_ENRICH__ and __LELOG_SEED_USER_EDITED__, used only below.
+# getExtractor() in index.html) and one narrow orchestration hook,
+# __LELOG_SEED_USER_EDITED__, used only below since there is no UI yet to
+# hand-edit an extracted field to test through. Everything else — turning
+# enrichment on, re-enriching — is driven through the real Settings UI.
 # No test here ever touches real WebGPU or downloads real model weights.
 
+def extraction_js(**overrides):
+    """A JS (rec, ctx) => Promise<result> literal for a fake extraction.
+
+    Defaults to an all-null/empty, low-confidence result; pass keyword
+    overrides for the fields a given test cares about, e.g.
+    extraction_js(type='book', title='Dune', confidence=0.9).
+    """
+    result = {
+        "type": None, "title": None, "occurredAt": None,
+        "tags": [], "rating": None, "details": {}, "confidence": 0.9,
+    }
+    result.update(overrides)
+    return f"(rec, ctx) => Promise.resolve({json.dumps(result)})"
+
+
 def stub_enrichment(page, fn_js):
-    """Install a fake on-device extractor before the app boots.
+    """Install a fake on-device extractor before the app boots, and turn
+    enrichment on so it actually runs.
 
     fn_js is a JS expression for a function of the shape (rec, ctx) => result
     or a promise of one. Must be called before boot()/page.goto(), since
     add_init_script only applies to future navigations.
     """
-    page.add_init_script(f"window.__LELOG_TEST_EXTRACTOR__ = {fn_js};")
+    page.add_init_script(f"""
+        window.__LELOG_TEST_EXTRACTOR__ = {fn_js};
+        localStorage.setItem('enrichmentEnabled', '1');
+    """)
 
 
 def wait_for_record(page, pred, timeout=5000):
@@ -2370,13 +2391,10 @@ def test_capture_does_not_wait_for_enrichment(page, base_url):
 
 @test
 def test_enrichment_applies_high_confidence_silently(page, base_url):
-    stub_enrichment(page, """
-        (rec, ctx) => Promise.resolve({
-            type: 'book', title: 'Klara and the Sun', occurredAt: null,
-            tags: ['fiction'], rating: 5, details: { author: 'Ishiguro' },
-            confidence: 0.9
-        })
-    """)
+    stub_enrichment(page, extraction_js(
+        type="book", title="Klara and the Sun", tags=["fiction"], rating=5,
+        details={"author": "Ishiguro"}, confidence=0.9,
+    ))
 
     boot(page, base_url)
     capture(page, "finished klara and the sun")
@@ -2396,12 +2414,9 @@ def test_enrichment_applies_high_confidence_silently(page, base_url):
 
 @test
 def test_enrichment_flags_medium_confidence(page, base_url):
-    stub_enrichment(page, """
-        (rec, ctx) => Promise.resolve({
-            type: 'restaurant', title: 'Le Petit Cambodge', occurredAt: null,
-            tags: [], rating: null, details: {}, confidence: 0.5
-        })
-    """)
+    stub_enrichment(page, extraction_js(
+        type="restaurant", title="Le Petit Cambodge", confidence=0.5,
+    ))
 
     boot(page, base_url)
     capture(page, "bo bun with marie")
@@ -2414,12 +2429,9 @@ def test_enrichment_flags_medium_confidence(page, base_url):
 
 @test
 def test_enrichment_does_not_apply_low_confidence(page, base_url):
-    stub_enrichment(page, """
-        (rec, ctx) => Promise.resolve({
-            type: 'idea', title: 'maybe something', occurredAt: null,
-            tags: [], rating: null, details: {}, confidence: 0.2
-        })
-    """)
+    stub_enrichment(page, extraction_js(
+        type="idea", title="maybe something", confidence=0.2,
+    ))
 
     boot(page, base_url)
     capture(page, "half formed thought")
@@ -2441,13 +2453,23 @@ def test_enrichment_never_overwrites_user_edited_field(page, base_url):
         "id => window.__LELOG_SEED_USER_EDITED__(id, 'title', 'My Own Title')",
         rec_id,
     )
-    page.evaluate("""
-        () => { window.__LELOG_TEST_EXTRACTOR__ = (rec, ctx) => Promise.resolve({
-            type: 'book', title: 'Extracted Title', occurredAt: null,
-            tags: ['fiction'], rating: 4, details: {}, confidence: 0.9
-        }); }
+    page.evaluate(f"""
+        () => {{
+            window.__LELOG_TEST_EXTRACTOR__ = {extraction_js(
+                type="book", title="Extracted Title", tags=["fiction"],
+                rating=4, confidence=0.9,
+            )};
+            localStorage.setItem('enrichmentEnabled', '1');
+        }}
     """)
-    page.evaluate("id => window.__LELOG_ENQUEUE_ENRICH__(id)", rec_id)
+
+    # Re-run through the real "Re-enrich everything" button rather than a
+    # test-only shortcut — there is only one record, so re-enriching
+    # everything and re-enriching this one are the same thing.
+    page.once("dialog", lambda d: d.accept())
+    open_sheet(page)
+    page.click("#reenrichBtn")
+    close_sheet(page)
 
     rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
     assert rec["title"] == "My Own Title", "a hand-edited field was overwritten"
@@ -2470,12 +2492,7 @@ def test_malformed_extraction_marks_failed(page, base_url):
 
 @test
 def test_out_of_enum_type_degrades_to_null(page, base_url):
-    stub_enrichment(page, """
-        (rec, ctx) => Promise.resolve({
-            type: 'spaceship', title: 'nope', occurredAt: null,
-            tags: [], rating: null, details: {}, confidence: 0.9
-        })
-    """)
+    stub_enrichment(page, extraction_js(type="spaceship", title="nope", confidence=0.9))
 
     boot(page, base_url)
     capture(page, "an odd guess")
@@ -2488,12 +2505,7 @@ def test_out_of_enum_type_degrades_to_null(page, base_url):
 
 @test
 def test_raw_is_never_modified_by_enrichment(page, base_url):
-    stub_enrichment(page, """
-        (rec, ctx) => Promise.resolve({
-            type: 'note', title: null, occurredAt: null, tags: [], rating: null,
-            details: {}, confidence: 0.9, raw: 'a rogue rewrite'
-        })
-    """)
+    stub_enrichment(page, extraction_js(type="note", confidence=0.9, raw="a rogue rewrite"))
 
     boot(page, base_url)
     capture(page, "the original words")
@@ -2508,12 +2520,7 @@ def test_reload_recovers_pending_queue(page, base_url):
     capture(page, "captured before ai was on")
     assert records(page)[0]["enrichment"]["status"] == "pending"
 
-    stub_enrichment(page, """
-        (rec, ctx) => Promise.resolve({
-            type: 'idea', title: null, occurredAt: null, tags: [], rating: null,
-            details: {}, confidence: 0.9
-        })
-    """)
+    stub_enrichment(page, extraction_js(type="idea", confidence=0.9))
     boot(page, base_url)
 
     rec = wait_for_record(page, lambda r: r["enrichment"]["status"] != "pending")

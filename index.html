@@ -1158,22 +1158,29 @@
   var CONFIDENCE_HIGH = 0.75, CONFIDENCE_LOW = 0.4;
 
   var enrichEngine = null; // the loaded WebLLM engine, created once and reused
-  var enrichQueue = [], enrichRunning = false;
+  var enrichQueue = [], enrichQueued = {}, enrichRunning = false;
 
   function enrichmentEnabled() {
-    return !!window.__LELOG_TEST_EXTRACTOR__ || localStorage.getItem('enrichmentEnabled') === '1';
+    return localStorage.getItem('enrichmentEnabled') === '1';
   }
 
   function enqueueEnrich(id) {
-    if (!enrichmentEnabled() || enrichQueue.indexOf(id) !== -1) return;
+    if (!enrichmentEnabled() || enrichQueued[id]) return;
+    enrichQueued[id] = true;
     enrichQueue.push(id);
     pumpEnrichQueue();
+  }
+
+  function enqueuePending() {
+    all.filter(function (r) { return !r.deleted && r.enrichment.status === 'pending'; })
+       .forEach(function (r) { enqueueEnrich(r.id); });
   }
 
   function pumpEnrichQueue() {
     if (enrichRunning || !enrichQueue.length) return;
     enrichRunning = true;
     var id = enrichQueue.shift();
+    delete enrichQueued[id];
     var rec = all.find(function (r) { return r.id === id; });
     if (!rec || rec.deleted) { enrichRunning = false; return pumpEnrichQueue(); }
     runExtraction(rec)
@@ -1292,40 +1299,52 @@
     });
   }
 
+  // The general "don't clobber a hand-edited field" gate — and its write-side
+  // counterpart, markUserEdited, unused in production until a later phase
+  // adds a UI to hand-edit an extracted field (CLAUDE.md invariant 1). Kept
+  // as real, shared functions rather than inlined so that UI has one place
+  // to call into rather than reinventing the check.
+  function applyIfNotUserEdited(rec, field, value) {
+    if (rec.userEdited.indexOf(field) === -1) rec[field] = value;
+  }
+  function markUserEdited(rec, field, value) {
+    rec[field] = value;
+    if (rec.userEdited.indexOf(field) === -1) rec.userEdited.push(field);
+  }
+
   function applyExtraction(rec, result) {
     var band = confidenceBand(result.confidence);
+    var now = new Date().toISOString();
     rec.enrichment = {
-      status: 'done', model: CURRENT_MODEL_ID, at: new Date().toISOString(),
+      status: 'done', model: CURRENT_MODEL_ID, at: now,
       confidence: result.confidence, needsReview: band === 'medium', suggestion: null
     };
     if (band === 'low' || result.type === null) {
       rec.enrichment.suggestion = result.type === null ? null : result;
     } else {
       ['type', 'title', 'occurredAt', 'tags', 'rating', 'details'].forEach(function (field) {
-        if (rec.userEdited.indexOf(field) === -1) rec[field] = result[field];
+        applyIfNotUserEdited(rec, field, result[field]);
       });
     }
-    rec.updatedAt = new Date().toISOString();
+    rec.updatedAt = now;
     return put(rec).then(function () { render(); refreshStats(); scheduleSync(); });
   }
 
   function markEnrichmentFailed(rec, err) {
+    var now = new Date().toISOString();
     rec.enrichment.status = 'failed';
-    rec.enrichment.at = new Date().toISOString();
-    rec.updatedAt = new Date().toISOString();
+    rec.enrichment.at = now;
+    rec.updatedAt = now;
     console.error('enrichment failed for', rec.id, err);
     return put(rec).then(function () { render(); scheduleSync(); });
   }
 
-  // Test-only orchestration hooks, alongside __LELOG_TEST_EXTRACTOR__ above.
-  // Neither is reachable from the UI; they exist so smoke.py can drive the
-  // queue and the userEdited gate directly, without a fetch() or a real
-  // model to intercept.
-  window.__LELOG_ENQUEUE_ENRICH__ = enqueueEnrich;
+  // Test-only hook, alongside __LELOG_TEST_EXTRACTOR__ above. Not reachable
+  // from the UI; exists so smoke.py can seed the userEdited gate directly,
+  // since there is no UI yet to hand-edit an extracted field to test through.
   window.__LELOG_SEED_USER_EDITED__ = function (id, field, value) {
     var rec = all.find(function (r) { return r.id === id; });
-    rec[field] = value;
-    if (rec.userEdited.indexOf(field) === -1) rec.userEdited.push(field);
+    markUserEdited(rec, field, value);
     return put(rec);
   };
 
@@ -1768,10 +1787,16 @@
       ? "Your browser doesn't support on-device AI yet — entries still save and sync normally."
       : 'On-device AI fills in type, title, tags and details after you save. Nothing leaves your phone.';
     if (!on) return;
-    var live = all.filter(function (r) { return !r.deleted; });
-    $('sEnriched').textContent = live.filter(function (r) { return r.enrichment.status === 'done'; }).length;
-    $('sEnrichPending').textContent = live.filter(function (r) { return r.enrichment.status === 'pending'; }).length;
-    $('sEnrichReview').textContent = live.filter(function (r) { return r.enrichment.needsReview; }).length;
+    var enriched = 0, pending = 0, review = 0;
+    all.forEach(function (r) {
+      if (r.deleted) return;
+      if (r.enrichment.status === 'done') enriched++;
+      if (r.enrichment.status === 'pending') pending++;
+      if (r.enrichment.needsReview) review++;
+    });
+    $('sEnriched').textContent = enriched;
+    $('sEnrichPending').textContent = pending;
+    $('sEnrichReview').textContent = review;
   }
 
   $('enrichEnableBtn').onclick = function () {
@@ -1783,8 +1808,7 @@
     }).then(function () {
       $('enrichProgress').hidden = true;
       refreshEnrichUI();
-      all.filter(function (r) { return !r.deleted && r.enrichment.status === 'pending'; })
-         .forEach(function (r) { enqueueEnrich(r.id); });
+      enqueuePending();
       toast('On-device AI is ready');
     }).catch(function (e) {
       console.error(e);
@@ -1862,8 +1886,7 @@
     if (window.matchMedia('(min-width: 700px)').matches) input.focus();
     // A tab closed mid-queue loses nothing: enrichment.status on the record
     // itself is the queue, so every still-pending record just gets re-enqueued.
-    all.filter(function (r) { return !r.deleted && r.enrichment.status === 'pending'; })
-       .forEach(function (r) { enqueueEnrich(r.id); });
+    enqueuePending();
     // Auth work happens after the first render: capture must never wait on it.
     // Kept off the boot chain's catch as well, so a Dropbox problem can never
     // present itself as "storage unavailable" and hide the entries.
