@@ -281,6 +281,10 @@
     <h2>Enrichment</h2>
     <p id="enrichNote">On-device AI fills in type, title, tags and details after you save. Nothing leaves your phone.</p>
     <select id="enrichModelSel" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);font:inherit;font-size:14px;padding:10px 12px;border-radius:11px;outline:none;margin-bottom:10px"></select>
+    <label style="display:flex;gap:9px;align-items:center;font-size:13.5px;color:var(--muted);margin-bottom:10px">
+      <input type="checkbox" id="enrichForceF32">
+      Use the 32-bit build — try this if loading fails on a driver that claims 16-bit support
+    </label>
     <div class="row">
       <button class="btn" id="enrichEnableBtn">Turn on</button>
       <button class="btn ghost" id="enrichDisableBtn" hidden>Turn off</button>
@@ -315,7 +319,7 @@
   </section>
 
   <section>
-    <p style="margin:0;color:var(--faint);font-size:12.5px">log-v1-8 — capture, search, export, Dropbox sync, on-device enrichment. No accounts. Entries are stored in the schema the full app expects, so nothing here needs migrating later.</p>
+    <p style="margin:0;color:var(--faint);font-size:12.5px">log-v1-9 — capture, search, export, Dropbox sync, on-device enrichment. No accounts. Entries are stored in the schema the full app expects, so nothing here needs migrating later.</p>
   </section>
 </div>
 
@@ -1153,8 +1157,8 @@
   // not have, and q4f32_1 runs anywhere WebGPU does. Every id below was
   // checked against the prebuilt list of the pinned WebLLM version.
   var MODELS = [
-    { key: 'smol-360m', label: 'SmolLM2 360M — smallest, most likely to run (~0.4GB)',
-      f16: 'SmolLM2-360M-Instruct-q4f16_1-MLC', f32: null },
+    { key: 'smol-360m', label: 'SmolLM2 360M — smallest (~0.4GB)',
+      f16: 'SmolLM2-360M-Instruct-q4f16_1-MLC', f32: 'SmolLM2-360M-Instruct-q4f32_1-MLC' },
     { key: 'llama-1b', label: 'Llama 3.2 1B — balanced (~0.9GB)',
       f16: 'Llama-3.2-1B-Instruct-q4f16_1-MLC', f32: 'Llama-3.2-1B-Instruct-q4f32_1-MLC' },
     { key: 'qwen-0.5b', label: 'Qwen2.5 0.5B — small (~1GB)',
@@ -1164,6 +1168,7 @@
   ];
   var DEFAULT_MODEL_KEY = 'llama-1b';
   var enrichModelId = null; // the concrete id last attempted, for error text
+  var enrichAdapter = '';   // what the GPU calls itself, likewise
   var TYPES = ['book', 'person', 'place', 'restaurant', 'podcast', 'film', 'idea', 'conversation', 'note'];
   var DETAIL_HINTS = {
     book: ['author', 'genre', 'format'],
@@ -1283,8 +1288,12 @@
       // a blocklisted driver, a headless GPU, a browser flag. That is a
       // clearer failure to report than whatever WebLLM would throw later.
       if (!adapter) throw new Error('WebGPU is present but no GPU adapter is available on this device.');
+      enrichAdapter = describeAdapter(adapter);
       var model = chosenModel();
-      var f16 = !!(adapter.features && adapter.features.has('shader-f16'));
+      // Some mobile drivers advertise shader-f16 and then fail to compile
+      // f16 shaders, so the choice can be overridden in Settings.
+      var f16 = localStorage.getItem('enrichForceF32') !== '1'
+        && !!(adapter.features && adapter.features.has('shader-f16'));
       enrichModelId = f16 ? model.f16 : (model.f32 || null);
       if (!enrichModelId) {
         throw new Error(model.label.split(' —')[0] + ' needs the WebGPU shader-f16 feature, which this'
@@ -1324,6 +1333,15 @@
     try { return new URL(url).host; } catch (e) { return url; }
   }
 
+  // Which GPU this is matters when the driver is the thing refusing, and it
+  // is the one detail no error message here would otherwise carry.
+  function describeAdapter(adapter) {
+    var info = adapter && adapter.info;
+    if (!info) return '';
+    return [info.vendor, info.architecture, info.device, info.description]
+      .filter(Boolean).join(' ').trim();
+  }
+
   function probe(url) {
     // One byte is enough to tell reachable from blocked, and costs nothing
     // on a metered connection.
@@ -1337,10 +1355,15 @@
     // A driver that refuses to compile the model's shaders has nothing to do
     // with the download, and probing hosts would say something misleading.
     if (/vk_|vulkan|dawn|pipeline|shader|device lost|out of memory/i.test(msg)) {
-      return Promise.resolve(' This is your GPU driver refusing to build the model'
+      var f32 = localStorage.getItem('enrichForceF32') === '1';
+      return Promise.resolve(' Your GPU driver refused to build the model'
         + (enrichModelId ? ' (' + enrichModelId + ')' : '')
-        + ', not a download problem — the model arrived fine. A smaller model is'
-        + ' the thing most likely to work: pick one in Settings and try again.');
+        + (enrichAdapter ? ' on ' + enrichAdapter : '')
+        + ', not a download problem — the model arrived fine.'
+        + (f32 ? ' A 32-bit build failed too, so this driver cannot run these'
+               + ' shaders at all and no model choice here will change that.'
+               : ' Some drivers claim 16-bit shader support and then fail to'
+               + ' compile it — try the 32-bit option in Settings.'));
     }
     if (!/cache|fetch|network|load model|failed to/i.test(msg)) return Promise.resolve('');
     var rec = modelRecord();
@@ -1897,6 +1920,7 @@
       });
     }
     sel.value = chosenModel().key;
+    $('enrichForceF32').checked = localStorage.getItem('enrichForceF32') === '1';
     $('enrichEnableBtn').hidden = on;
     $('enrichEnableBtn').disabled = !supported;
     $('enrichDisableBtn').hidden = !on;
@@ -1951,6 +1975,13 @@
   $('enrichDisableBtn').onclick = function () {
     localStorage.removeItem('enrichmentEnabled');
     refreshEnrichUI();
+  };
+
+  $('enrichForceF32').onchange = function () {
+    if (this.checked) localStorage.setItem('enrichForceF32', '1');
+    else localStorage.removeItem('enrichForceF32');
+    enrichEngine = null;
+    $('enrichError').hidden = true;
   };
 
   $('enrichModelSel').onchange = function () {
