@@ -2528,6 +2528,31 @@ def test_reload_recovers_pending_queue(page, base_url):
 
 
 @test
+def test_turning_on_reports_why_the_model_would_not_load(page, base_url):
+    """A phone has no console, so the real failure has to reach the screen.
+
+    navigator.gpu can exist while the device still refuses an adapter; that
+    path is reachable without real WebGPU, unlike loading actual weights.
+    """
+    page.add_init_script("""
+        Object.defineProperty(navigator, 'gpu', {
+            configurable: true,
+            value: { requestAdapter: () => Promise.resolve(null) },
+        });
+    """)
+
+    boot(page, base_url)
+    open_sheet(page)
+    page.click("#enrichEnableBtn")
+
+    page.wait_for_selector("#enrichError:not([hidden])")
+    assert "no GPU adapter" in page.inner_text("#enrichError")
+    # A failed load must not leave enrichment switched on.
+    assert page.evaluate("() => localStorage.getItem('enrichmentEnabled')") is None
+    assert not page.locator("#enrichEnableBtn").is_disabled(), "retry is impossible"
+
+
+@test
 def test_enrichment_shape_in_export(page, base_url):
     boot(page, base_url)
     capture(page, "not yet enriched")

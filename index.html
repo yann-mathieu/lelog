@@ -287,6 +287,7 @@
     <div id="enrichProgress" hidden>
       <div class="stat"><span>Downloading model</span><b id="enrichPct">0%</b></div>
     </div>
+    <p id="enrichError" hidden style="color:var(--danger);word-break:break-word"></p>
     <div id="enrichStats" hidden>
       <div class="stat"><span>Enriched</span><b id="sEnriched">0</b></div>
       <div class="stat"><span>Waiting</span><b id="sEnrichPending">0</b></div>
@@ -313,7 +314,7 @@
   </section>
 
   <section>
-    <p style="margin:0;color:var(--faint);font-size:12.5px">v0.1 — capture, search, export. No AI, no sync, no accounts. Entries are stored in the schema the full app expects, so nothing here needs migrating later.</p>
+    <p style="margin:0;color:var(--faint);font-size:12.5px">log-v1-6 — capture, search, export, Dropbox sync, on-device enrichment. No accounts. Entries are stored in the schema the full app expects, so nothing here needs migrating later.</p>
   </section>
 </div>
 
@@ -1142,7 +1143,13 @@
   // requests this runs strictly one record at a time (enrichRunning).
   // Capture never waits on any of this: save() only ever calls enqueueEnrich()
   // fire-and-forget, exactly like it does with scheduleSync().
-  var CURRENT_MODEL_ID = 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC';
+  // Two quantisations of the same model. q4f16_1 is smaller and faster but
+  // needs the WebGPU shader-f16 feature, which plenty of phone GPUs do not
+  // have; q4f32_1 is the fallback that runs anywhere WebGPU does. Which one
+  // we get is decided from the real adapter in getEnrichEngine().
+  var MODEL_F16 = 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC';
+  var MODEL_F32 = 'Qwen2.5-1.5B-Instruct-q4f32_1-MLC';
+  var enrichModelId = MODEL_F16;
   var TYPES = ['book', 'person', 'place', 'restaurant', 'podcast', 'film', 'idea', 'conversation', 'note'];
   var DETAIL_HINTS = {
     book: ['author', 'genre', 'format'],
@@ -1247,10 +1254,25 @@
 
   function getEnrichEngine(onProgress) {
     if (enrichEngine) return enrichEngine;
-    enrichEngine = loadWebLLM().then(function (webllm) {
-      return webllm.CreateMLCEngine(CURRENT_MODEL_ID, {
+    enrichEngine = Promise.resolve().then(function () {
+      if (!navigator.gpu) throw new Error('This browser has no WebGPU support.');
+      return navigator.gpu.requestAdapter();
+    }).then(function (adapter) {
+      // navigator.gpu can exist while the device still refuses an adapter —
+      // a blocklisted driver, a headless GPU, a browser flag. That is a
+      // clearer failure to report than whatever WebLLM would throw later.
+      if (!adapter) throw new Error('WebGPU is present but no GPU adapter is available on this device.');
+      enrichModelId = adapter.features && adapter.features.has('shader-f16') ? MODEL_F16 : MODEL_F32;
+      return loadWebLLM();
+    }).then(function (webllm) {
+      return webllm.CreateMLCEngine(enrichModelId, {
         initProgressCallback: onProgress || function () {}
       });
+    }).catch(function (e) {
+      // Never leave a rejected promise cached, or every later retry fails
+      // instantly with the first attempt's error instead of trying again.
+      enrichEngine = null;
+      throw e;
     });
     return enrichEngine;
   }
@@ -1316,7 +1338,7 @@
     var band = confidenceBand(result.confidence);
     var now = new Date().toISOString();
     rec.enrichment = {
-      status: 'done', model: CURRENT_MODEL_ID, at: now,
+      status: 'done', model: enrichModelId, at: now,
       confidence: result.confidence, needsReview: band === 'medium', suggestion: null
     };
     if (band === 'low' || result.type === null) {
@@ -1386,6 +1408,11 @@
       searchEl = $('search'), countEl = $('count'), hintEl = $('hint');
 
   // ---------- helpers ----------
+  function errorText(e) {
+    var msg = (e && e.message) ? e.message : String(e);
+    return msg.length > 300 ? msg.slice(0, 300) + '…' : msg;
+  }
+
   function esc(s) {
     return String(s).replace(/[&<>"']/g, function (c) {
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
@@ -1778,6 +1805,9 @@
   function refreshEnrichUI() {
     var on = enrichmentEnabled();
     var supported = !!navigator.gpu;
+    // A failure message is about one attempt; reopening the sheet clears it.
+    // The catch that shows it runs after this, so it still gets its say.
+    $('enrichError').hidden = true;
     $('enrichEnableBtn').hidden = on;
     $('enrichEnableBtn').disabled = !supported;
     $('enrichDisableBtn').hidden = !on;
@@ -1803,8 +1833,10 @@
     this.disabled = true;
     localStorage.setItem('enrichmentEnabled', '1');
     $('enrichProgress').hidden = false;
+    $('enrichError').hidden = true;
     getEnrichEngine(function (p) {
       $('enrichPct').textContent = Math.round((p.progress || 0) * 100) + '%';
+      if (p.text) $('enrichPct').title = p.text;
     }).then(function () {
       $('enrichProgress').hidden = true;
       refreshEnrichUI();
@@ -1816,7 +1848,11 @@
       localStorage.removeItem('enrichmentEnabled');
       this.disabled = false;
       refreshEnrichUI();
-      toast('Could not load the on-device model');
+      // The real message, on screen: this fails for device-specific reasons
+      // (no adapter, not enough VRAM, a blocked CDN) that a generic "could
+      // not load" hides, and a phone has no console to go and read.
+      $('enrichError').textContent = 'Could not load the on-device model — ' + errorText(e);
+      $('enrichError').hidden = false;
     }.bind(this));
   };
 
