@@ -314,7 +314,7 @@
   </section>
 
   <section>
-    <p style="margin:0;color:var(--faint);font-size:12.5px">log-v1-6 — capture, search, export, Dropbox sync, on-device enrichment. No accounts. Entries are stored in the schema the full app expects, so nothing here needs migrating later.</p>
+    <p style="margin:0;color:var(--faint);font-size:12.5px">log-v1-7 — capture, search, export, Dropbox sync, on-device enrichment. No accounts. Entries are stored in the schema the full app expects, so nothing here needs migrating later.</p>
   </section>
 </div>
 
@@ -1165,6 +1165,7 @@
   var CONFIDENCE_HIGH = 0.75, CONFIDENCE_LOW = 0.4;
 
   var enrichEngine = null; // the loaded WebLLM engine, created once and reused
+  var webllmModule = null; // the imported module, kept for its prebuilt model list
   var enrichQueue = [], enrichQueued = {}, enrichRunning = false;
 
   function enrichmentEnabled() {
@@ -1265,6 +1266,7 @@
       enrichModelId = adapter.features && adapter.features.has('shader-f16') ? MODEL_F16 : MODEL_F32;
       return loadWebLLM();
     }).then(function (webllm) {
+      webllmModule = webllm;
       return webllm.CreateMLCEngine(enrichModelId, {
         initProgressCallback: onProgress || function () {}
       });
@@ -1275,6 +1277,48 @@
       throw e;
     });
     return enrichEngine;
+  }
+
+  // WebLLM downloads the model from two hosts, and when one is unreachable
+  // it surfaces the failure as a bare "Cache.add() encountered a network
+  // error" that names neither. These probes run only after a failure, so
+  // they can never break a load that would have worked, and they turn that
+  // into a message that says which host is refusing and why.
+  function modelRecord() {
+    var list = webllmModule && webllmModule.prebuiltAppConfig
+      && webllmModule.prebuiltAppConfig.model_list;
+    if (!list) return null;
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].model_id === enrichModelId) return list[i];
+    }
+    return null;
+  }
+
+  function hostOf(url) {
+    try { return new URL(url).host; } catch (e) { return url; }
+  }
+
+  function probe(url) {
+    // One byte is enough to tell reachable from blocked, and costs nothing
+    // on a metered connection.
+    return fetch(url, { headers: { Range: 'bytes=0-0' } }).then(function (res) {
+      return (res.ok || res.status === 206) ? null : 'HTTP ' + res.status;
+    }).catch(function (e) { return errorText(e) || 'unreachable'; });
+  }
+
+  function diagnoseModelLoad() {
+    var rec = modelRecord();
+    if (!rec) return Promise.resolve('');
+    var weights = String(rec.model).replace(/\/+$/, '') + '/resolve/main/mlc-chat-config.json';
+    return Promise.all([probe(rec.model_lib), probe(weights)]).then(function (r) {
+      var bad = [];
+      if (r[0]) bad.push('the model library on ' + hostOf(rec.model_lib) + ' (' + r[0] + ')');
+      if (r[1]) bad.push('the model weights on ' + hostOf(weights) + ' (' + r[1] + ')');
+      return bad.length
+        ? ' Could not reach ' + bad.join(', nor ') + '.'
+        : ' Both model hosts are reachable from here, so the download was most'
+          + ' likely interrupted or ran out of room — it needs roughly 1.5GB free.';
+    }).catch(function () { return ''; });
   }
 
   function extractionSchema() {
@@ -1853,6 +1897,9 @@
       // not load" hides, and a phone has no console to go and read.
       $('enrichError').textContent = 'Could not load the on-device model — ' + errorText(e);
       $('enrichError').hidden = false;
+      diagnoseModelLoad().then(function (extra) {
+        if (extra) $('enrichError').textContent += extra;
+      });
     }.bind(this));
   };
 
