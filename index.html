@@ -280,6 +280,7 @@
   <section>
     <h2>Enrichment</h2>
     <p id="enrichNote">On-device AI fills in type, title, tags and details after you save. Nothing leaves your phone.</p>
+    <select id="enrichModelSel" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);font:inherit;font-size:14px;padding:10px 12px;border-radius:11px;outline:none;margin-bottom:10px"></select>
     <div class="row">
       <button class="btn" id="enrichEnableBtn">Turn on</button>
       <button class="btn ghost" id="enrichDisableBtn" hidden>Turn off</button>
@@ -314,7 +315,7 @@
   </section>
 
   <section>
-    <p style="margin:0;color:var(--faint);font-size:12.5px">log-v1-7 — capture, search, export, Dropbox sync, on-device enrichment. No accounts. Entries are stored in the schema the full app expects, so nothing here needs migrating later.</p>
+    <p style="margin:0;color:var(--faint);font-size:12.5px">log-v1-8 — capture, search, export, Dropbox sync, on-device enrichment. No accounts. Entries are stored in the schema the full app expects, so nothing here needs migrating later.</p>
   </section>
 </div>
 
@@ -1143,13 +1144,26 @@
   // requests this runs strictly one record at a time (enrichRunning).
   // Capture never waits on any of this: save() only ever calls enqueueEnrich()
   // fire-and-forget, exactly like it does with scheduleSync().
-  // Two quantisations of the same model. q4f16_1 is smaller and faster but
-  // needs the WebGPU shader-f16 feature, which plenty of phone GPUs do not
-  // have; q4f32_1 is the fallback that runs anywhere WebGPU does. Which one
-  // we get is decided from the real adapter in getEnrichEngine().
-  var MODEL_F16 = 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC';
-  var MODEL_F32 = 'Qwen2.5-1.5B-Instruct-q4f32_1-MLC';
-  var enrichModelId = MODEL_F16;
+  // Which model to run is a device question, not a taste question: a phone
+  // GPU driver that refuses to compile a 1.5B model's shaders will often
+  // compile a smaller one, and there is no way to know from here which. So
+  // the choice is offered in Settings, smallest-is-safest documented, and
+  // each family carries both quantisations — q4f16_1 is smaller and faster
+  // but needs the WebGPU shader-f16 feature, which plenty of phone GPUs do
+  // not have, and q4f32_1 runs anywhere WebGPU does. Every id below was
+  // checked against the prebuilt list of the pinned WebLLM version.
+  var MODELS = [
+    { key: 'smol-360m', label: 'SmolLM2 360M — smallest, most likely to run (~0.4GB)',
+      f16: 'SmolLM2-360M-Instruct-q4f16_1-MLC', f32: null },
+    { key: 'llama-1b', label: 'Llama 3.2 1B — balanced (~0.9GB)',
+      f16: 'Llama-3.2-1B-Instruct-q4f16_1-MLC', f32: 'Llama-3.2-1B-Instruct-q4f32_1-MLC' },
+    { key: 'qwen-0.5b', label: 'Qwen2.5 0.5B — small (~1GB)',
+      f16: 'Qwen2.5-0.5B-Instruct-q4f16_1-MLC', f32: 'Qwen2.5-0.5B-Instruct-q4f32_1-MLC' },
+    { key: 'qwen-1.5b', label: 'Qwen2.5 1.5B — best extraction, heaviest (~1.6GB)',
+      f16: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC', f32: 'Qwen2.5-1.5B-Instruct-q4f32_1-MLC' }
+  ];
+  var DEFAULT_MODEL_KEY = 'llama-1b';
+  var enrichModelId = null; // the concrete id last attempted, for error text
   var TYPES = ['book', 'person', 'place', 'restaurant', 'podcast', 'film', 'idea', 'conversation', 'note'];
   var DETAIL_HINTS = {
     book: ['author', 'genre', 'format'],
@@ -1170,6 +1184,12 @@
 
   function enrichmentEnabled() {
     return localStorage.getItem('enrichmentEnabled') === '1';
+  }
+
+  function chosenModel() {
+    var key = localStorage.getItem('enrichModel') || DEFAULT_MODEL_KEY;
+    for (var i = 0; i < MODELS.length; i++) if (MODELS[i].key === key) return MODELS[i];
+    return MODELS[0];
   }
 
   function enqueueEnrich(id) {
@@ -1263,7 +1283,13 @@
       // a blocklisted driver, a headless GPU, a browser flag. That is a
       // clearer failure to report than whatever WebLLM would throw later.
       if (!adapter) throw new Error('WebGPU is present but no GPU adapter is available on this device.');
-      enrichModelId = adapter.features && adapter.features.has('shader-f16') ? MODEL_F16 : MODEL_F32;
+      var model = chosenModel();
+      var f16 = !!(adapter.features && adapter.features.has('shader-f16'));
+      enrichModelId = f16 ? model.f16 : (model.f32 || null);
+      if (!enrichModelId) {
+        throw new Error(model.label.split(' —')[0] + ' needs the WebGPU shader-f16 feature, which this'
+          + ' device does not have. Pick a different model in Settings.');
+      }
       return loadWebLLM();
     }).then(function (webllm) {
       webllmModule = webllm;
@@ -1306,7 +1332,17 @@
     }).catch(function (e) { return errorText(e) || 'unreachable'; });
   }
 
-  function diagnoseModelLoad() {
+  function diagnoseModelLoad(err) {
+    var msg = errorText(err);
+    // A driver that refuses to compile the model's shaders has nothing to do
+    // with the download, and probing hosts would say something misleading.
+    if (/vk_|vulkan|dawn|pipeline|shader|device lost|out of memory/i.test(msg)) {
+      return Promise.resolve(' This is your GPU driver refusing to build the model'
+        + (enrichModelId ? ' (' + enrichModelId + ')' : '')
+        + ', not a download problem — the model arrived fine. A smaller model is'
+        + ' the thing most likely to work: pick one in Settings and try again.');
+    }
+    if (!/cache|fetch|network|load model|failed to/i.test(msg)) return Promise.resolve('');
     var rec = modelRecord();
     if (!rec) return Promise.resolve('');
     var weights = String(rec.model).replace(/\/+$/, '') + '/resolve/main/mlc-chat-config.json';
@@ -1317,7 +1353,7 @@
       return bad.length
         ? ' Could not reach ' + bad.join(', nor ') + '.'
         : ' Both model hosts are reachable from here, so the download was most'
-          + ' likely interrupted or ran out of room — it needs roughly 1.5GB free.';
+          + ' likely interrupted or ran out of room.';
     }).catch(function () { return ''; });
   }
 
@@ -1852,6 +1888,15 @@
     // A failure message is about one attempt; reopening the sheet clears it.
     // The catch that shows it runs after this, so it still gets its say.
     $('enrichError').hidden = true;
+    var sel = $('enrichModelSel');
+    if (!sel.options.length) {
+      MODELS.forEach(function (m) {
+        var o = document.createElement('option');
+        o.value = m.key; o.textContent = m.label;
+        sel.appendChild(o);
+      });
+    }
+    sel.value = chosenModel().key;
     $('enrichEnableBtn').hidden = on;
     $('enrichEnableBtn').disabled = !supported;
     $('enrichDisableBtn').hidden = !on;
@@ -1897,7 +1942,7 @@
       // not load" hides, and a phone has no console to go and read.
       $('enrichError').textContent = 'Could not load the on-device model — ' + errorText(e);
       $('enrichError').hidden = false;
-      diagnoseModelLoad().then(function (extra) {
+      diagnoseModelLoad(e).then(function (extra) {
         if (extra) $('enrichError').textContent += extra;
       });
     }.bind(this));
@@ -1906,6 +1951,15 @@
   $('enrichDisableBtn').onclick = function () {
     localStorage.removeItem('enrichmentEnabled');
     refreshEnrichUI();
+  };
+
+  $('enrichModelSel').onchange = function () {
+    localStorage.setItem('enrichModel', this.value);
+    // Drop any engine built from the previous choice, so the next load
+    // actually uses the newly picked model rather than the cached one.
+    enrichEngine = null;
+    $('enrichError').hidden = true;
+    if (enrichmentEnabled()) toast('Model changed — turn enrichment off and on to load it');
   };
 
   $('reenrichBtn').onclick = function () {

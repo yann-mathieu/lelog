@@ -2553,6 +2553,20 @@ def test_turning_on_reports_why_the_model_would_not_load(page, base_url):
 
 
 @test
+def test_model_choice_persists(page, base_url):
+    """Which model a device can actually run is trial and error, so the
+    choice has to survive a reload rather than resetting every visit."""
+    boot(page, base_url)
+    open_sheet(page)
+    page.select_option("#enrichModelSel", "smol-360m")
+    close_sheet(page)
+
+    boot(page, base_url)
+    open_sheet(page)
+    assert page.input_value("#enrichModelSel") == "smol-360m"
+
+
+@test
 def test_enrichment_shape_in_export(page, base_url):
     boot(page, base_url)
     capture(page, "not yet enriched")
