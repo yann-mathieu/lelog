@@ -296,6 +296,7 @@
     <div id="enrichStats" hidden>
       <div class="stat"><span>Enriched</span><b id="sEnriched">0</b></div>
       <div class="stat"><span>Waiting</span><b id="sEnrichPending">0</b></div>
+      <div class="stat"><span>Failed</span><b id="sEnrichFailed">0</b></div>
       <div class="stat"><span>Needs a glance</span><b id="sEnrichReview">0</b></div>
     </div>
     <p style="margin-bottom:0">
@@ -319,7 +320,7 @@
   </section>
 
   <section>
-    <p style="margin:0;color:var(--faint);font-size:12.5px">log-v1-9 — capture, search, export, Dropbox sync, on-device enrichment. No accounts. Entries are stored in the schema the full app expects, so nothing here needs migrating later.</p>
+    <p style="margin:0;color:var(--faint);font-size:12.5px">log-v2-0 — capture, search, export, Dropbox sync, on-device enrichment. No accounts. Entries are stored in the schema the full app expects, so nothing here needs migrating later.</p>
   </section>
 </div>
 
@@ -1169,6 +1170,7 @@
   var DEFAULT_MODEL_KEY = 'llama-1b';
   var enrichModelId = null; // the concrete id last attempted, for error text
   var enrichAdapter = '';   // what the GPU calls itself, likewise
+  var lastEnrichFailure = ''; // why the most recent extraction gave up
   var TYPES = ['book', 'person', 'place', 'restaurant', 'podcast', 'film', 'idea', 'conversation', 'note'];
   var DETAIL_HINTS = {
     book: ['author', 'genre', 'format'],
@@ -1452,7 +1454,9 @@
       });
     }
     rec.updatedAt = now;
-    return put(rec).then(function () { render(); refreshStats(); scheduleSync(); });
+    return put(rec).then(function () {
+      render(); refreshStats(); refreshEnrichUI(); scheduleSync();
+    });
   }
 
   function markEnrichmentFailed(rec, err) {
@@ -1461,7 +1465,8 @@
     rec.enrichment.at = now;
     rec.updatedAt = now;
     console.error('enrichment failed for', rec.id, err);
-    return put(rec).then(function () { render(); scheduleSync(); });
+    lastEnrichFailure = errorText(err);
+    return put(rec).then(function () { render(); refreshEnrichUI(); scheduleSync(); });
   }
 
   // Test-only hook, alongside __LELOG_TEST_EXTRACTOR__ above. Not reachable
@@ -1930,16 +1935,25 @@
       ? "Your browser doesn't support on-device AI yet — entries still save and sync normally."
       : 'On-device AI fills in type, title, tags and details after you save. Nothing leaves your phone.';
     if (!on) return;
-    var enriched = 0, pending = 0, review = 0;
+    var enriched = 0, pending = 0, failed = 0, review = 0;
     all.forEach(function (r) {
       if (r.deleted) return;
       if (r.enrichment.status === 'done') enriched++;
       if (r.enrichment.status === 'pending') pending++;
+      if (r.enrichment.status === 'failed') failed++;
       if (r.enrichment.needsReview) review++;
     });
     $('sEnriched').textContent = enriched;
     $('sEnrichPending').textContent = pending;
+    $('sEnrichFailed').textContent = failed;
     $('sEnrichReview').textContent = review;
+    // A count of failures is not a reason for them; the model can load fine
+    // and still fall over on every extraction, which would otherwise show up
+    // only as a number that never becomes "enriched".
+    if (failed && lastEnrichFailure) {
+      $('enrichError').textContent = 'Last extraction failed — ' + lastEnrichFailure;
+      $('enrichError').hidden = false;
+    }
   }
 
   $('enrichEnableBtn').onclick = function () {
