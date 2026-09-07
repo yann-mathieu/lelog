@@ -2703,7 +2703,45 @@ def test_the_list_says_when_an_entry_is_waiting(page, base_url):
     enrich(page)
 
     page.wait_for_selector(".estate.working")
-    assert "enriching" in page.inner_text(".estate.working")
+    # The label is a live one: whatever it says, it must carry elapsed time
+    # so a slow pass is distinguishable from a stuck one.
+    page.wait_for_function(
+        "() => /\\d+s/.test(document.querySelector('.estate.working').textContent)"
+    )
+
+
+@test
+def test_the_list_reports_model_load_and_token_progress(page, base_url):
+    """"Enriching…" alone cannot distinguish a working model from a hung one.
+    The extractor is handed a reporter; whatever it reports has to show."""
+    # Reports a download, then tokens, and never finishes — so the live
+    # states are all observable rather than racing to a result.
+    stub_enrichment(page, """
+        (rec, ctx, report) => new Promise(() => {
+            report({ phase: 'loading', pct: 42 });
+            setTimeout(() => report({ phase: 'running', tokens: 7,
+                                      partial: '{"type":"book"' }), 50);
+        })
+    """)
+
+    boot(page, base_url)
+    capture(page, "watch the model work")
+    enrich(page)
+
+    page.wait_for_selector(".estate.working")
+    page.wait_for_function(
+        "() => /loading model 42%/.test(document.querySelector('.estate.working').textContent)"
+    )
+    # Then the generating phase, with a token count and elapsed time.
+    page.wait_for_function(
+        "() => /thinking/.test(document.querySelector('.estate.working').textContent)"
+    )
+    assert "7 tokens" in page.inner_text(".estate.working")
+
+    # And the raw output so far is visible on the entry itself.
+    page.click(".entry .raw")
+    page.wait_for_selector("#liveStream:not([hidden])")
+    assert '"type":"book"' in page.inner_text("#liveStream")
 
 
 @test

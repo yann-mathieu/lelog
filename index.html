@@ -165,6 +165,15 @@
     margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--border);
     color: var(--faint); font-size: 12px; word-break: break-word;
   }
+  /* The model's output as it arrives — proof of life, and the only way to
+     see what it is actually producing rather than only the verdict. */
+  .live-stream {
+    margin: 8px 0 0; padding: 8px 10px; background: var(--surface-2);
+    border-radius: 8px; color: var(--muted); font-size: 11.5px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: pre-wrap; word-break: break-all; max-height: 96px;
+    overflow: hidden; line-height: 1.45;
+  }
   .hint-row { display: flex; gap: 8px; margin-top: 10px; }
   .hint-input {
     flex: 1; min-width: 0; background: var(--bg); border: 1px solid var(--border);
@@ -1295,12 +1304,14 @@
     // Which record is actually being worked on right now, so the list can
     // say so — a model call takes seconds and otherwise looks like nothing.
     enrichingId = id;
+    startLive();
     render();
     runExtraction(rec)
       .then(function (result) { return applyExtraction(rec, result); })
       .catch(function (e) { return markEnrichmentFailed(rec, e); })
       .then(function () {
-        enrichingId = null; enrichRunning = false; render(); pumpEnrichQueue();
+        enrichingId = null; enrichRunning = false; stopLive();
+        render(); pumpEnrichQueue();
       });
   }
 
@@ -1352,8 +1363,62 @@
     // model call) that throws synchronously still rejects the promise chain
     // instead of escaping pumpEnrichQueue uncaught and wedging the queue.
     return Promise.resolve().then(function () {
-      return getExtractor()(rec, buildContext());
+      return getExtractor()(rec, buildContext(), reportProgress);
     }).then(validateExtraction);
+  }
+
+  // What the model is doing, right now. A pass is a model download the first
+  // time and then seconds of silent GPU work, so without this the only
+  // honest thing the app could say was "enriching…" and hope.
+  var live = { phase: '', pct: 0, tokens: 0, partial: '', startedAt: 0 };
+  var liveTimer = null;
+
+  function reportProgress(p) {
+    if (p.phase) live.phase = p.phase;
+    if (typeof p.pct === 'number') live.pct = p.pct;
+    if (typeof p.tokens === 'number') live.tokens = p.tokens;
+    if (typeof p.partial === 'string') live.partial = p.partial;
+    paintLive();
+  }
+
+  function startLive() {
+    live = { phase: 'starting', pct: 0, tokens: 0, partial: '', startedAt: Date.now() };
+    clearInterval(liveTimer);
+    // Ticks the elapsed seconds even while the model is quiet, which is the
+    // difference between "working" and "hung" from the outside.
+    liveTimer = setInterval(paintLive, 500);
+  }
+
+  function stopLive() {
+    clearInterval(liveTimer);
+    liveTimer = null;
+    live = { phase: '', pct: 0, tokens: 0, partial: '', startedAt: 0 };
+  }
+
+  function liveLabel() {
+    var secs = live.startedAt ? Math.round((Date.now() - live.startedAt) / 1000) : 0;
+    if (live.phase === 'loading') {
+      return 'loading model ' + live.pct + '%' + (secs ? ' · ' + secs + 's' : '');
+    }
+    if (live.phase === 'running') {
+      return 'thinking · ' + secs + 's' + (live.tokens ? ' · ' + live.tokens + ' tokens' : '');
+    }
+    return 'starting · ' + secs + 's';
+  }
+
+  // Painted straight into the DOM rather than through render(): this updates
+  // several times a second, and re-rendering the list that often would throw
+  // away whatever is being typed in an open editor.
+  function paintLive() {
+    var badge = document.querySelector('.estate.working');
+    if (badge) badge.textContent = liveLabel();
+    var foot = document.getElementById('liveFoot');
+    if (foot) foot.textContent = liveLabel();
+    var stream = document.getElementById('liveStream');
+    if (stream) {
+      stream.textContent = live.partial || '';
+      stream.hidden = !live.partial;
+    }
   }
 
   function loadWebLLM() {
@@ -1507,14 +1572,59 @@
   // in tests via window.__LELOG_TEST_EXTRACTOR__ (see getExtractor above),
   // since there is no fetch() here for a test to intercept — WebLLM runs
   // over WebGPU, client-side, with no network request to stub.
-  function realWebLLMExtract(rec, ctx) {
-    return getEnrichEngine().then(function (engine) {
-      return engine.chat.completions.create({
+  function realWebLLMExtract(rec, ctx, report) {
+    report = report || function () {};
+    // The load callback matters most on the first pass after a fresh start:
+    // that is a several-hundred-megabyte download, and triggering it from an
+    // entry used to show nothing at all until it finished.
+    return getEnrichEngine(function (p) {
+      report({ phase: 'loading', pct: Math.round((p.progress || 0) * 100) });
+    }).then(function (engine) {
+      report({ phase: 'running', tokens: 0, partial: '' });
+      var req = {
         messages: [{ role: 'user', content: buildPrompt(rec, ctx) }],
         response_format: { type: 'json_object', schema: extractionSchema() }
+      };
+      return streamCompletion(engine, req, report).then(null, function (e) {
+        // Only fall back when streaming never produced anything — a failure
+        // partway through is a real failure, not an unsupported option, and
+        // re-running would cost another pass over the model for nothing.
+        if (live.tokens) throw e;
+        console.warn('streaming unavailable, falling back', e);
+        return engine.chat.completions.create(req).then(function (res) {
+          return res.choices[0].message.content;
+        });
       });
-    }).then(function (res) {
-      return JSON.parse(res.choices[0].message.content);
+    }).then(function (text) {
+      return JSON.parse(text);
+    });
+  }
+
+  function streamCompletion(engine, req, report) {
+    return Promise.resolve().then(function () {
+      var streamReq = {};
+      Object.keys(req).forEach(function (k) { streamReq[k] = req[k]; });
+      streamReq.stream = true;
+      return engine.chat.completions.create(streamReq);
+    }).then(function (stream) {
+      var it = stream[Symbol.asyncIterator] ? stream[Symbol.asyncIterator]() : stream;
+      var text = '', n = 0;
+      // Drained by hand rather than for-await: this file is plain ES5-style
+      // promises throughout and a build step is not on the table.
+      function pump() {
+        return it.next().then(function (step) {
+          if (step.done) return text;
+          var choice = step.value && step.value.choices && step.value.choices[0];
+          var delta = choice && choice.delta && choice.delta.content;
+          if (delta) {
+            text += delta;
+            n++;
+            report({ tokens: n, partial: text.slice(-160) });
+          }
+          return pump();
+        });
+      }
+      return pump();
     });
   }
 
@@ -1610,7 +1720,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v2-4';
+  var APP_VERSION = 'log-v2-5';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -1684,7 +1794,7 @@
   // the resting state now that nothing runs on its own, so it says nothing at
   // all — only work in flight and outright failure are worth a word.
   function enrichBadge(r) {
-    if (r.id === enrichingId) return '<span class="estate working">enriching…</span>';
+    if (r.id === enrichingId) return '<span class="estate working">' + esc(liveLabel()) + '</span>';
     if (enrichQueued[r.id]) return '<span class="estate">queued</span>';
     if (r.enrichment.status === 'failed') {
       return '<span class="estate failed">could not enrich · tap to see why</span>';
@@ -1716,7 +1826,7 @@
     } else if (e.status === 'failed') {
       foot = 'Could not enrich this entry' + (e.error ? ' — ' + esc(e.error) : '');
     } else if (r.id === enrichingId) {
-      foot = 'Enriching now…';
+      foot = esc(liveLabel());
     } else if (e.status === 'pending') {
       foot = enrichmentEnabled() ? 'Waiting its turn' : 'Enrichment is off — turn it on in Settings';
     }
@@ -1728,10 +1838,12 @@
         '</b></div>';
     }
 
-    if (!body && !sugg && !foot) return '';
-    return '<div class="ereadout">' + body + sugg +
-      (foot ? '<div class="ereadout-foot' + (body || sugg ? '' : ' bare') + '">'
-        + foot + '</div>' : '') + '</div>';
+    var stream = r.id === enrichingId
+      ? '<pre class="live-stream" id="liveStream" hidden></pre>' : '';
+    if (!body && !sugg && !foot && !stream) return '';
+    return '<div class="ereadout">' + body + sugg + stream +
+      (foot ? '<div class="ereadout-foot' + (body || sugg ? '' : ' bare') + '"' +
+        (r.id === enrichingId ? ' id="liveFoot"' : '') + '>' + foot + '</div>' : '') + '</div>';
   }
 
   function render() {
