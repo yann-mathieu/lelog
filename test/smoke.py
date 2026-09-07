@@ -2834,6 +2834,168 @@ def test_a_failed_entry_says_so_in_the_list(page, base_url):
     assert "could not enrich" in page.inner_text(".estate.failed")
 
 
+# ---------- the model layer itself ----------
+#
+# The stub above replaces the extractor, which leaves everything below it —
+# engine creation, adapter and quantisation choice, streaming, cache checks —
+# running for the first time on a real phone. That is where every field
+# failure in this feature has come from. These tests replace the WebLLM
+# *module* instead, so that code actually executes here.
+
+FAKE_WEBLLM = """
+window.__LELOG_TEST_WEBLLM__ = {
+    prebuiltAppConfig: { model_list: [
+        { model_id: 'SmolLM2-360M-Instruct-q4f16_1-MLC',
+          model: 'https://huggingface.co/mlc-ai/SmolLM2-360M-Instruct-q4f16_1-MLC',
+          model_lib: 'https://raw.githubusercontent.com/x/y/lib.wasm' },
+        { model_id: 'SmolLM2-360M-Instruct-q4f32_1-MLC',
+          model: 'https://huggingface.co/mlc-ai/SmolLM2-360M-Instruct-q4f32_1-MLC',
+          model_lib: 'https://raw.githubusercontent.com/x/y/lib32.wasm' }
+    ] },
+    hasModelInCache: () => Promise.resolve(true),
+    CreateMLCEngine: (id, opts) => {
+        window.__LELOG_SEEN_MODEL__ = id;
+        (opts.initProgressCallback || (() => {}))({ progress: 0.5, text: 'fetching' });
+        (opts.initProgressCallback || (() => {}))({ progress: 1, text: 'done' });
+        const out = JSON.stringify({ type: 'book', title: 'Dune', occurredAt: null,
+            tags: ['scifi'], rating: 5, details: { author: 'Herbert' }, confidence: 0.9 });
+        return Promise.resolve({
+            interruptGenerate() { this.stopped = true; },
+            chat: { completions: { create(req) {
+                window.__LELOG_SEEN_REQ__ = JSON.parse(JSON.stringify(req));
+                if (!req.stream) {
+                    return Promise.resolve({ choices: [{ message: { content: out } }] });
+                }
+                let i = 0;
+                return Promise.resolve({ [Symbol.asyncIterator]() { return { next() {
+                    if (i >= out.length) return Promise.resolve({ done: true });
+                    const chunk = out.slice(i, i + 12); i += 12;
+                    return Promise.resolve({ done: false,
+                        value: { choices: [{ delta: { content: chunk } }] } });
+                } }; } });
+            } } }
+        });
+    }
+};
+"""
+
+
+def fake_gpu(f16=True):
+    """A WebGPU adapter that reports what a real one reports."""
+    return """
+        Object.defineProperty(navigator, 'gpu', { configurable: true, value: {
+            requestAdapter: () => Promise.resolve({
+                features: new Set(%s),
+                info: { vendor: 'testvendor', architecture: 'testarch', device: 'testgpu' }
+            })
+        }});
+    """ % ("['shader-f16']" if f16 else "[]")
+
+
+def stub_model_layer(page, f16=True):
+    page.add_init_script(fake_gpu(f16) + FAKE_WEBLLM
+                         + "localStorage.setItem('enrichmentEnabled', '1');")
+
+
+@test
+def test_a_whole_pass_through_the_real_model_layer(page, base_url):
+    """Engine creation, streaming and parsing, with only the module faked."""
+    stub_model_layer(page)
+
+    boot(page, base_url)
+    capture(page, "finished dune")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+    assert rec["type"] == "book" and rec["title"] == "Dune"
+    assert rec["details"] == {"author": "Herbert"}
+    # Streamed rather than fetched in one go.
+    assert page.evaluate("() => window.__LELOG_SEEN_REQ__.stream") is True
+    assert page.evaluate("() => window.__LELOG_SEEN_REQ__.max_tokens") == 220
+    # And the model it recorded is the one the engine was actually built with.
+    assert rec["enrichment"]["model"] == page.evaluate("() => window.__LELOG_SEEN_MODEL__")
+
+
+@test
+def test_model_load_progress_reaches_an_entry_trigger(page, base_url):
+    """The bug that shipped: load progress was wired to Settings only, so a
+    pass started from a row downloaded hundreds of megabytes in silence."""
+    stub_model_layer(page)
+    # Hold the engine open at 50% so the loading state is observable.
+    page.add_init_script("""
+        const real = window.__LELOG_TEST_WEBLLM__.CreateMLCEngine;
+        window.__LELOG_TEST_WEBLLM__.CreateMLCEngine = (id, opts) => {
+            opts.initProgressCallback({ progress: 0.5, text: 'fetching' });
+            return new Promise(() => {});
+        };
+    """)
+
+    boot(page, base_url)
+    capture(page, "watch it load")
+    enrich(page)
+
+    page.wait_for_function("() => /loading model 50%/.test(document.body.textContent)")
+
+
+@test
+def test_the_quantisation_follows_the_adapter(page, base_url):
+    """A driver without shader-f16 must get the 32-bit build, and this is the
+    decision that took a week of round trips to get right."""
+    stub_model_layer(page, f16=False)
+
+    boot(page, base_url)
+    capture(page, "no f16 here")
+    enrich(page)
+    wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+
+    assert page.evaluate("() => window.__LELOG_SEEN_MODEL__").endswith("q4f32_1-MLC")
+
+
+@test
+def test_it_falls_back_when_streaming_is_unsupported(page, base_url):
+    stub_model_layer(page)
+    page.add_init_script("""
+        const mk = window.__LELOG_TEST_WEBLLM__.CreateMLCEngine;
+        window.__LELOG_TEST_WEBLLM__.CreateMLCEngine = (id, opts) =>
+            mk(id, opts).then(engine => {
+                const inner = engine.chat.completions.create;
+                engine.chat.completions.create = (req) => req.stream
+                    ? Promise.reject(new Error('stream unsupported'))
+                    : inner(req);
+                return engine;
+            });
+    """)
+
+    boot(page, base_url)
+    capture(page, "no streaming here")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+    assert rec["title"] == "Dune", "the non-streaming fallback did not run"
+
+
+@test
+def test_diagnostics_gathers_the_whole_picture(page, base_url):
+    """One paste instead of one fact per round trip."""
+    stub_model_layer(page)
+
+    boot(page, base_url)
+    capture(page, "something to report on")
+    enrich(page)
+    wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+
+    open_sheet(page)
+    page.click("#diagBtn")
+    page.wait_for_selector("#diagOut:not([hidden])")
+    text = page.input_value("#diagOut")
+
+    for field in ["version", "webgpu", "gpu", "shader-f16", "model state",
+                  "settings", "entries", "last timing", "last error"]:
+        assert field in text, f"diagnostics omitted {field}"
+    assert "testgpu" in text, "the GPU is not named"
+    assert "yes" in text.split("shader-f16")[1][:10]
+
+
 @test
 def test_enrichment_shape_in_export(page, base_url):
     boot(page, base_url)

@@ -44,7 +44,7 @@ The enrichment questioner and the quiz questioner are **the same component** at 
 
 ## Testing
 
-86 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
+91 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
 
 ```bash
 python3 test/smoke.py            # all
@@ -57,6 +57,24 @@ Needs Playwright once: `pip install playwright && python3 -m playwright install 
 
 `file://` will not work — IndexedDB and service workers need a real origin.
 
+### Testing the model layer
+
+**Two seams, and the difference matters.** `window.__LELOG_TEST_EXTRACTOR__`
+replaces the extractor and is the quick way to drive a specific result.
+`window.__LELOG_TEST_WEBLLM__` replaces the WebLLM *module* instead, so
+engine creation, adapter and quantisation choice, streaming, and cache
+checks all actually run — see `FAKE_WEBLLM` and `stub_model_layer` in
+`test/smoke.py`.
+
+**Prefer the module seam for anything touching the model.** Every field
+failure in this feature came from code the extractor seam skips: a version
+that was never published, load progress wired to one trigger and not the
+other, the f16/f32 choice. 86 tests passed throughout while none of that
+code had ever executed outside a phone. If a change touches
+`getEnrichEngine`, `realWebLLMExtract`, `streamCompletion`, `modelCached` or
+`diagnoseModelLoad`, it needs a module-seam test, and that test must be seen
+to fail with the change reverted.
+
 ## Deployment
 
 `git push` → GitHub Pages redeploys from `main` in a minute or two → `https://yann-mathieu.github.io/lelog/`. All paths are relative so the `/lelog/` subdirectory works unchanged.
@@ -64,6 +82,37 @@ Needs Playwright once: `pip install playwright && python3 -m playwright install 
 **Bump `CACHE` in `sw.js` whenever `index.html` changes**, or the service worker keeps serving the old shell and clients never see the update.
 
 The repo is public because Pages will not serve a private repo on a free plan. `index.html` carries a `noindex` tag so the app stays out of search results. Nothing sensitive is in here: entries live in IndexedDB and the user's Dropbox, and the Dropbox app key in `index.html` is public by design under PKCE. Don't commit backup JSON.
+
+## Working on enrichment from here
+
+**The device is the thing you do not have.** No WebGPU, and the network here
+blocks `huggingface.co`, `cdn.jsdelivr.net` and `unpkg.com`. So the model
+never runs in this environment, and anything about *this GPU* or *this
+network* can only come from the phone. Everything else can and should be
+settled here first — most of the round trips in this feature's history were
+avoidable, not device-specific.
+
+**Verify external facts, never recall them.** `registry.npmjs.org` and
+`raw.githubusercontent.com` *are* reachable. A version pin of
+`@mlc-ai/web-llm@0.2.79` — a version that has never existed — cost two
+round trips and was one `curl` away from being caught. Before writing a
+package version, a model id, or an API shape: fetch it. `curl -sI` a model
+artifact to confirm it is really there.
+
+**Ask for the diagnostics blob, not one fact at a time.** Settings →
+Enrichment → *Copy diagnostics* returns version, GPU and adapter, whether
+`shader-f16` is really supported, which model resolved and whether it is
+cached, the settings in force, entry counts, last timing and last error. One
+paste answers what previously took several exchanges. If a report arrives
+without it, ask for that before theorising.
+
+**Look at UI before shipping it.** Drive the app with Playwright at a phone
+width (412×915) and screenshot the state being changed. A toast with no
+`max-width`, and per-type `details` that were extracted but rendered
+nowhere, both shipped because nobody looked.
+
+**Say which half is unverified.** When a change cannot be exercised here,
+state that plainly rather than implying it works.
 
 ## Working from a phone
 

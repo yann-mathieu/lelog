@@ -359,6 +359,8 @@
       Skip the strict output format — starts faster, output is checked anyway
     </label>
     <p id="enrichModelNote" hidden style="margin:-4px 0 10px;font-size:13px;color:var(--faint)"></p>
+    <button class="linkbtn" id="diagBtn" style="padding:8px 0;color:var(--muted)">Copy diagnostics</button>
+    <textarea id="diagOut" hidden readonly style="width:100%;height:150px;background:var(--bg);border:1px solid var(--border);border-radius:11px;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;padding:10px;margin-bottom:10px"></textarea>
     <div class="row">
       <button class="btn" id="enrichEnableBtn">Turn on</button>
       <button class="btn ghost" id="enrichDisableBtn" hidden>Turn off</button>
@@ -1465,7 +1467,14 @@
     }
   }
 
+  // The seam the tests occupy. It is deliberately here, at the module
+  // boundary, rather than higher up at getExtractor(): everything between
+  // this line and the model — engine creation, adapter and quantisation
+  // choice, streaming, cache checks — is the code that has actually broken
+  // in the field, and a seam above it leaves all of that unrun until it
+  // reaches a real phone.
   function loadWebLLM() {
+    if (window.__LELOG_TEST_WEBLLM__) return Promise.resolve(window.__LELOG_TEST_WEBLLM__);
     return import('https://esm.run/@mlc-ai/web-llm@0.2.78');
   }
 
@@ -1826,7 +1835,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v2-8';
+  var APP_VERSION = 'log-v2-9';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -2462,6 +2471,67 @@
     else localStorage.removeItem('enrichForceF32');
     enrichEngine = null;
     $('enrichError').hidden = true;
+  };
+
+  // Everything a session working on this app would otherwise have to extract
+  // from someone one question at a time, over one round trip each. If the
+  // model misbehaves on a device, this is the thing to paste.
+  function diagnostics() {
+    var live = all.filter(function (r) { return !r.deleted; });
+    var counts = { done: 0, pending: 0, failed: 0 };
+    var lastErr = '', lastMs = '';
+    live.forEach(function (r) {
+      var e = r.enrichment;
+      if (counts[e.status] !== undefined) counts[e.status]++;
+      if (e.status === 'failed' && e.error) lastErr = e.error;
+      if (e.status === 'done' && e.ms) {
+        lastMs = e.ms + 'ms total, ' + (e.msFirst || '?') + 'ms to first word';
+      }
+    });
+    var gpu = navigator.gpu ? 'present' : 'absent';
+    return Promise.resolve().then(function () {
+      return navigator.gpu ? navigator.gpu.requestAdapter() : null;
+    }).catch(function () { return null; }).then(function (adapter) {
+      return modelCached().then(function (cached) {
+        return [
+          'version      ' + APP_VERSION,
+          'ua           ' + navigator.userAgent,
+          'webgpu       ' + gpu + (adapter ? ', adapter ok' : ', no adapter'),
+          'gpu          ' + (adapter ? (describeAdapter(adapter) || 'unnamed') : '—'),
+          'shader-f16   ' + (adapter && adapter.features
+            ? (adapter.features.has('shader-f16') ? 'yes' : 'no') : '—'),
+          'model        ' + chosenModel().key + ' → ' + (enrichModelId || 'not resolved yet'),
+          'model state  ' + (loadedModelKey === chosenModel().key ? 'loaded in this session'
+            : cached === true ? 'downloaded, not loaded'
+            : cached === false ? 'not downloaded' : 'unknown'),
+          'settings     enrichment=' + (enrichmentEnabled() ? 'on' : 'off') +
+            ' forceF32=' + (localStorage.getItem('enrichForceF32') === '1') +
+            ' looseJSON=' + (localStorage.getItem('enrichLooseJSON') === '1'),
+          'entries      ' + live.length + ' (' + counts.done + ' enriched, ' +
+            counts.pending + ' raw, ' + counts.failed + ' failed)',
+          'last timing  ' + (lastMs || '—'),
+          'last error   ' + (lastErr || '—')
+        ].join('\n');
+      });
+    });
+  }
+
+  $('diagBtn').onclick = function () {
+    diagnostics().then(function (text) {
+      var out = $('diagOut');
+      out.value = text;
+      out.hidden = false;
+      // Clipboard access fails in plenty of ordinary situations, so the text
+      // is on screen and selectable either way rather than only copied.
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text)
+          .then(function () { toast('Diagnostics copied'); })
+          .catch(function () { out.select(); toast('Select and copy the text'); });
+      } else {
+        out.select();
+        toast('Select and copy the text');
+      }
+    });
   };
 
   $('enrichLooseJSON').onchange = function () {
