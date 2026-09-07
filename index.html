@@ -188,10 +188,14 @@
   .pill.off { background: rgba(224,122,122,.14); color: var(--danger); }
 
   .toast {
-    position: fixed; bottom: 26px; left: 50%; transform: translate(-50%, 90px);
+    position: fixed; bottom: calc(26px + env(safe-area-inset-bottom)); left: 50%;
+    transform: translate(-50%, 90px);
     background: var(--surface-2); border: 1px solid var(--border); color: var(--text);
     padding: 11px 20px; border-radius: 30px; font-size: 14px; z-index: 60;
     transition: transform .25s cubic-bezier(.2,.7,.3,1); box-shadow: 0 8px 30px rgba(0,0,0,.4);
+    /* Centred on left:50%, so without a width cap a long message runs off
+       both edges at once and reads as truncated on a phone. */
+    max-width: min(88vw, 420px); text-align: center; line-height: 1.45;
   }
   .toast.show { transform: translate(-50%, 0); }
 </style>
@@ -285,6 +289,7 @@
       <input type="checkbox" id="enrichForceF32">
       Use the 32-bit build — try this if loading fails on a driver that claims 16-bit support
     </label>
+    <p id="enrichModelNote" hidden style="margin:-4px 0 10px;font-size:13px;color:var(--faint)"></p>
     <div class="row">
       <button class="btn" id="enrichEnableBtn">Turn on</button>
       <button class="btn ghost" id="enrichDisableBtn" hidden>Turn off</button>
@@ -320,7 +325,7 @@
   </section>
 
   <section>
-    <p style="margin:0;color:var(--faint);font-size:12.5px">log-v2-0 — capture, search, export, Dropbox sync, on-device enrichment. No accounts. Entries are stored in the schema the full app expects, so nothing here needs migrating later.</p>
+    <p style="margin:0;color:var(--faint);font-size:12.5px">log-v2-1 — capture, search, export, Dropbox sync, on-device enrichment. No accounts. Entries are stored in the schema the full app expects, so nothing here needs migrating later.</p>
   </section>
 </div>
 
@@ -1171,6 +1176,7 @@
   var enrichModelId = null; // the concrete id last attempted, for error text
   var enrichAdapter = '';   // what the GPU calls itself, likewise
   var lastEnrichFailure = ''; // why the most recent extraction gave up
+  var loadedModelKey = null;  // which choice the live engine was actually built from
   var TYPES = ['book', 'person', 'place', 'restaurant', 'podcast', 'film', 'idea', 'conversation', 'note'];
   var DETAIL_HINTS = {
     book: ['author', 'genre', 'format'],
@@ -1307,6 +1313,9 @@
       return webllm.CreateMLCEngine(enrichModelId, {
         initProgressCallback: onProgress || function () {}
       });
+    }).then(function (engine) {
+      loadedModelKey = chosenModel().key;
+      return engine;
     }).catch(function (e) {
       // Never leave a rejected promise cached, or every later retry fails
       // instantly with the first attempt's error instead of trying again.
@@ -1926,6 +1935,13 @@
     }
     sel.value = chosenModel().key;
     $('enrichForceF32').checked = localStorage.getItem('enrichForceF32') === '1';
+    // Changing the model does not reload it there and then — the next
+    // extraction does, since that is when a big download is least surprising.
+    var swapPending = on && loadedModelKey && loadedModelKey !== chosenModel().key;
+    $('enrichModelNote').hidden = !swapPending;
+    if (swapPending) {
+      $('enrichModelNote').textContent = 'Downloads the next time enrichment runs.';
+    }
     $('enrichEnableBtn').hidden = on;
     $('enrichEnableBtn').disabled = !supported;
     $('enrichDisableBtn').hidden = !on;
@@ -2004,7 +2020,8 @@
     // actually uses the newly picked model rather than the cached one.
     enrichEngine = null;
     $('enrichError').hidden = true;
-    if (enrichmentEnabled()) toast('Model changed — turn enrichment off and on to load it');
+    refreshEnrichUI();
+    if (enrichmentEnabled()) toast('Model changed');
   };
 
   $('reenrichBtn').onclick = function () {
