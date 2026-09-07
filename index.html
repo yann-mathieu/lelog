@@ -148,6 +148,11 @@
     color: var(--faint); cursor: pointer; line-height: 0; border-radius: 8px;
   }
   .act-quick-enrich:active { background: var(--surface-2); color: var(--accent); }
+  .act-stop-enrich {
+    margin-left: auto; background: none; border: 1px solid var(--border);
+    color: var(--muted); font: inherit; font-size: 11.5px; cursor: pointer;
+    padding: 2px 9px; border-radius: 100px;
+  }
   .entry .meta .edit-hint { margin-left: 0; }
   .estate.working { color: var(--accent); }
   .estate.failed { color: var(--danger); }
@@ -454,6 +459,7 @@
     if (typeof e.needsReview !== 'boolean') e.needsReview = false;
     if (!('suggestion' in e)) e.suggestion = null;
     if (!('error' in e)) e.error = null;
+    if (!('ms' in e)) e.ms = null;
     return rec;
   }
 
@@ -1274,6 +1280,7 @@
 
   var enrichEngine = null; // the loaded WebLLM engine, created once and reused
   var webllmModule = null; // the imported module, kept for its prebuilt model list
+  var enrichEngineInstance = null; // the resolved engine, for interrupting a run
   var enrichQueue = [], enrichQueued = {}, enrichRunning = false;
   var enrichingId = null; // the record the model is working on this moment
 
@@ -1308,9 +1315,13 @@
     render();
     runExtraction(rec)
       .then(function (result) { return applyExtraction(rec, result); })
-      .catch(function (e) { return markEnrichmentFailed(rec, e); })
+      .catch(function (e) {
+        if (enrichCancel) return abandonEnrichment(rec);
+        return markEnrichmentFailed(rec, e);
+      })
       .then(function () {
-        enrichingId = null; enrichRunning = false; stopLive();
+        enrichingId = null; enrichRunning = false; enrichCancel = false;
+        enrichAbort = null; stopLive();
         render(); pumpEnrichQueue();
       });
   }
@@ -1359,24 +1370,38 @@
   }
 
   function runExtraction(rec) {
-    // Wrapped in Promise.resolve().then(...) so a test extractor (or a real
-    // model call) that throws synchronously still rejects the promise chain
-    // instead of escaping pumpEnrichQueue uncaught and wedging the queue.
-    return Promise.resolve().then(function () {
-      return getExtractor()(rec, buildContext(), reportProgress);
-    }).then(validateExtraction);
+    // Raced against a cancellation this function controls, so Stop always
+    // frees the app even when the model cannot be interrupted or is wedged
+    // somewhere that never settles. Asking the engine to stop is best effort
+    // on top of that, not the thing the UI depends on.
+    return new Promise(function (resolve, reject) {
+      enrichAbort = reject;
+      // Wrapped in Promise.resolve().then(...) so a test extractor (or a real
+      // model call) that throws synchronously still rejects the promise chain
+      // instead of escaping pumpEnrichQueue uncaught and wedging the queue.
+      Promise.resolve().then(function () {
+        return getExtractor()(rec, buildContext(), reportProgress);
+      }).then(validateExtraction).then(resolve, reject);
+    });
   }
 
   // What the model is doing, right now. A pass is a model download the first
   // time and then seconds of silent GPU work, so without this the only
   // honest thing the app could say was "enriching…" and hope.
-  var live = { phase: '', pct: 0, tokens: 0, partial: '', startedAt: 0 };
+  var live = { phase: '', pct: 0, tokens: 0, partial: '', startedAt: 0, firstTokenAt: 0 };
   var liveTimer = null;
+  var enrichCancel = false;
+  var enrichAbort = null; // rejects the in-flight pass when you press Stop
 
   function reportProgress(p) {
     if (p.phase) live.phase = p.phase;
     if (typeof p.pct === 'number') live.pct = p.pct;
-    if (typeof p.tokens === 'number') live.tokens = p.tokens;
+    if (typeof p.tokens === 'number') {
+      // The first token is the moment the model stops reading and starts
+      // answering, and it is the longest silence in the whole pass.
+      if (!live.tokens && p.tokens) live.firstTokenAt = Date.now();
+      live.tokens = p.tokens;
+    }
     if (typeof p.partial === 'string') live.partial = p.partial;
     paintLive();
   }
@@ -1401,9 +1426,22 @@
       return 'loading model ' + live.pct + '%' + (secs ? ' · ' + secs + 's' : '');
     }
     if (live.phase === 'running') {
-      return 'thinking · ' + secs + 's' + (live.tokens ? ' · ' + live.tokens + ' tokens' : '');
+      // Before the first token the model is reading the note, which on a
+      // phone is the longest quiet stretch — naming it is the difference
+      // between "slow" and "stuck".
+      if (!live.tokens) return 'reading your note · ' + secs + 's' + pace();
+      var gen = (Date.now() - live.firstTokenAt) / 1000;
+      var rate = gen > 0.5 ? ' · ' + (live.tokens / gen).toFixed(1) + '/s' : '';
+      return 'writing · ' + secs + 's · ' + live.tokens + ' tokens' + rate;
     }
-    return 'starting · ' + secs + 's';
+    return 'starting · ' + secs + 's' + pace();
+  }
+
+  // What this device did last time, so "is this normal?" has an answer that
+  // came from this phone rather than from a guess about phones in general.
+  function pace() {
+    var ms = +localStorage.getItem('enrichLastMs');
+    return ms ? ' · last took ' + Math.round(ms / 1000) + 's' : '';
   }
 
   // Painted straight into the DOM rather than through render(): this updates
@@ -1454,6 +1492,7 @@
       });
     }).then(function (engine) {
       loadedModelKey = chosenModel().key;
+      enrichEngineInstance = engine;
       return engine;
     }).catch(function (e) {
       // Never leave a rejected promise cached, or every later retry fails
@@ -1612,6 +1651,7 @@
       // Drained by hand rather than for-await: this file is plain ES5-style
       // promises throughout and a build step is not on the table.
       function pump() {
+        if (enrichCancel) return Promise.resolve(text);
         return it.next().then(function (step) {
           if (step.done) return text;
           var choice = step.value && step.value.choices && step.value.choices[0];
@@ -1647,8 +1687,9 @@
     rec.enrichment = {
       status: 'done', model: enrichModelId, at: now,
       confidence: result.confidence, needsReview: band === 'medium', suggestion: null,
-      error: null
+      error: null, ms: live.startedAt ? Date.now() - live.startedAt : null
     };
+    if (rec.enrichment.ms) localStorage.setItem('enrichLastMs', String(rec.enrichment.ms));
     if (band === 'low' || result.type === null) {
       rec.enrichment.suggestion = result.type === null ? null : result;
     } else {
@@ -1660,6 +1701,28 @@
     return put(rec).then(function () {
       render(); refreshStats(); refreshEnrichUI(); scheduleSync();
     });
+  }
+
+  // Stopping is a decision, not an error: the entry goes back to simply not
+  // being enriched, with nothing recorded against it.
+  function cancelEnrichment() {
+    if (!enrichingId) return;
+    enrichCancel = true;
+    enrichQueue.length = 0;
+    enrichQueued = {};
+    try {
+      if (enrichEngineInstance && enrichEngineInstance.interruptGenerate) {
+        enrichEngineInstance.interruptGenerate();
+      }
+    } catch (e) { console.warn('could not interrupt the model', e); }
+    if (enrichAbort) { enrichAbort(new Error('stopped')); enrichAbort = null; }
+    toast('Stopped');
+  }
+
+  function abandonEnrichment(rec) {
+    rec.enrichment.status = 'pending';
+    rec.enrichment.error = null;
+    return put(rec).then(function () { render(); });
   }
 
   function markEnrichmentFailed(rec, err) {
@@ -1705,7 +1768,7 @@
       raw: raw,
       capturedAt: now,
       captureSource: 'text',
-      enrichment: { status: 'pending', model: null, at: null, confidence: null, needsReview: false, suggestion: null, error: null },
+      enrichment: { status: 'pending', model: null, at: null, confidence: null, needsReview: false, suggestion: null, error: null, ms: null },
       type: null, title: null, occurredAt: null,
       tags: [], rating: null, details: {}, links: [],
       // Things you have told the extractor about this entry. Kept out of raw
@@ -1720,7 +1783,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v2-5';
+  var APP_VERSION = 'log-v2-6';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -1821,7 +1884,8 @@
       // Either half can be missing without the other being worth hiding.
       foot = [
         e.model ? esc(e.model) : '',
-        typeof e.confidence === 'number' ? Math.round(e.confidence * 100) + '% confident' : ''
+        typeof e.confidence === 'number' ? Math.round(e.confidence * 100) + '% confident' : '',
+        e.ms ? Math.round(e.ms / 1000) + 's' : ''
       ].filter(Boolean).join(' · ');
     } else if (e.status === 'failed') {
       foot = 'Could not enrich this entry' + (e.error ? ' — ' + esc(e.error) : '');
@@ -1839,7 +1903,9 @@
     }
 
     var stream = r.id === enrichingId
-      ? '<pre class="live-stream" id="liveStream" hidden></pre>' : '';
+      ? '<pre class="live-stream" id="liveStream" hidden></pre>' +
+        '<button class="linkbtn act-stop-enrich" style="padding:6px 0;color:var(--muted)">Stop</button>'
+      : '';
     if (!body && !sugg && !foot && !stream) return '';
     return '<div class="ereadout">' + body + sugg + stream +
       (foot ? '<div class="ereadout-foot' + (body || sugg ? '' : ' bare') + '"' +
@@ -1901,9 +1967,11 @@
           chips +
           '<div class="meta"><span>' + timeLabel(r.capturedAt) + '</span>' +
             enrichBadge(r) +
-            '<button class="act-quick-enrich" title="' +
-              (r.enrichment.status === 'done' ? 'Enrich again' : 'Enrich this entry') +
-              '" aria-label="Enrich this entry">' + SPARK_SVG + '</button>' +
+            (r.id === enrichingId
+              ? '<button class="act-stop-enrich" aria-label="Stop">Stop</button>'
+              : '<button class="act-quick-enrich" title="' +
+                  (r.enrichment.status === 'done' ? 'Enrich again' : 'Enrich this entry') +
+                  '" aria-label="Enrich this entry">' + SPARK_SVG + '</button>') +
             '<span class="edit-hint" aria-hidden="true">' + PENCIL_SVG + '</span></div></div>';
       }
     });
@@ -2172,6 +2240,7 @@
     }
     // Enrich straight from the list, without going through the editor —
     // triggering one entry is the main gesture now that nothing is automatic.
+    if (e.target.closest('.act-stop-enrich')) { cancelEnrichment(); return; }
     if (e.target.closest('.act-quick-enrich')) {
       var rec = all.find(function (r) { return r.id === id; });
       if (!rec) return;

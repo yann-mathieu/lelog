@@ -58,7 +58,7 @@ V2_KEYS = {
 OPTIONAL_KEYS = {"deletedAt"}
 
 # The enrichment sub-object's own keys, from newRecord() in index.html.
-ENRICHMENT_KEYS = {"status", "model", "at", "confidence", "needsReview", "suggestion", "error"}
+ENRICHMENT_KEYS = {"status", "model", "at", "confidence", "needsReview", "suggestion", "error", "ms"}
 
 
 # ---------- server ----------
@@ -203,7 +203,7 @@ def test_capture_writes_the_full_v2_schema(page, base_url):
     # Everything the model will later fill is present but empty, never absent.
     assert rec["enrichment"] == {
         "status": "pending", "model": None, "at": None, "confidence": None,
-        "needsReview": False, "suggestion": None, "error": None
+        "needsReview": False, "suggestion": None, "error": None, "ms": None
     }
     assert (rec["type"], rec["title"], rec["occurredAt"], rec["rating"]) == \
         (None, None, None, None)
@@ -2734,7 +2734,7 @@ def test_the_list_reports_model_load_and_token_progress(page, base_url):
     )
     # Then the generating phase, with a token count and elapsed time.
     page.wait_for_function(
-        "() => /thinking/.test(document.querySelector('.estate.working').textContent)"
+        "() => /writing/.test(document.querySelector('.estate.working').textContent)"
     )
     assert "7 tokens" in page.inner_text(".estate.working")
 
@@ -2742,6 +2742,62 @@ def test_the_list_reports_model_load_and_token_progress(page, base_url):
     page.click(".entry .raw")
     page.wait_for_selector("#liveStream:not([hidden])")
     assert '"type":"book"' in page.inner_text("#liveStream")
+
+
+@test
+def test_reading_and_writing_are_reported_separately(page, base_url):
+    """Before the first token the model is reading the prompt, which is the
+    longest silence in a pass. Calling both "thinking" hides that."""
+    stub_enrichment(page, """
+        (rec, ctx, report) => new Promise(resolve => {
+            report({ phase: 'running', tokens: 0 });
+            setTimeout(() => report({ phase: 'running', tokens: 5, partial: '{"a"' }), 400);
+        })
+    """)
+
+    boot(page, base_url)
+    capture(page, "two phases")
+    enrich(page)
+
+    page.wait_for_selector(".estate.working")
+    page.wait_for_function(
+        "() => /reading your note/.test(document.body.textContent)"
+    )
+    page.wait_for_function("() => /writing/.test(document.body.textContent)")
+
+
+@test
+def test_a_slow_pass_can_be_stopped(page, base_url):
+    """Stopping is a decision, not a failure: the entry goes back to simply
+    not being enriched, with nothing recorded against it."""
+    stub_enrichment(page, "(rec, ctx, report) => new Promise(() => {})")
+
+    boot(page, base_url)
+    capture(page, "this will take for ever")
+    enrich(page)
+    page.wait_for_selector(".act-stop-enrich")
+    page.click(".act-stop-enrich")
+
+    page.wait_for_function("() => !document.querySelector('.estate.working')")
+    rec = records(page)[0]
+    assert rec["enrichment"]["status"] == "pending", "stopping must not mark it failed"
+    assert rec["enrichment"]["error"] is None
+    assert page.locator(".estate.failed").count() == 0
+
+
+@test
+def test_a_finished_pass_records_how_long_it_took(page, base_url):
+    """So "is this normal?" can be answered from this device rather than a
+    guess about phones in general."""
+    stub_enrichment(page, extraction_js(type="book", confidence=0.9))
+
+    boot(page, base_url)
+    capture(page, "time me")
+    enrich(page)
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+
+    assert isinstance(rec["enrichment"]["ms"], int)
+    assert page.evaluate("() => localStorage.getItem('enrichLastMs')") is not None
 
 
 @test
