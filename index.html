@@ -131,6 +131,21 @@
   .chip.title { color: var(--text); font-weight: 500; }
   .chip.rating { color: var(--accent); letter-spacing: 1px; }
   .chip.review { color: var(--faint); padding: 2px 7px; }
+  .chip.hint {
+    color: var(--accent); border-color: var(--accent-dim);
+    display: inline-flex; align-items: center; gap: 5px; padding-right: 5px;
+  }
+  .chip.hint .act-hint-del {
+    background: none; border: none; color: var(--faint); cursor: pointer;
+    font-size: 15px; line-height: 1; padding: 0 3px;
+  }
+  .hint-row { display: flex; gap: 8px; margin-top: 10px; }
+  .hint-input {
+    flex: 1; min-width: 0; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 11px; color: var(--text); font: inherit; font-size: 14px;
+    padding: 10px 12px; outline: none;
+  }
+  .hint-input::placeholder { color: var(--faint); }
   .entry.editing { border-color: var(--accent-dim); background: var(--surface-2); }
   .entry textarea {
     width: 100%; background: var(--bg); border: 1px solid var(--border);
@@ -169,6 +184,15 @@
   }
   .sheet.open { transform: translateY(0); }
   .grabber { width: 36px; height: 4px; background: var(--border); border-radius: 2px; margin: 6px auto 16px; }
+  /* Which build you are actually running, where you can find it without
+     scrolling to the bottom — the first question whenever something is
+     behaving unexpectedly after a deploy. */
+  .version {
+    display: inline-block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px; color: var(--muted); background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 100px; padding: 3px 11px;
+    margin-bottom: 14px;
+  }
   .sheet-close {
     position: absolute; top: 14px; right: 14px;
     background: var(--surface-2); border: 1px solid var(--border); color: var(--muted);
@@ -241,13 +265,14 @@
 <div class="scrim" id="scrim"></div>
 <div class="sheet" id="sheet">
   <div class="grabber"></div>
+  <div class="version" id="appVersion"></div>
   <button class="sheet-close" id="closeSheetBtn" aria-label="Close">
     <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
   </button>
 
   <section>
     <h2>Your data</h2>
-    <p>Everything lives on this phone only. Nothing is uploaded anywhere. That also means <strong>this device is the only copy</strong> — export regularly until sync exists.</p>
+    <p>Entries live on this phone, and in your own Dropbox if you connect it. Sync copies a mistake to every device faithfully, so <strong>export is still the only thing that recovers from one</strong>.</p>
     <div class="row">
       <button class="btn" id="exportBtn">Export backup</button>
       <button class="btn ghost" id="importBtn">Import</button>
@@ -325,7 +350,7 @@
   </section>
 
   <section>
-    <p style="margin:0;color:var(--faint);font-size:12.5px">log-v2-1 — capture, search, export, Dropbox sync, on-device enrichment. No accounts. Entries are stored in the schema the full app expects, so nothing here needs migrating later.</p>
+    <p style="margin:0;color:var(--faint);font-size:12.5px">Capture, search, export, Dropbox sync, on-device enrichment. No accounts. Entries are stored in the schema the full app expects, so nothing here needs migrating later.</p>
   </section>
 </div>
 
@@ -382,12 +407,29 @@
     });
   }
 
+  // Invariant 2 says every record carries the whole v2 schema, which is only
+  // true if fields added after a record was written get filled in. Records
+  // predating a field arrive from three places — this device's own history,
+  // another device over Dropbox, and an imported backup — so both the read
+  // and the write path top them up rather than trusting the source.
+  function normalise(rec) {
+    if (!Array.isArray(rec.hints)) rec.hints = [];
+    var e = rec.enrichment;
+    if (!e) e = rec.enrichment = { status: 'pending', model: null, at: null, confidence: null };
+    if (typeof e.needsReview !== 'boolean') e.needsReview = false;
+    if (!('suggestion' in e)) e.suggestion = null;
+    return rec;
+  }
+
   function put(rec) {
+    normalise(rec);
     return idb(tx('readwrite').put(rec)).then(function () { return rec; });
   }
 
   function getAll() {
-    return idb(tx('readonly').getAll()).then(function (r) { return r || []; });
+    return idb(tx('readonly').getAll()).then(function (r) {
+      return (r || []).map(normalise);
+    });
   }
 
   function clearAll() {
@@ -1416,7 +1458,16 @@
       '(omit fields that do not apply, invent nothing outside it): ' +
       JSON.stringify(ctx.detailHints) + '. ' +
       'Give your own confidence (0 to 1) that the extraction is correct. ' +
+      hintText(rec) +
       'Note: "' + rec.raw + '"';
+  }
+
+  function hintText(rec) {
+    var hints = rec.hints || [];
+    if (!hints.length) return '';
+    return 'The person who wrote this note has asked you to do the following, and '
+      + 'these instructions take priority: '
+      + hints.map(function (h) { return '"' + h + '"'; }).join('; ') + '. ';
   }
 
   // The only function in this file that talks to the model. Every other
@@ -1511,12 +1562,19 @@
       enrichment: { status: 'pending', model: null, at: null, confidence: null, needsReview: false, suggestion: null },
       type: null, title: null, occurredAt: null,
       tags: [], rating: null, details: {}, links: [],
+      // Things you have told the extractor about this entry. Kept out of raw
+      // — your sentence stays your sentence — but fed into every extraction
+      // pass, so they survive re-enrichment and a change of model.
+      hints: [],
       userEdited: [], media: [],
       createdAt: now, updatedAt: now, deleted: false
     };
   }
 
   // ---------- state ----------
+  // Must match CACHE in sw.js — that is what actually decides which build a
+  // device is serving, and a test asserts the two agree so this can't drift.
+  var APP_VERSION = 'log-v2-2';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
 
@@ -1606,8 +1664,17 @@
         lastDay = k;
       }
       if (r.id === editingId) {
+        var hints = (r.hints || []).map(function (h, i) {
+          return '<span class="chip hint">' + esc(h) +
+            '<button class="act-hint-del" data-i="' + i + '" aria-label="Remove">×</button></span>';
+        }).join('');
         html += '<div class="entry editing" data-id="' + r.id + '">' +
           '<textarea class="edit-area">' + esc(r.raw) + '</textarea>' +
+          (hints ? '<div class="chips">' + hints + '</div>' : '') +
+          '<div class="hint-row">' +
+            '<input class="hint-input" placeholder="Tell the AI what to add or focus on…">' +
+            '<button class="btn act-enrich">Enrich</button>' +
+          '</div>' +
           '<div class="entry-actions">' +
             '<button class="btn act-save">Save</button>' +
             '<button class="btn ghost act-cancel">Cancel</button>' +
@@ -1661,6 +1728,38 @@
       toast('Could not save — storage may be full');
       console.error(e);
     });
+  }
+
+  // Enrich this one entry now, optionally with a new instruction. Saves any
+  // text change first so pressing Enrich can never quietly discard an edit
+  // sitting in the textarea.
+  function enrichNow(id, text, hint) {
+    var rec = all.find(function (r) { return r.id === id; });
+    if (!rec) return;
+    var t = text.trim(), h = hint.trim();
+    if (t) rec.raw = t;
+    if (h) {
+      rec.hints = (rec.hints || []).concat([h]);
+      // A new instruction is only worth anything if it is acted on, so this
+      // pass is not skipped even when the record was already enriched.
+    }
+    rec.enrichment.status = 'pending';
+    rec.updatedAt = new Date().toISOString();
+    put(rec).then(function () {
+      editingId = null;
+      render(); refreshStats(); scheduleSync();
+      if (!enrichmentEnabled()) { toast('Turn on enrichment in Settings'); return; }
+      enqueueEnrich(id);
+      toast('Enriching…');
+    });
+  }
+
+  function removeHint(id, i) {
+    var rec = all.find(function (r) { return r.id === id; });
+    if (!rec || !rec.hints || i < 0 || i >= rec.hints.length) return;
+    rec.hints.splice(i, 1);
+    rec.updatedAt = new Date().toISOString();
+    put(rec).then(function () { render(); scheduleSync(); });
   }
 
   function commitEdit(id, text) {
@@ -1844,6 +1943,15 @@
 
     if (e.target.closest('.act-save')) {
       commitEdit(id, entry.querySelector('.edit-area').value); return;
+    }
+    if (e.target.closest('.act-hint-del')) {
+      removeHint(id, +e.target.closest('.act-hint-del').getAttribute('data-i'));
+      return;
+    }
+    if (e.target.closest('.act-enrich')) {
+      enrichNow(id, entry.querySelector('.edit-area').value,
+                entry.querySelector('.hint-input').value);
+      return;
     }
     if (e.target.closest('.act-cancel')) { editingId = null; render(); return; }
     if (e.target.closest('.act-delete')) {
@@ -2081,6 +2189,7 @@
     return getAll();
   }).then(function (rows) {
     all = rows;
+    $('appVersion').textContent = APP_VERSION;
     render(); refreshStats(); checkPersistence(); maybeBanner();
     if (window.matchMedia('(min-width: 700px)').matches) input.focus();
     // A tab closed mid-queue loses nothing: enrichment.status on the record

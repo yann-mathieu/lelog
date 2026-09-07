@@ -25,6 +25,7 @@ import functools
 import hashlib
 import http.server
 import json
+import re
 import socket
 import socketserver
 import sys
@@ -50,7 +51,7 @@ ROOT = Path(__file__).resolve().parent.parent
 V2_KEYS = {
     "id", "schemaVersion", "raw", "capturedAt", "captureSource", "enrichment",
     "type", "title", "occurredAt", "tags", "rating", "details", "links",
-    "userEdited", "media", "createdAt", "updatedAt", "deleted",
+    "hints", "userEdited", "media", "createdAt", "updatedAt", "deleted",
 }
 
 # Only ever present on a tombstoned record.
@@ -2564,6 +2565,88 @@ def test_model_choice_persists(page, base_url):
     boot(page, base_url)
     open_sheet(page)
     assert page.input_value("#enrichModelSel") == "smol-360m"
+
+
+@test
+def test_version_is_visible_and_matches_the_service_worker(page, base_url):
+    """The build id decides what a device is actually running, so it is shown
+    at the top of Settings — and it is two constants in two files, which is
+    exactly the kind of pair that drifts silently."""
+    app = (ROOT / "index.html").read_text(encoding="utf-8")
+    sw = (ROOT / "sw.js").read_text(encoding="utf-8")
+    in_app = re.search(r"var APP_VERSION = '([^']+)'", app).group(1)
+    in_sw = re.search(r"var CACHE = '([^']+)'", sw).group(1)
+    assert in_app == in_sw, f"APP_VERSION {in_app} != sw.js CACHE {in_sw}"
+
+    boot(page, base_url)
+    open_sheet(page)
+    assert page.inner_text("#appVersion").strip() == in_app
+
+
+@test
+def test_a_hint_is_stored_and_reaches_the_extractor(page, base_url):
+    """Iterating on an entry: the instruction is kept on the record and fed
+    to every later pass, so it survives re-enrichment and a model change."""
+    stub_enrichment(page, """
+        (rec, ctx) => Promise.resolve({
+            type: 'restaurant', title: (rec.hints || []).join('|'),
+            occurredAt: null, tags: [], rating: null, details: {}, confidence: 0.9
+        })
+    """)
+
+    boot(page, base_url)
+    capture(page, "dinner out")
+    page.click(".entry .raw")
+    page.wait_for_selector(".edit-area")
+    page.fill(".hint-input", "mention the wine")
+    page.click(".act-enrich")
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+    assert rec["hints"] == ["mention the wine"]
+    # The extractor saw it, rather than it merely being stored.
+    assert rec["title"] == "mention the wine"
+    assert rec["raw"] == "dinner out", "a hint must never be folded into raw"
+
+
+@test
+def test_enrich_button_re_runs_a_single_entry(page, base_url):
+    stub_enrichment(page, extraction_js(type="book", title="First", confidence=0.9))
+
+    boot(page, base_url)
+    capture(page, "a book")
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+    assert rec["title"] == "First"
+
+    page.evaluate("""
+        () => { window.__LELOG_TEST_EXTRACTOR__ = (rec, ctx) => Promise.resolve({
+            type: 'book', title: 'Second', occurredAt: null, tags: [],
+            rating: null, details: {}, confidence: 0.9
+        }); }
+    """)
+    page.click(".entry .raw")
+    page.wait_for_selector(".edit-area")
+    page.click(".act-enrich")
+
+    rec = wait_for_record(page, lambda r: r["title"] == "Second")
+    assert rec is not None, "the per-entry Enrich button did not re-run extraction"
+
+
+@test
+def test_a_hint_can_be_removed(page, base_url):
+    boot(page, base_url)
+    capture(page, "something")
+    page.click(".entry .raw")
+    page.wait_for_selector(".edit-area")
+    page.fill(".hint-input", "focus on the food")
+    page.click(".act-enrich")
+    page.wait_for_function("() => !document.querySelector('.edit-area')")
+
+    page.click(".entry .raw")
+    page.wait_for_selector(".chip.hint")
+    page.click(".act-hint-del")
+    page.wait_for_function("() => !document.querySelector('.chip.hint')")
+
+    assert records(page)[0]["hints"] == []
 
 
 @test
