@@ -2801,6 +2801,27 @@ def test_a_finished_pass_records_how_long_it_took(page, base_url):
 
 
 @test
+def test_a_failed_entry_carries_the_diagnosis_not_just_the_error(page, base_url):
+    """A download failure names the hosts it could not reach. That ran only
+    from Settings, which is no longer how anyone starts a pass."""
+    stub_enrichment(page, """
+        (rec, ctx, report) => Promise.reject(new Error(
+            "Failed to execute 'add' on 'Cache': Cache.add() encountered a network error"))
+    """)
+
+    boot(page, base_url)
+    capture(page, "this fails while downloading")
+    enrich(page)
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "failed")
+
+    # The bare message alone is what sent this round-tripping for days.
+    assert "Cache.add()" in rec["enrichment"]["error"]
+    page.click(".entry .raw")
+    page.wait_for_selector(".ereadout")
+    assert "Could not enrich" in page.inner_text(".ereadout")
+
+
+@test
 def test_a_failed_entry_says_so_in_the_list(page, base_url):
     stub_enrichment(page, "(rec, ctx) => Promise.reject(new Error('boom'))")
 

@@ -370,6 +370,7 @@
     <div id="enrichStats" hidden>
       <div class="stat"><span>Enriched</span><b id="sEnriched">0</b></div>
       <div class="stat"><span>Not enriched</span><b id="sEnrichPending">0</b></div>
+      <div class="stat"><span>Model on this device</span><b id="sModelCached">—</b></div>
       <div class="stat"><span>Failed</span><b id="sEnrichFailed">0</b></div>
       <div class="stat"><span>Needs a glance</span><b id="sEnrichReview">0</b></div>
     </div>
@@ -1544,6 +1545,17 @@
     }).catch(function (e) { return errorText(e) || 'unreachable'; });
   }
 
+  // WebLLM knows whether the weights are already on disk; that decides
+  // whether a network failure was even relevant to this pass.
+  function modelCached() {
+    if (!webllmModule || !webllmModule.hasModelInCache || !enrichModelId) {
+      return Promise.resolve(null);
+    }
+    return Promise.resolve()
+      .then(function () { return webllmModule.hasModelInCache(enrichModelId); })
+      .catch(function () { return null; });
+  }
+
   function diagnoseModelLoad(err) {
     var msg = errorText(err);
     // A driver that refuses to compile the model's shaders has nothing to do
@@ -1562,15 +1574,23 @@
     if (!/cache|fetch|network|load model|failed to/i.test(msg)) return Promise.resolve('');
     var rec = modelRecord();
     if (!rec) return Promise.resolve('');
+    var cachedNote = '';
     var weights = String(rec.model).replace(/\/+$/, '') + '/resolve/main/mlc-chat-config.json';
     return Promise.all([probe(rec.model_lib), probe(weights)]).then(function (r) {
       var bad = [];
       if (r[0]) bad.push('the model library on ' + hostOf(rec.model_lib) + ' (' + r[0] + ')');
       if (r[1]) bad.push('the model weights on ' + hostOf(weights) + ' (' + r[1] + ')');
-      return bad.length
-        ? ' Could not reach ' + bad.join(', nor ') + '.'
-        : ' Both model hosts are reachable from here, so the download was most'
-          + ' likely interrupted or ran out of room.';
+      return modelCached().then(function (cached) {
+        cachedNote = cached === true
+          ? ' The model is already cached, so this was not a fresh download.'
+          : cached === false
+            ? ' The model is not cached yet, so this pass was downloading it.'
+            : '';
+        return bad.length
+          ? ' Could not reach ' + bad.join(', nor ') + '.' + cachedNote
+          : ' Both model hosts are reachable from here, so the download was most'
+            + ' likely interrupted or ran out of room.' + cachedNote;
+      });
     }).catch(function () { return ''; });
   }
 
@@ -1745,15 +1765,20 @@
 
   function markEnrichmentFailed(rec, err) {
     var now = new Date().toISOString();
-    rec.enrichment.status = 'failed';
-    rec.enrichment.at = now;
-    rec.updatedAt = now;
     console.error('enrichment failed for', rec.id, err);
-    // On the record, not in a variable: the reason has to survive a reload
-    // and belong to this entry rather than to whichever failed most recently.
-    rec.enrichment.error = errorText(err);
-    lastEnrichFailure = rec.enrichment.error;
-    return put(rec).then(function () { render(); refreshEnrichUI(); scheduleSync(); });
+    // The same diagnosis Settings does. It used to run only there, so a
+    // failure triggered from an entry — which is now the only way anyone
+    // triggers one — arrived as a bare message naming no host and no cause.
+    return diagnoseModelLoad(err).then(function (extra) {
+      rec.enrichment.status = 'failed';
+      rec.enrichment.at = now;
+      rec.updatedAt = now;
+      // On the record, not in a variable: the reason has to survive a reload
+      // and belong to this entry rather than to whichever failed most recently.
+      rec.enrichment.error = errorText(err) + (extra || '');
+      lastEnrichFailure = rec.enrichment.error;
+      return put(rec);
+    }).then(function () { render(); refreshEnrichUI(); scheduleSync(); });
   }
 
   // Test-only hook, alongside __LELOG_TEST_EXTRACTOR__ above. Not reachable
@@ -1801,7 +1826,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v2-7';
+  var APP_VERSION = 'log-v2-8';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -2382,6 +2407,13 @@
     $('sEnrichPending').textContent = pending;
     $('sEnrichFailed').textContent = failed;
     $('sEnrichReview').textContent = review;
+    // Whether the weights are on disk decides whether the next pass pays a
+    // download, which is the difference between seconds and many minutes.
+    $('sModelCached').textContent = loadedModelKey === chosenModel().key ? 'loaded' : 'checking…';
+    modelCached().then(function (cached) {
+      $('sModelCached').textContent = loadedModelKey === chosenModel().key ? 'loaded'
+        : cached === true ? 'downloaded' : cached === false ? 'not downloaded' : 'unknown';
+    });
     // A count of failures is not a reason for them; the model can load fine
     // and still fall over on every extraction, which would otherwise show up
     // only as a number that never becomes "enriched".
