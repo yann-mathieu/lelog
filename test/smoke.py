@@ -58,7 +58,7 @@ V2_KEYS = {
 OPTIONAL_KEYS = {"deletedAt"}
 
 # The enrichment sub-object's own keys, from newRecord() in index.html.
-ENRICHMENT_KEYS = {"status", "model", "at", "confidence", "needsReview", "suggestion"}
+ENRICHMENT_KEYS = {"status", "model", "at", "confidence", "needsReview", "suggestion", "error"}
 
 
 # ---------- server ----------
@@ -203,7 +203,7 @@ def test_capture_writes_the_full_v2_schema(page, base_url):
     # Everything the model will later fill is present but empty, never absent.
     assert rec["enrichment"] == {
         "status": "pending", "model": None, "at": None, "confidence": None,
-        "needsReview": False, "suggestion": None
+        "needsReview": False, "suggestion": None, "error": None
     }
     assert (rec["type"], rec["title"], rec["occurredAt"], rec["rating"]) == \
         (None, None, None, None)
@@ -2375,19 +2375,28 @@ def wait_for_record(page, pred, timeout=5000):
     return next((r for r in records(page) if pred(r)), None)
 
 
+def enrich(page, index=0):
+    """Ask for one entry to be enriched, the way a person now has to."""
+    page.locator(".act-quick-enrich").nth(index).click()
+
+
 @test
-def test_capture_does_not_wait_for_enrichment(page, base_url):
-    """Invariant 4: save is instant even when on-device extraction hangs."""
-    stub_enrichment(page, "() => new Promise(() => {})")
+def test_capture_never_enriches_on_its_own(page, base_url):
+    """Enrichment is asked for per entry. Capture must not start it, and an
+    entry staying raw for ever is a normal resting state, not a backlog."""
+    stub_enrichment(page, extraction_js(type="book", confidence=0.9))
 
     boot(page, base_url)
-
     start = time.time()
-    capture(page, "saved while enrichment hangs")
-    elapsed = time.time() - start
+    capture(page, "saved and left alone")
+    assert time.time() - start < 5
 
-    assert elapsed < 5, f"save blocked for {elapsed:.1f}s"
-    assert texts(page) == ["saved while enrichment hangs"]
+    page.wait_for_timeout(1200)
+    rec = records(page)[0]
+    assert rec["enrichment"]["status"] == "pending", "capture enriched by itself"
+    assert rec["type"] is None
+    # And it is not nagged about in the list.
+    assert page.locator(".estate").count() == 0
 
 
 @test
@@ -2399,6 +2408,7 @@ def test_enrichment_applies_high_confidence_silently(page, base_url):
 
     boot(page, base_url)
     capture(page, "finished klara and the sun")
+    enrich(page)
 
     rec = wait_for_record(page, lambda r: r["enrichment"]["status"] != "pending")
     assert rec["enrichment"]["status"] == "done"
@@ -2421,6 +2431,7 @@ def test_enrichment_flags_medium_confidence(page, base_url):
 
     boot(page, base_url)
     capture(page, "bo bun with marie")
+    enrich(page)
 
     rec = wait_for_record(page, lambda r: r["enrichment"]["status"] != "pending")
     assert rec["type"] == "restaurant"
@@ -2436,6 +2447,7 @@ def test_enrichment_does_not_apply_low_confidence(page, base_url):
 
     boot(page, base_url)
     capture(page, "half formed thought")
+    enrich(page)
 
     rec = wait_for_record(page, lambda r: r["enrichment"]["status"] != "pending")
     assert rec["type"] is None
@@ -2484,6 +2496,7 @@ def test_malformed_extraction_marks_failed(page, base_url):
 
     boot(page, base_url)
     capture(page, "this will not parse")
+    enrich(page)
 
     rec = wait_for_record(page, lambda r: r["enrichment"]["status"] != "pending")
     assert rec["enrichment"]["status"] == "failed"
@@ -2497,6 +2510,7 @@ def test_out_of_enum_type_degrades_to_null(page, base_url):
 
     boot(page, base_url)
     capture(page, "an odd guess")
+    enrich(page)
 
     rec = wait_for_record(page, lambda r: r["enrichment"]["status"] != "pending")
     assert rec["enrichment"]["status"] == "done", "an unrecognised type must not fail the record"
@@ -2510,22 +2524,25 @@ def test_raw_is_never_modified_by_enrichment(page, base_url):
 
     boot(page, base_url)
     capture(page, "the original words")
+    enrich(page)
 
     rec = wait_for_record(page, lambda r: r["enrichment"]["status"] != "pending")
     assert rec["raw"] == "the original words"
 
 
 @test
-def test_reload_recovers_pending_queue(page, base_url):
+def test_reload_does_not_sweep_unenriched_entries(page, base_url):
+    """Launching the app must not quietly start work on everything raw."""
     boot(page, base_url)
-    capture(page, "captured before ai was on")
+    capture(page, "captured and left raw")
     assert records(page)[0]["enrichment"]["status"] == "pending"
 
     stub_enrichment(page, extraction_js(type="idea", confidence=0.9))
     boot(page, base_url)
+    page.wait_for_timeout(1200)
 
-    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] != "pending")
-    assert rec["type"] == "idea", "a pending record was not picked up after reload"
+    assert records(page)[0]["enrichment"]["status"] == "pending", \
+        "launching the app enriched a backlog on its own"
 
 
 @test
@@ -2614,6 +2631,7 @@ def test_enrich_button_re_runs_a_single_entry(page, base_url):
 
     boot(page, base_url)
     capture(page, "a book")
+    enrich(page)
     rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
     assert rec["title"] == "First"
 
@@ -2660,6 +2678,7 @@ def test_details_are_readable_on_the_entry(page, base_url):
 
     boot(page, base_url)
     capture(page, "finished klara")
+    enrich(page)
     wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
 
     page.click(".entry .raw")
@@ -2681,6 +2700,7 @@ def test_the_list_says_when_an_entry_is_waiting(page, base_url):
 
     boot(page, base_url)
     capture(page, "waiting on the model")
+    enrich(page)
 
     page.wait_for_selector(".estate.working")
     assert "enriching" in page.inner_text(".estate.working")
@@ -2692,6 +2712,7 @@ def test_a_failed_entry_says_so_in_the_list(page, base_url):
 
     boot(page, base_url)
     capture(page, "this will fail")
+    enrich(page)
     wait_for_record(page, lambda r: r["enrichment"]["status"] == "failed")
 
     page.wait_for_selector(".estate.failed")

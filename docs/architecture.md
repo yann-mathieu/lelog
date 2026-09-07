@@ -6,6 +6,8 @@
 
 **Corrections of 2 September 2026.** Phases 0 and 1 are built and in daily use. Where this document and the code disagree, the code is right and the disagreement is marked inline. Three sections were materially wrong: §5.1–5.3 (folder name, merge strategy), §7 (tech stack), §10 (the name). Everything else stands.
 
+**Correction of 7 September 2026.** §2.5's pipeline has capture queue enrichment automatically. It does not: enrichment is triggered per entry, by hand, and most entries are expected to stay raw. The reasoning is the same one §2.6 applies to questions — an app that goes off and does expensive work you did not ask for is one you stop trusting — and it matters more here than there, because each pass is seconds of GPU on a phone. Steps 2 and 3 of §2.5 are therefore user-initiated; everything after them is unchanged. §3.4's re-enrichment is the Settings-wide action, and per-entry instructions (`hints`) are replayed on every pass so a re-run after a model upgrade keeps them.
+
 **Corrections of 4 September 2026.** Phase 2's first slice shipped: on-device extraction (§3.1) and richer per-type `details`, using WebLLM/WebGPU (§6.3(b)) rather than the cloud API §7 originally named — chosen for privacy from the outset, not as a phase 5 fallback. Confidence handling (§3.2) is built as described, except the "review queue" is a passive per-entry marker for now, not an interactive screen — that's still §2.6/§8.2's question queue, not yet built. `links` and entity resolution (§3.3) are untouched; no type proposals (§4) yet either.
 
 **Changes since v4.0:** added §1.1 — this is a log, not a diary or a notes app, and the design consequences that follow (no streaks, no calendar view, no daily prompt).

@@ -10,7 +10,9 @@ Unscheduled ideas live in **`docs/ideas.md`** — things worth building, not yet
 
 **Phases 0 and 1 shipped, in daily use since August 2026.** One text box, list, search, edit, soft delete, export/import, and Dropbox sync. Installable PWA, works offline.
 
-**Phase 2's first slice shipped 4 September 2026:** on-device extraction (WebLLM/WebGPU, opt-in from Settings), filling type, title, tags, rating and per-type `details`. Nothing leaves the phone — no cloud API. High/medium-confidence extractions apply automatically (medium gets a quiet review marker); low-confidence guesses sit unapplied in `enrichment.suggestion`. No entity resolution, no interactive review queue yet — see the roadmap.
+**Phase 2's first slice shipped 4 September 2026:** on-device extraction (WebLLM/WebGPU, opt-in from Settings), filling type, title, tags, rating and per-type `details`. Nothing leaves the phone — no cloud API. High/medium-confidence extractions apply (medium gets a quiet review marker); low-confidence guesses sit unapplied in `enrichment.suggestion`. No entity resolution, no interactive review queue yet — see the roadmap.
+
+**Enrichment is manual, per entry, by deliberate choice (7 September 2026).** Capture does not enqueue it and launching does not sweep a backlog: you enrich an entry from its row when you want it, or everything at once from Settings. This departs from §2.5 of the architecture doc, which has capture queue enrichment automatically. Entries staying raw for ever is a normal outcome, so `enrichment.status: 'pending'` means "never asked for", not "queued", and the UI reports it quietly rather than as work outstanding. Instructions to the extractor live in `hints` on the record and are replayed on every later pass.
 
 Sync is done: OAuth 2 with PKCE, one JSON file per record under `memories/{year}/`, cursor-based delta pull, `WriteMode.update(rev)` on push, record-level last-write-wins merge, and automatic syncing on change and on launch. §5 of the architecture doc describes the design; §5.3 records where the implementation deliberately departs from the original plan.
 

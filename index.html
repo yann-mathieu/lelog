@@ -140,6 +140,15 @@
     font-size: 15px; line-height: 1; padding: 0 3px;
   }
   .estate { color: var(--faint); font-size: 11.5px; }
+  /* Sits to the right of the timestamp, before the edit hint. Quiet until
+     touched, because most rows will never be enriched and it should not
+     read as an unfinished task. */
+  .act-quick-enrich {
+    margin-left: auto; background: none; border: none; padding: 4px;
+    color: var(--faint); cursor: pointer; line-height: 0; border-radius: 8px;
+  }
+  .act-quick-enrich:active { background: var(--surface-2); color: var(--accent); }
+  .entry .meta .edit-hint { margin-left: 0; }
   .estate.working { color: var(--accent); }
   .estate.failed { color: var(--danger); }
   .ereadout {
@@ -150,6 +159,8 @@
   .ereadout-row span { color: var(--faint); }
   .ereadout-row b { font-weight: 500; text-align: right; word-break: break-word; }
   .ereadout-row.suggestion b { color: var(--muted); font-style: italic; }
+  /* The rule only earns its place when there is something above it. */
+  .ereadout-foot.bare { margin-top: 0; padding-top: 0; border-top: none; }
   .ereadout-foot {
     margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--border);
     color: var(--faint); font-size: 12px; word-break: break-word;
@@ -323,7 +334,7 @@
 
   <section>
     <h2>Enrichment</h2>
-    <p id="enrichNote">On-device AI fills in type, title, tags and details after you save. Nothing leaves your phone.</p>
+    <p id="enrichNote">On-device AI fills in type, title, tags and details. Nothing runs on its own and nothing leaves your phone — enrich an entry from its row when you want it.</p>
     <select id="enrichModelSel" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);font:inherit;font-size:14px;padding:10px 12px;border-radius:11px;outline:none;margin-bottom:10px"></select>
     <label style="display:flex;gap:9px;align-items:center;font-size:13.5px;color:var(--muted);margin-bottom:10px">
       <input type="checkbox" id="enrichForceF32">
@@ -340,7 +351,7 @@
     <p id="enrichError" hidden style="color:var(--danger);word-break:break-word"></p>
     <div id="enrichStats" hidden>
       <div class="stat"><span>Enriched</span><b id="sEnriched">0</b></div>
-      <div class="stat"><span>Waiting</span><b id="sEnrichPending">0</b></div>
+      <div class="stat"><span>Not enriched</span><b id="sEnrichPending">0</b></div>
       <div class="stat"><span>Failed</span><b id="sEnrichFailed">0</b></div>
       <div class="stat"><span>Needs a glance</span><b id="sEnrichReview">0</b></div>
     </div>
@@ -433,6 +444,7 @@
     if (!e) e = rec.enrichment = { status: 'pending', model: null, at: null, confidence: null };
     if (typeof e.needsReview !== 'boolean') e.needsReview = false;
     if (!('suggestion' in e)) e.suggestion = null;
+    if (!('error' in e)) e.error = null;
     return rec;
   }
 
@@ -1209,8 +1221,11 @@
   // On-device extraction only — nothing here ever leaves the phone. A model
   // call is seconds-long and GPU/CPU-bound, so unlike sync's pooled network
   // requests this runs strictly one record at a time (enrichRunning).
-  // Capture never waits on any of this: save() only ever calls enqueueEnrich()
-  // fire-and-forget, exactly like it does with scheduleSync().
+  // Nothing here is automatic. Capture does not enqueue, launching does not
+  // sweep a backlog: an entry is enriched because you asked for that entry to
+  // be enriched. Most entries staying raw for ever is a normal outcome, not a
+  // queue that fell behind, which is why "not enriched" is reported quietly
+  // and never as something needing attention.
   // Which model to run is a device question, not a taste question: a phone
   // GPU driver that refuses to compile a 1.5B model's shaders will often
   // compile a smaller one, and there is no way to know from here which. So
@@ -1268,11 +1283,6 @@
     enrichQueued[id] = true;
     enrichQueue.push(id);
     pumpEnrichQueue();
-  }
-
-  function enqueuePending() {
-    all.filter(function (r) { return !r.deleted && r.enrichment.status === 'pending'; })
-       .forEach(function (r) { enqueueEnrich(r.id); });
   }
 
   function pumpEnrichQueue() {
@@ -1526,7 +1536,8 @@
     var now = new Date().toISOString();
     rec.enrichment = {
       status: 'done', model: enrichModelId, at: now,
-      confidence: result.confidence, needsReview: band === 'medium', suggestion: null
+      confidence: result.confidence, needsReview: band === 'medium', suggestion: null,
+      error: null
     };
     if (band === 'low' || result.type === null) {
       rec.enrichment.suggestion = result.type === null ? null : result;
@@ -1547,7 +1558,10 @@
     rec.enrichment.at = now;
     rec.updatedAt = now;
     console.error('enrichment failed for', rec.id, err);
-    lastEnrichFailure = errorText(err);
+    // On the record, not in a variable: the reason has to survive a reload
+    // and belong to this entry rather than to whichever failed most recently.
+    rec.enrichment.error = errorText(err);
+    lastEnrichFailure = rec.enrichment.error;
     return put(rec).then(function () { render(); refreshEnrichUI(); scheduleSync(); });
   }
 
@@ -1581,7 +1595,7 @@
       raw: raw,
       capturedAt: now,
       captureSource: 'text',
-      enrichment: { status: 'pending', model: null, at: null, confidence: null, needsReview: false, suggestion: null },
+      enrichment: { status: 'pending', model: null, at: null, confidence: null, needsReview: false, suggestion: null, error: null },
       type: null, title: null, occurredAt: null,
       tags: [], rating: null, details: {}, links: [],
       // Things you have told the extractor about this entry. Kept out of raw
@@ -1596,9 +1610,10 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v2-3';
+  var APP_VERSION = 'log-v2-4';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
+  var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
 
   var $ = function (id) { return document.getElementById(id); };
   var input = $('input'), saveBtn = $('saveBtn'), listEl = $('list'),
@@ -1665,15 +1680,14 @@
     return live.sort(function (a, b) { return b.capturedAt.localeCompare(a.capturedAt); });
   }
 
-  // What the list says about an entry's enrichment state. Silent when there
-  // is nothing to say — an enriched entry shows its chips, not a tick.
+  // What the list says about an entry's enrichment state. Never enriched is
+  // the resting state now that nothing runs on its own, so it says nothing at
+  // all — only work in flight and outright failure are worth a word.
   function enrichBadge(r) {
     if (r.id === enrichingId) return '<span class="estate working">enriching…</span>';
+    if (enrichQueued[r.id]) return '<span class="estate">queued</span>';
     if (r.enrichment.status === 'failed') {
-      return '<span class="estate failed" title="Tap the entry, then Enrich, to try again">could not enrich</span>';
-    }
-    if (r.enrichment.status === 'pending' && enrichmentEnabled()) {
-      return '<span class="estate">queued</span>';
+      return '<span class="estate failed">could not enrich · tap to see why</span>';
     }
     return '';
   }
@@ -1700,7 +1714,7 @@
         typeof e.confidence === 'number' ? Math.round(e.confidence * 100) + '% confident' : ''
       ].filter(Boolean).join(' · ');
     } else if (e.status === 'failed') {
-      foot = 'Could not enrich this entry' + (lastEnrichFailure ? ' — ' + esc(lastEnrichFailure) : '');
+      foot = 'Could not enrich this entry' + (e.error ? ' — ' + esc(e.error) : '');
     } else if (r.id === enrichingId) {
       foot = 'Enriching now…';
     } else if (e.status === 'pending') {
@@ -1716,7 +1730,8 @@
 
     if (!body && !sugg && !foot) return '';
     return '<div class="ereadout">' + body + sugg +
-      (foot ? '<div class="ereadout-foot">' + foot + '</div>' : '') + '</div>';
+      (foot ? '<div class="ereadout-foot' + (body || sugg ? '' : ' bare') + '">'
+        + foot + '</div>' : '') + '</div>';
   }
 
   function render() {
@@ -1774,6 +1789,9 @@
           chips +
           '<div class="meta"><span>' + timeLabel(r.capturedAt) + '</span>' +
             enrichBadge(r) +
+            '<button class="act-quick-enrich" title="' +
+              (r.enrichment.status === 'done' ? 'Enrich again' : 'Enrich this entry') +
+              '" aria-label="Enrich this entry">' + SPARK_SVG + '</button>' +
             '<span class="edit-hint" aria-hidden="true">' + PENCIL_SVG + '</span></div></div>';
       }
     });
@@ -1806,7 +1824,6 @@
       toast('Saved');
       input.focus();
       scheduleSync();
-      enqueueEnrich(rec.id);
     }).catch(function (e) {
       toast('Could not save — storage may be full');
       console.error(e);
@@ -2041,6 +2058,16 @@
       if (confirm('Delete this entry?')) removeEntry(id);
       return;
     }
+    // Enrich straight from the list, without going through the editor —
+    // triggering one entry is the main gesture now that nothing is automatic.
+    if (e.target.closest('.act-quick-enrich')) {
+      var rec = all.find(function (r) { return r.id === id; });
+      if (!rec) return;
+      if (!enrichmentEnabled()) { toast('Turn on enrichment in Settings'); return; }
+      rec.enrichment.status = 'pending';
+      put(rec).then(function () { enqueueEnrich(id); render(); });
+      return;
+    }
     if (entry.classList.contains('editing')) return;
     editingId = id;
     render();
@@ -2140,7 +2167,7 @@
     $('reenrichBtn').hidden = !on;
     $('enrichNote').textContent = !supported
       ? "Your browser doesn't support on-device AI yet — entries still save and sync normally."
-      : 'On-device AI fills in type, title, tags and details after you save. Nothing leaves your phone.';
+      : 'On-device AI fills in type, title, tags and details. Nothing runs on its own and nothing leaves your phone — enrich an entry from its row when you want it.';
     if (!on) return;
     var enriched = 0, pending = 0, failed = 0, review = 0;
     all.forEach(function (r) {
@@ -2174,7 +2201,6 @@
     }).then(function () {
       $('enrichProgress').hidden = true;
       refreshEnrichUI();
-      enqueuePending();
       toast('On-device AI is ready');
     }).catch(function (e) {
       console.error(e);
@@ -2275,9 +2301,6 @@
     $('appVersion').textContent = APP_VERSION;
     render(); refreshStats(); checkPersistence(); maybeBanner();
     if (window.matchMedia('(min-width: 700px)').matches) input.focus();
-    // A tab closed mid-queue loses nothing: enrichment.status on the record
-    // itself is the queue, so every still-pending record just gets re-enqueued.
-    enqueuePending();
     // Auth work happens after the first render: capture must never wait on it.
     // Kept off the boot chain's catch as well, so a Dropbox problem can never
     // present itself as "storage unavailable" and hide the entries.
