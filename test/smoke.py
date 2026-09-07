@@ -58,7 +58,7 @@ V2_KEYS = {
 OPTIONAL_KEYS = {"deletedAt"}
 
 # The enrichment sub-object's own keys, from newRecord() in index.html.
-ENRICHMENT_KEYS = {"status", "model", "at", "confidence", "needsReview", "suggestion", "error", "ms"}
+ENRICHMENT_KEYS = {"status", "model", "at", "confidence", "needsReview", "suggestion", "error", "ms", "msFirst"}
 
 
 # ---------- server ----------
@@ -203,7 +203,7 @@ def test_capture_writes_the_full_v2_schema(page, base_url):
     # Everything the model will later fill is present but empty, never absent.
     assert rec["enrichment"] == {
         "status": "pending", "model": None, "at": None, "confidence": None,
-        "needsReview": False, "suggestion": None, "error": None, "ms": None
+        "needsReview": False, "suggestion": None, "error": None, "ms": None, "msFirst": None
     }
     assert (rec["type"], rec["title"], rec["occurredAt"], rec["rating"]) == \
         (None, None, None, None)

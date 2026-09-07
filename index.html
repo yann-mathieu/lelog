@@ -354,6 +354,10 @@
       <input type="checkbox" id="enrichForceF32">
       Use the 32-bit build — try this if loading fails on a driver that claims 16-bit support
     </label>
+    <label style="display:flex;gap:9px;align-items:center;font-size:13.5px;color:var(--muted);margin-bottom:10px">
+      <input type="checkbox" id="enrichLooseJSON">
+      Skip the strict output format — starts faster, output is checked anyway
+    </label>
     <p id="enrichModelNote" hidden style="margin:-4px 0 10px;font-size:13px;color:var(--faint)"></p>
     <div class="row">
       <button class="btn" id="enrichEnableBtn">Turn on</button>
@@ -460,6 +464,7 @@
     if (!('suggestion' in e)) e.suggestion = null;
     if (!('error' in e)) e.error = null;
     if (!('ms' in e)) e.ms = null;
+    if (!('msFirst' in e)) e.msFirst = null;
     return rec;
   }
 
@@ -1333,7 +1338,7 @@
         if (!seen[t]) { seen[t] = true; out.push(t); }
       });
     });
-    return out.slice(0, 200);
+    return out.slice(0, 40);
   }
 
   function buildContext() {
@@ -1585,25 +1590,29 @@
     });
   }
 
+  // Every character here is prefilled on the GPU before the model says
+  // anything, so this is the largest thing standing between pressing enrich
+  // and seeing a first token. It used to run to ~800 characters of scaffolding
+  // around a one-line note — the guide for all nine types, spelled out as
+  // JSON, whichever type the note turned out to be.
   function buildPrompt(rec, ctx) {
-    return 'You extract structure from a short personal note. Pick one type from this ' +
-      'closed list or null if none fit: ' + ctx.types.join(', ') + '. ' +
-      'Reuse existing tags where they fit instead of inventing near-duplicates: ' +
-      ctx.tags.join(', ') + '. ' +
-      'For the chosen type, only fill relevant fields in "details" from this guide ' +
-      '(omit fields that do not apply, invent nothing outside it): ' +
-      JSON.stringify(ctx.detailHints) + '. ' +
-      'Give your own confidence (0 to 1) that the extraction is correct. ' +
-      hintText(rec) +
-      'Note: "' + rec.raw + '"';
+    var p = 'Extract JSON from a note.\ntype: one of ' + ctx.types.join('|') + ' or null.\n';
+    if (ctx.tags.length) p += 'tags: prefer existing ones — ' + ctx.tags.join(', ') + '.\n';
+    p += 'details: keys for the type you pick — ' + compactHints(ctx.detailHints) + '.\n'
+      + 'confidence: 0-1, how sure you are.\n' + hintText(rec)
+      + 'Note: "' + rec.raw + '"';
+    return p;
+  }
+
+  function compactHints(hints) {
+    return Object.keys(hints).filter(function (k) { return hints[k].length; })
+      .map(function (k) { return k + ' ' + hints[k].join('/'); }).join('; ');
   }
 
   function hintText(rec) {
     var hints = rec.hints || [];
     if (!hints.length) return '';
-    return 'The person who wrote this note has asked you to do the following, and '
-      + 'these instructions take priority: '
-      + hints.map(function (h) { return '"' + h + '"'; }).join('; ') + '. ';
+    return 'Follow these first: ' + hints.join('; ') + '.\n';
   }
 
   // The only function in this file that talks to the model. Every other
@@ -1620,9 +1629,17 @@
       report({ phase: 'loading', pct: Math.round((p.progress || 0) * 100) });
     }).then(function (engine) {
       report({ phase: 'running', tokens: 0, partial: '' });
+      // A strict schema is compiled into a decoding grammar before the model
+      // emits anything, which is part of what the wait before the first token
+      // is made of. validateExtraction sanitises the output either way, so
+      // dropping the schema costs robustness the app already provides twice.
+      var strict = localStorage.getItem('enrichLooseJSON') !== '1';
       var req = {
         messages: [{ role: 'user', content: buildPrompt(rec, ctx) }],
-        response_format: { type: 'json_object', schema: extractionSchema() }
+        response_format: strict
+          ? { type: 'json_object', schema: extractionSchema() }
+          : { type: 'json_object' },
+        max_tokens: 220
       };
       return streamCompletion(engine, req, report).then(null, function (e) {
         // Only fall back when streaming never produced anything — a failure
@@ -1687,7 +1704,8 @@
     rec.enrichment = {
       status: 'done', model: enrichModelId, at: now,
       confidence: result.confidence, needsReview: band === 'medium', suggestion: null,
-      error: null, ms: live.startedAt ? Date.now() - live.startedAt : null
+      error: null, ms: live.startedAt ? Date.now() - live.startedAt : null,
+      msFirst: (live.startedAt && live.firstTokenAt) ? live.firstTokenAt - live.startedAt : null
     };
     if (rec.enrichment.ms) localStorage.setItem('enrichLastMs', String(rec.enrichment.ms));
     if (band === 'low' || result.type === null) {
@@ -1768,7 +1786,7 @@
       raw: raw,
       capturedAt: now,
       captureSource: 'text',
-      enrichment: { status: 'pending', model: null, at: null, confidence: null, needsReview: false, suggestion: null, error: null, ms: null },
+      enrichment: { status: 'pending', model: null, at: null, confidence: null, needsReview: false, suggestion: null, error: null, ms: null, msFirst: null },
       type: null, title: null, occurredAt: null,
       tags: [], rating: null, details: {}, links: [],
       // Things you have told the extractor about this entry. Kept out of raw
@@ -1783,7 +1801,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v2-6';
+  var APP_VERSION = 'log-v2-7';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -1885,7 +1903,8 @@
       foot = [
         e.model ? esc(e.model) : '',
         typeof e.confidence === 'number' ? Math.round(e.confidence * 100) + '% confident' : '',
-        e.ms ? Math.round(e.ms / 1000) + 's' : ''
+        e.ms ? Math.round(e.ms / 1000) + 's' : '',
+        e.msFirst ? Math.round(e.msFirst / 1000) + 's before first word' : ''
       ].filter(Boolean).join(' · ');
     } else if (e.status === 'failed') {
       foot = 'Could not enrich this entry' + (e.error ? ' — ' + esc(e.error) : '');
@@ -2334,6 +2353,7 @@
     }
     sel.value = chosenModel().key;
     $('enrichForceF32').checked = localStorage.getItem('enrichForceF32') === '1';
+    $('enrichLooseJSON').checked = localStorage.getItem('enrichLooseJSON') === '1';
     // Changing the model does not reload it there and then — the next
     // extraction does, since that is when a big download is least surprising.
     var swapPending = on && loadedModelKey && loadedModelKey !== chosenModel().key;
@@ -2410,6 +2430,11 @@
     else localStorage.removeItem('enrichForceF32');
     enrichEngine = null;
     $('enrichError').hidden = true;
+  };
+
+  $('enrichLooseJSON').onchange = function () {
+    if (this.checked) localStorage.setItem('enrichLooseJSON', '1');
+    else localStorage.removeItem('enrichLooseJSON');
   };
 
   $('enrichModelSel').onchange = function () {
