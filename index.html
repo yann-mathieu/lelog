@@ -139,6 +139,21 @@
     background: none; border: none; color: var(--faint); cursor: pointer;
     font-size: 15px; line-height: 1; padding: 0 3px;
   }
+  .estate { color: var(--faint); font-size: 11.5px; }
+  .estate.working { color: var(--accent); }
+  .estate.failed { color: var(--danger); }
+  .ereadout {
+    margin-top: 10px; padding: 10px 12px; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 11px; font-size: 13px;
+  }
+  .ereadout-row { display: flex; justify-content: space-between; gap: 12px; padding: 2px 0; }
+  .ereadout-row span { color: var(--faint); }
+  .ereadout-row b { font-weight: 500; text-align: right; word-break: break-word; }
+  .ereadout-row.suggestion b { color: var(--muted); font-style: italic; }
+  .ereadout-foot {
+    margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--border);
+    color: var(--faint); font-size: 12px; word-break: break-word;
+  }
   .hint-row { display: flex; gap: 8px; margin-top: 10px; }
   .hint-input {
     flex: 1; min-width: 0; background: var(--bg); border: 1px solid var(--border);
@@ -1236,6 +1251,7 @@
   var enrichEngine = null; // the loaded WebLLM engine, created once and reused
   var webllmModule = null; // the imported module, kept for its prebuilt model list
   var enrichQueue = [], enrichQueued = {}, enrichRunning = false;
+  var enrichingId = null; // the record the model is working on this moment
 
   function enrichmentEnabled() {
     return localStorage.getItem('enrichmentEnabled') === '1';
@@ -1266,10 +1282,16 @@
     delete enrichQueued[id];
     var rec = all.find(function (r) { return r.id === id; });
     if (!rec || rec.deleted) { enrichRunning = false; return pumpEnrichQueue(); }
+    // Which record is actually being worked on right now, so the list can
+    // say so — a model call takes seconds and otherwise looks like nothing.
+    enrichingId = id;
+    render();
     runExtraction(rec)
       .then(function (result) { return applyExtraction(rec, result); })
       .catch(function (e) { return markEnrichmentFailed(rec, e); })
-      .then(function () { enrichRunning = false; pumpEnrichQueue(); });
+      .then(function () {
+        enrichingId = null; enrichRunning = false; render(); pumpEnrichQueue();
+      });
   }
 
   function tagVocabulary() {
@@ -1574,7 +1596,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v2-2';
+  var APP_VERSION = 'log-v2-3';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
 
@@ -1643,6 +1665,60 @@
     return live.sort(function (a, b) { return b.capturedAt.localeCompare(a.capturedAt); });
   }
 
+  // What the list says about an entry's enrichment state. Silent when there
+  // is nothing to say — an enriched entry shows its chips, not a tick.
+  function enrichBadge(r) {
+    if (r.id === enrichingId) return '<span class="estate working">enriching…</span>';
+    if (r.enrichment.status === 'failed') {
+      return '<span class="estate failed" title="Tap the entry, then Enrich, to try again">could not enrich</span>';
+    }
+    if (r.enrichment.status === 'pending' && enrichmentEnabled()) {
+      return '<span class="estate">queued</span>';
+    }
+    return '';
+  }
+
+  // The whole of what the model made of an entry, shown where you are
+  // already standing when you tap one — including the fields the chip row
+  // has no room for, and the guesses it was not confident enough to apply.
+  function enrichReadout(r) {
+    var e = r.enrichment, rows = [];
+    if (r.occurredAt) rows.push(['when', r.occurredAt]);
+    Object.keys(r.details || {}).forEach(function (k) {
+      var v = r.details[k];
+      if (v !== null && v !== '' && typeof v !== 'object') rows.push([k, String(v)]);
+    });
+    var body = rows.map(function (kv) {
+      return '<div class="ereadout-row"><span>' + esc(kv[0]) + '</span><b>' + esc(kv[1]) + '</b></div>';
+    }).join('');
+
+    var foot = '';
+    if (e.status === 'done') {
+      // Either half can be missing without the other being worth hiding.
+      foot = [
+        e.model ? esc(e.model) : '',
+        typeof e.confidence === 'number' ? Math.round(e.confidence * 100) + '% confident' : ''
+      ].filter(Boolean).join(' · ');
+    } else if (e.status === 'failed') {
+      foot = 'Could not enrich this entry' + (lastEnrichFailure ? ' — ' + esc(lastEnrichFailure) : '');
+    } else if (r.id === enrichingId) {
+      foot = 'Enriching now…';
+    } else if (e.status === 'pending') {
+      foot = enrichmentEnabled() ? 'Waiting its turn' : 'Enrichment is off — turn it on in Settings';
+    }
+
+    var sugg = '';
+    if (e.suggestion && e.suggestion.type) {
+      sugg = '<div class="ereadout-row suggestion"><span>unsure</span><b>' +
+        esc(e.suggestion.type) + (e.suggestion.title ? ' · ' + esc(e.suggestion.title) : '') +
+        '</b></div>';
+    }
+
+    if (!body && !sugg && !foot) return '';
+    return '<div class="ereadout">' + body + sugg +
+      (foot ? '<div class="ereadout-foot">' + foot + '</div>' : '') + '</div>';
+  }
+
   function render() {
     var rows = visible();
     var total = all.filter(function (r) { return !r.deleted; }).length;
@@ -1668,8 +1744,14 @@
           return '<span class="chip hint">' + esc(h) +
             '<button class="act-hint-del" data-i="' + i + '" aria-label="Remove">×</button></span>';
         }).join('');
+        var eChips = r.type ? '<div class="chips"><span class="chip">' + esc(r.type) + '</span>' +
+          (r.title ? '<span class="chip title">' + esc(r.title) + '</span>' : '') +
+          r.tags.map(function (t) { return '<span class="chip">' + esc(t) + '</span>'; }).join('') +
+          (r.rating ? '<span class="chip rating">' + '★'.repeat(r.rating) + '</span>' : '') +
+          '</div>' : '';
         html += '<div class="entry editing" data-id="' + r.id + '">' +
           '<textarea class="edit-area">' + esc(r.raw) + '</textarea>' +
+          eChips + enrichReadout(r) +
           (hints ? '<div class="chips">' + hints + '</div>' : '') +
           '<div class="hint-row">' +
             '<input class="hint-input" placeholder="Tell the AI what to add or focus on…">' +
@@ -1691,6 +1773,7 @@
           '<div class="raw">' + highlight(r.raw, query) + '</div>' +
           chips +
           '<div class="meta"><span>' + timeLabel(r.capturedAt) + '</span>' +
+            enrichBadge(r) +
             '<span class="edit-hint" aria-hidden="true">' + PENCIL_SVG + '</span></div></div>';
       }
     });

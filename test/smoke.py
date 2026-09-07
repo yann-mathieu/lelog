@@ -2650,6 +2650,55 @@ def test_a_hint_can_be_removed(page, base_url):
 
 
 @test
+def test_details_are_readable_on_the_entry(page, base_url):
+    """Extracted details are the point of enrichment, so they have to be
+    visible somewhere — the chip row has no room for them."""
+    stub_enrichment(page, extraction_js(
+        type="book", title="Klara and the Sun", confidence=0.9,
+        details={"author": "Ishiguro", "genre": "fiction"},
+    ))
+
+    boot(page, base_url)
+    capture(page, "finished klara")
+    wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+
+    page.click(".entry .raw")
+    page.wait_for_selector(".ereadout")
+    readout = page.inner_text(".ereadout")
+    assert "Ishiguro" in readout and "author" in readout
+    assert "genre" in readout and "fiction" in readout
+    # Which model produced this, and how sure it was.
+    assert "confident" in readout
+
+
+@test
+def test_the_list_says_when_an_entry_is_waiting(page, base_url):
+    """A queued or failed entry looks identical to an enriched one without
+    this, which is the whole of 'is it still working?'."""
+    # Enrichment on, but the extractor never resolves: the entry stays in
+    # flight rather than racing to done before the assertion.
+    stub_enrichment(page, "() => new Promise(() => {})")
+
+    boot(page, base_url)
+    capture(page, "waiting on the model")
+
+    page.wait_for_selector(".estate.working")
+    assert "enriching" in page.inner_text(".estate.working")
+
+
+@test
+def test_a_failed_entry_says_so_in_the_list(page, base_url):
+    stub_enrichment(page, "(rec, ctx) => Promise.reject(new Error('boom'))")
+
+    boot(page, base_url)
+    capture(page, "this will fail")
+    wait_for_record(page, lambda r: r["enrichment"]["status"] == "failed")
+
+    page.wait_for_selector(".estate.failed")
+    assert "could not enrich" in page.inner_text(".estate.failed")
+
+
+@test
 def test_enrichment_shape_in_export(page, base_url):
     boot(page, base_url)
     capture(page, "not yet enriched")
