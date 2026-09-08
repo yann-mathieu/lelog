@@ -1349,6 +1349,10 @@
   }
 
   function confidenceBand(confidence) {
+    // An unreported confidence is treated as medium: the model produced
+    // fields, and its failure to also rate itself is not evidence those
+    // fields are wrong. They get applied, and flagged for a glance.
+    if (confidence === null) return 'medium';
     if (confidence >= CONFIDENCE_HIGH) return 'high';
     if (confidence >= CONFIDENCE_LOW) return 'medium';
     return 'low';
@@ -1368,7 +1372,11 @@
       tags: Array.isArray(result.tags) ? result.tags.filter(function (t) { return typeof t === 'string'; }) : [],
       rating: (Number.isInteger(result.rating) && result.rating >= 1 && result.rating <= 5) ? result.rating : null,
       details: (result.details && typeof result.details === 'object') ? result.details : {},
-      confidence: (typeof result.confidence === 'number' && result.confidence >= 0 && result.confidence <= 1) ? result.confidence : 0
+      // null, not 0. "Did not say" and "said it is hopeless" are different
+      // claims, and collapsing them threw away whole extractions because a
+      // small model omitted one meta-field it was never good at anyway.
+      confidence: (typeof result.confidence === 'number' && result.confidence >= 0 && result.confidence <= 1)
+        ? result.confidence : null
     };
     return out;
   }
@@ -1841,7 +1849,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-0';
+  var APP_VERSION = 'log-v3-1';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -1942,7 +1950,8 @@
       // Either half can be missing without the other being worth hiding.
       foot = [
         e.model ? esc(e.model) : '',
-        typeof e.confidence === 'number' ? Math.round(e.confidence * 100) + '% confident' : '',
+        typeof e.confidence === 'number' ? Math.round(e.confidence * 100) + '% confident'
+          : e.status === 'done' ? 'confidence not reported' : '',
         e.ms ? Math.round(e.ms / 1000) + 's' : '',
         e.msFirst ? Math.round(e.msFirst / 1000) + 's before first word' : ''
       ].filter(Boolean).join(' · ');

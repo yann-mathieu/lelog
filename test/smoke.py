@@ -2975,6 +2975,52 @@ def test_it_falls_back_when_streaming_is_unsupported(page, base_url):
 
 
 @test
+def test_a_model_that_omits_confidence_still_gets_applied(page, base_url):
+    """A 1B model on a phone spent 44s extracting a note correctly, then had
+    the lot discarded for leaving out a self-rating it was never reliable at.
+    Not reporting confidence is not the same as reporting none."""
+    stub_model_layer(page)
+    page.add_init_script("""
+        const mk = window.__LELOG_TEST_WEBLLM__.CreateMLCEngine;
+        window.__LELOG_TEST_WEBLLM__.CreateMLCEngine = (id, opts) =>
+            mk(id, opts).then(engine => {
+                engine.chat.completions.create = () => Promise.resolve({ choices: [
+                    { message: { content: JSON.stringify({
+                        type: 'podcast', title: 'The Pragmatic Engineer',
+                        occurredAt: null, tags: ['engineering'], rating: null,
+                        details: { host: 'Gergely Orosz' } }) } }
+                ] });
+                return engine;
+            });
+    """)
+
+    boot(page, base_url)
+    capture(page, "listened to a podcast")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+    assert rec["type"] == "podcast", "an omitted confidence discarded the extraction"
+    assert rec["title"] == "The Pragmatic Engineer"
+    assert rec["enrichment"]["confidence"] is None, "absent must not become 0"
+    assert rec["enrichment"]["needsReview"] is True, "unrated work deserves a glance"
+    assert rec["enrichment"]["suggestion"] is None
+
+
+@test
+def test_an_explicitly_low_confidence_is_still_withheld(page, base_url):
+    """The other half: a model that does say it is unsure is believed."""
+    stub_enrichment(page, extraction_js(type="book", title="Maybe", confidence=0.1))
+
+    boot(page, base_url)
+    capture(page, "a shaky guess")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+    assert rec["type"] is None, "a stated low confidence must still hold back"
+    assert rec["enrichment"]["suggestion"]["type"] == "book"
+
+
+@test
 def test_the_host_probe_does_not_force_a_cors_preflight(page, base_url):
     """A Range header makes the probe a non-simple cross-origin request, and
     raw.githubusercontent.com answers that preflight with 403 while serving
