@@ -44,7 +44,7 @@ The enrichment questioner and the quiz questioner are **the same component** at 
 
 ## Testing
 
-91 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
+92 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
 
 ```bash
 python3 test/smoke.py            # all
@@ -98,6 +98,13 @@ avoidable, not device-specific.
 round trips and was one `curl` away from being caught. Before writing a
 package version, a model id, or an API shape: fetch it. `curl -sI` a model
 artifact to confirm it is really there.
+
+**Diagnostics can lie, so verify them too.** The host probe once sent a
+`Range` header, which makes a cross-origin request non-simple and forces a
+CORS preflight — `raw.githubusercontent.com` answers that preflight with 403
+while serving the file itself perfectly well. It reported a reachable host
+as unreachable, and sent a debugging session off after an outage that did
+not exist. Probes use simple requests only; a test asserts it.
 
 **Ask for the diagnostics blob, not one fact at a time.** Settings →
 Enrichment → *Copy diagnostics* returns version, GPU and adapter, whether

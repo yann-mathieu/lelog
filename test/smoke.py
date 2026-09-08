@@ -2975,6 +2975,46 @@ def test_it_falls_back_when_streaming_is_unsupported(page, base_url):
 
 
 @test
+def test_the_host_probe_does_not_force_a_cors_preflight(page, base_url):
+    """A Range header makes the probe a non-simple cross-origin request, and
+    raw.githubusercontent.com answers that preflight with 403 while serving
+    the file itself fine. The probe then called a reachable host unreachable
+    — a diagnostic that invents outages is worse than none."""
+    stub_model_layer(page)
+    # The probe reads the host URLs from the module's model list, so the
+    # chosen model has to be one the fake module actually knows about.
+    page.add_init_script("localStorage.setItem('enrichModel', 'smol-360m');")
+    seen = []
+
+    def record(route):
+        seen.append(dict(route.request.headers))
+        route.fulfill(status=200, body="ok",
+                      headers={"access-control-allow-origin": "*"})
+
+    page.route("https://raw.githubusercontent.com/**", record)
+    page.route("https://huggingface.co/**", record)
+    page.add_init_script("""
+        const mk = window.__LELOG_TEST_WEBLLM__.CreateMLCEngine;
+        window.__LELOG_TEST_WEBLLM__.CreateMLCEngine = () =>
+            Promise.reject(new TypeError('Failed to fetch'));
+    """)
+
+    boot(page, base_url)
+    capture(page, "probe the hosts")
+    enrich(page)
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "failed")
+
+    assert seen, "the diagnosis never probed either host"
+    for headers in seen:
+        assert "range" not in headers, \
+            "a Range header forces a preflight these hosts reject"
+
+    # Both hosts answered, so the diagnosis must not claim they are down.
+    assert "Could not reach" not in rec["enrichment"]["error"], \
+        f"reachable hosts reported as unreachable: {rec['enrichment']['error']}"
+
+
+@test
 def test_diagnostics_gathers_the_whole_picture(page, base_url):
     """One paste instead of one fact per round trip."""
     stub_model_layer(page)

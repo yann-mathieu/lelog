@@ -1546,10 +1546,16 @@
       .filter(Boolean).join(' ').trim();
   }
 
+  // No custom headers, deliberately. A Range header makes this a non-simple
+  // cross-origin request, which forces a CORS preflight — and
+  // raw.githubusercontent.com answers that preflight with 403 while serving
+  // the file itself perfectly happily. The probe then reported a reachable
+  // host as unreachable, which is worse than not probing at all.
+  // fetch() resolves once the headers are in, so cancelling the body here
+  // costs a connection rather than a download.
   function probe(url) {
-    // One byte is enough to tell reachable from blocked, and costs nothing
-    // on a metered connection.
-    return fetch(url, { headers: { Range: 'bytes=0-0' } }).then(function (res) {
+    return fetch(url).then(function (res) {
+      try { if (res.body && res.body.cancel) res.body.cancel(); } catch (e) {}
       return (res.ok || res.status === 206) ? null : 'HTTP ' + res.status;
     }).catch(function (e) { return errorText(e) || 'unreachable'; });
   }
@@ -1835,7 +1841,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v2-9';
+  var APP_VERSION = 'log-v3-0';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
