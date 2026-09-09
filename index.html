@@ -1695,8 +1695,71 @@
         });
       });
     }).then(function (text) {
-      return JSON.parse(text);
+      return parseModelJSON(text);
     });
+  }
+
+  // Small models produce JSON that is nearly right: wrapped in prose or code
+  // fences, a trailing comma, or cut off when it runs out of tokens. Handing
+  // that straight to JSON.parse throws away a minute of a phone's work over
+  // one character, so this tries progressively harder, and settles for the
+  // fields it can recover rather than nothing.
+  function parseModelJSON(text) {
+    var raw = String(text == null ? '' : text);
+    var tries = [raw];
+
+    var open = raw.indexOf('{'), close = raw.lastIndexOf('}');
+    if (open !== -1 && close > open) tries.push(raw.slice(open, close + 1));
+    tries.push(repairJSON(open !== -1 ? raw.slice(open) : raw));
+
+    for (var i = 0; i < tries.length; i++) {
+      if (!tries[i]) continue;
+      try {
+        var parsed = JSON.parse(tries[i]);
+        if (parsed && typeof parsed === 'object') return parsed;
+      } catch (e) { /* try the next one */ }
+    }
+
+    var salvaged = salvageFields(raw);
+    if (salvaged) return salvaged;
+
+    // Nothing usable: say what it actually produced, since the position of a
+    // syntax error tells you nothing without the text it happened in.
+    var err = new Error('The model did not return usable JSON. It said: '
+      + raw.trim().slice(0, 200) + (raw.length > 200 ? '…' : ''));
+    throw err;
+  }
+
+  function repairJSON(s) {
+    var t = String(s).replace(/```[a-z]*/gi, '').trim();
+    t = t.replace(/,\s*([}\]])/g, '$1');
+    var counts = function (re) { return (t.match(re) || []).length; };
+    if (counts(/{/g) > counts(/}/g) || counts(/\[/g) > counts(/\]/g)) {
+      // Truncated: drop whatever half-written pair it stopped in the middle
+      // of, then close what is still open.
+      t = t.replace(/[,{\[]\s*"[^"]*"?\s*:?\s*[^,{}\[\]]*$/, '').replace(/,\s*$/, '');
+      var needBrackets = counts(/\[/g) - counts(/\]/g);
+      var needBraces = counts(/{/g) - counts(/}/g);
+      while (needBrackets-- > 0) t += ']';
+      while (needBraces-- > 0) t += '}';
+    }
+    return t;
+  }
+
+  // Even badly broken output usually still carries "type": "podcast" intact,
+  // and a partial extraction beats discarding the pass.
+  function salvageFields(s) {
+    var out = {}, m;
+    if ((m = /"type"\s*:\s*"([^"]*)"/.exec(s))) out.type = m[1];
+    if ((m = /"title"\s*:\s*"([^"]*)"/.exec(s))) out.title = m[1];
+    if ((m = /"rating"\s*:\s*(\d+)/.exec(s))) out.rating = +m[1];
+    if ((m = /"confidence"\s*:\s*([0-9.]+)/.exec(s))) out.confidence = +m[1];
+    if ((m = /"tags"\s*:\s*\[([^\]]*)\]/.exec(s))) {
+      out.tags = m[1].split(',').map(function (t) {
+        return t.trim().replace(/^"|"$/g, '');
+      }).filter(Boolean);
+    }
+    return Object.keys(out).length ? out : null;
   }
 
   function streamCompletion(engine, req, report) {
@@ -1849,7 +1912,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-1';
+  var APP_VERSION = 'log-v3-2';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';

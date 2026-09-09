@@ -2974,6 +2974,92 @@ def test_it_falls_back_when_streaming_is_unsupported(page, base_url):
     assert rec["title"] == "Dune", "the non-streaming fallback did not run"
 
 
+def model_says(js_string_literal):
+    """Make the fake engine return exactly this text as the model output."""
+    return """
+        const mk = window.__LELOG_TEST_WEBLLM__.CreateMLCEngine;
+        window.__LELOG_TEST_WEBLLM__.CreateMLCEngine = (id, opts) =>
+            mk(id, opts).then(engine => {
+                engine.chat.completions.create = () => Promise.resolve(
+                    { choices: [{ message: { content: %s } }] });
+                return engine;
+            });
+    """ % js_string_literal
+
+
+@test
+def test_output_wrapped_in_prose_or_fences_is_still_read(page, base_url):
+    """Small models narrate. Discarding a good extraction because it arrived
+    inside a code fence wastes a minute of a phone's work."""
+    stub_model_layer(page)
+    page.add_init_script(model_says(
+        r"'Sure! Here you go:\n```json\n{\"type\":\"podcast\",\"title\":\"The Pragmatic Engineer\","
+        r"\"tags\":[\"engineering\"],\"rating\":null,\"details\":{},\"confidence\":0.8}\n```\nHope that helps.'"
+    ))
+
+    boot(page, base_url)
+    capture(page, "a narrated answer")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+    assert rec["type"] == "podcast"
+    assert rec["title"] == "The Pragmatic Engineer"
+
+
+@test
+def test_output_cut_off_mid_write_is_recovered(page, base_url):
+    """Hitting the token ceiling truncates the JSON. What arrived before the
+    cut is still worth keeping."""
+    stub_model_layer(page)
+    page.add_init_script(model_says(
+        r"'{\"type\":\"restaurant\",\"title\":\"Le Petit Cambodge\",\"tags\":[\"vietnamese\"],"
+        r"\"details\":{\"cuisine\":'"
+    ))
+
+    boot(page, base_url)
+    capture(page, "cut off half way")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+    assert rec["type"] == "restaurant"
+    assert rec["tags"] == ["vietnamese"]
+
+
+@test
+def test_malformed_json_salvages_the_fields_it_can(page, base_url):
+    """The exact failure seen on the phone: Expected ':' after property name.
+    The type and title were intact either side of the broken part."""
+    stub_model_layer(page)
+    page.add_init_script(model_says(
+        r"'{\"type\":\"idea\",\"title\":\"one prod environment\",\"tags\":[\"devops\"],"
+        r"\"det ails\" \"split by users\"}'"
+    ))
+
+    boot(page, base_url)
+    capture(page, "broken in the middle")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+    assert rec["type"] == "idea", "salvageable fields were thrown away"
+    assert rec["title"] == "one prod environment"
+
+
+@test
+def test_unusable_output_reports_what_the_model_said(page, base_url):
+    """When nothing can be recovered, a character position is useless on its
+    own — the text it happened in is the thing worth having."""
+    stub_model_layer(page)
+    page.add_init_script(model_says(r"'I am sorry, I cannot help with that request.'"))
+
+    boot(page, base_url)
+    capture(page, "a refusal")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "failed")
+    assert "I am sorry" in rec["enrichment"]["error"], \
+        f"the model's own words are missing: {rec['enrichment']['error']}"
+
+
 @test
 def test_a_model_that_omits_confidence_still_gets_applied(page, base_url):
     """A 1B model on a phone spent 44s extracting a note correctly, then had
