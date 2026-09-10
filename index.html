@@ -1488,6 +1488,7 @@
 
   function getEnrichEngine(onProgress) {
     if (enrichEngine) return enrichEngine;
+    var report = onProgress || function () {};
     enrichEngine = Promise.resolve().then(function () {
       if (!navigator.gpu) throw new Error('This browser has no WebGPU support.');
       return navigator.gpu.requestAdapter();
@@ -1510,8 +1511,23 @@
       return loadWebLLM();
     }).then(function (webllm) {
       webllmModule = webllm;
-      return webllm.CreateMLCEngine(enrichModelId, {
-        initProgressCallback: onProgress || function () {}
+      var create = function () {
+        return webllm.CreateMLCEngine(enrichModelId, {
+          initProgressCallback: onProgress || function () {}
+        });
+      };
+      // One retry, and only for a download that fell over. A model is
+      // hundreds of megabytes over a phone connection, WebLLM keeps the
+      // shards it already has, so a second attempt resumes rather than
+      // starting again — and losing the whole thing to one blip is the
+      // difference between a slow feature and an unusable one. A driver or
+      // shader failure is not retried: it would fail identically and cost
+      // another wait to say so.
+      return create().catch(function (e) {
+        if (!/cache|fetch|network|failed to/i.test(errorText(e))) throw e;
+        console.warn('model download failed, retrying once', e);
+        report({ phase: 'loading', pct: 0 });
+        return create();
       });
     }).then(function (engine) {
       loadedModelKey = chosenModel().key;
@@ -1912,7 +1928,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-2';
+  var APP_VERSION = 'log-v3-3';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -2468,10 +2484,24 @@
     $('enrichLooseJSON').checked = localStorage.getItem('enrichLooseJSON') === '1';
     // Changing the model does not reload it there and then — the next
     // extraction does, since that is when a big download is least surprising.
+    // Changing the model, or the 16/32-bit choice, means different weights
+    // and so a fresh download of several hundred megabytes. That used to
+    // happen silently on the next pass, which on a phone connection is not a
+    // thing to discover afterwards.
+    var note = $('enrichModelNote');
     var swapPending = on && loadedModelKey && loadedModelKey !== chosenModel().key;
-    $('enrichModelNote').hidden = !swapPending;
+    note.hidden = true;
     if (swapPending) {
-      $('enrichModelNote').textContent = 'Downloads the next time enrichment runs.';
+      note.textContent = 'Downloads the next time enrichment runs.';
+      note.hidden = false;
+    } else if (on && loadedModelKey !== chosenModel().key) {
+      modelCached().then(function (cached) {
+        if (cached === false) {
+          note.textContent = 'Not downloaded yet — the next pass will fetch it '
+            + '(several hundred MB). Best on wi-fi.';
+          note.hidden = false;
+        }
+      });
     }
     $('enrichEnableBtn').hidden = on;
     $('enrichEnableBtn').disabled = !supported;

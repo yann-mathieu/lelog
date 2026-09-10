@@ -2988,6 +2988,52 @@ def model_says(js_string_literal):
 
 
 @test
+def test_a_failed_download_is_retried_once(page, base_url):
+    """A model is hundreds of megabytes over a phone connection and WebLLM
+    keeps the shards it already has, so one blip should not cost the lot."""
+    stub_model_layer(page)
+    page.add_init_script("""
+        const mk = window.__LELOG_TEST_WEBLLM__.CreateMLCEngine;
+        window.__LELOG_TEST_WEBLLM__.CreateMLCEngine = (id, opts) => {
+            window.__TRIES__ = (window.__TRIES__ || 0) + 1;
+            if (window.__TRIES__ === 1) {
+                return Promise.reject(new Error(
+                    "Failed to execute 'add' on 'Cache': Cache.add() encountered a network error"));
+            }
+            return mk(id, opts);
+        };
+    """)
+
+    boot(page, base_url)
+    capture(page, "flaky download")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+    assert rec["type"] == "book", "the retry never happened"
+    assert page.evaluate("() => window.__TRIES__") == 2
+
+
+@test
+def test_a_driver_failure_is_not_retried(page, base_url):
+    """Retrying a shader failure just fails identically, one wait later."""
+    stub_model_layer(page)
+    page.add_init_script("""
+        window.__LELOG_TEST_WEBLLM__.CreateMLCEngine = () => {
+            window.__TRIES__ = (window.__TRIES__ || 0) + 1;
+            return Promise.reject(new Error(
+                'CreateComputePipelines failed with VK_ERROR_UNKNOWN'));
+        };
+    """)
+
+    boot(page, base_url)
+    capture(page, "a driver that says no")
+    enrich(page)
+
+    wait_for_record(page, lambda r: r["enrichment"]["status"] == "failed")
+    assert page.evaluate("() => window.__TRIES__") == 1, "a driver failure was retried"
+
+
+@test
 def test_output_wrapped_in_prose_or_fences_is_still_read(page, base_url):
     """Small models narrate. Discarding a good extraction because it arrived
     inside a code fence wastes a minute of a phone's work."""
