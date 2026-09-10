@@ -3214,6 +3214,176 @@ def test_diagnostics_gathers_the_whole_picture(page, base_url):
     assert "yes" in text.split("shader-f16")[1][:10]
 
 
+# ---------- the self-test ----------
+#
+# The one button that produces, from a real device, everything this suite
+# cannot observe: the adapter, the quantisation actually resolved, what is on
+# disk, how long the model took, and what it said. These tests drive it
+# through the module seam, so the report is assembled by the same code that
+# runs on the phone.
+
+def run_self_test(page, timeout=20000):
+    """Run the Settings self-test and return the finished report."""
+    open_sheet(page)
+    # A cold run warns that it may have to download the model first.
+    page.once("dialog", lambda d: d.accept())
+    page.click("#selfTestBtn")
+    page.wait_for_function(
+        "() => /verdict/.test(document.querySelector('#diagOut').value)",
+        timeout=timeout,
+    )
+    return page.input_value("#diagOut")
+
+
+@test
+def test_self_test_walks_the_whole_real_path(page, base_url):
+    """One button, one paste — the report a phone cannot otherwise produce."""
+    stub_model_layer(page)
+    boot(page, base_url)
+
+    report = run_self_test(page)
+
+    for label in ["version", "ua", "screen", "storage", "webgpu", "gpu",
+                  "shader-f16", "choice", "module", "16-bit build",
+                  "32-bit build", "resolved", "engine", "prompt",
+                  "first token", "finished", "output", "parse", "result",
+                  "details", "verdict"]:
+        assert label in report, f"the self-test never reported {label}\n{report}"
+    assert re.search(r"verdict\s+PASS", report), report
+    assert "testgpu" in report, "the GPU is not named"
+    # It went through the model layer, not a stubbed extractor: the fake
+    # engine's own words had to survive streaming, parsing and validation.
+    assert "Dune" in report and "book" in report, report
+
+
+@test
+def test_self_test_names_the_step_that_failed(page, base_url):
+    """Naming which of eight steps broke is the whole point. "Could not load
+    the on-device model" is precisely what this replaces."""
+    stub_model_layer(page)
+    page.add_init_script("""
+        window.__LELOG_TEST_WEBLLM__.CreateMLCEngine = () =>
+            Promise.reject(new Error('CreateComputePipelines failed with VK_ERROR_UNKNOWN'));
+    """)
+    boot(page, base_url)
+
+    report = run_self_test(page)
+
+    assert re.search(r"verdict\s+FAILED AT engine", report), report
+    assert "VK_ERROR_UNKNOWN" in report, report
+    # The driver diagnosis rides along, and the steps before it still
+    # reported — a failure with no context is what we already had.
+    assert "GPU driver refused" in report, report
+    assert "shader-f16" in report and "16-bit build" in report, report
+
+
+@test
+def test_self_test_reports_both_builds_separately(page, base_url):
+    """The question that took a week: a model which had just run successfully
+    reporting itself uncached, because flipping the 16/32-bit switch resolves
+    a different model id and therefore a different download."""
+    stub_model_layer(page)
+    page.add_init_script("""
+        window.__LELOG_TEST_WEBLLM__.hasModelInCache =
+            (id) => Promise.resolve(/q4f32_1/.test(id));
+    """)
+    boot(page, base_url)
+
+    report = run_self_test(page)
+
+    f16 = next(l for l in report.split("\n") if l.startswith("16-bit build"))
+    f32 = next(l for l in report.split("\n") if l.startswith("32-bit build"))
+    assert "q4f16_1" in f16 and "not downloaded" in f16, f16
+    assert "q4f32_1" in f32 and "on this device" in f32, f32
+
+
+@test
+def test_self_test_uses_a_fixed_sentence_and_leaves_the_log_alone(page, base_url):
+    """It is written to be pasted to a stranger, and running it must not
+    quietly enrich anything."""
+    stub_model_layer(page)
+    boot(page, base_url)
+    capture(page, "a private thing about someone")
+
+    report = run_self_test(page)
+
+    assert "a private thing" not in report, "the self-test leaked an entry"
+    # The prompt is reported by length only — it embeds the tag vocabulary,
+    # and this report is written to be pasted. What the model was actually
+    # asked has to be checked at the model, not in the report.
+    prompt = page.evaluate("() => window.__LELOG_SEEN_REQ__.messages[0].content")
+    assert "Le Servan" in prompt, "the fixed sample sentence was not used"
+    assert "a private thing" not in prompt, "an entry reached the model"
+    assert re.search(r"prompt\s+\d+ chars", report), report
+
+    after = [r for r in records(page) if not r["deleted"]]
+    assert len(after) == 1, "the self-test wrote a record"
+    assert after[0]["raw"] == "a private thing about someone"
+    assert after[0]["enrichment"]["status"] == "pending", \
+        "the self-test enriched an entry as a side effect"
+
+
+@test
+def test_self_test_says_how_the_output_had_to_be_parsed(page, base_url):
+    """"Parsed as-is" and "salvaged out of the wreckage" are the same outcome
+    for the record and completely different model behaviour."""
+    stub_model_layer(page)
+    page.add_init_script(model_says(
+        r'"```json\n{\"type\": \"book\", \"title\": \"Dune\", \"tags\": [\"scifi\"],"'))
+    boot(page, base_url)
+
+    report = run_self_test(page)
+
+    assert re.search(r"verdict\s+PASS", report), report
+    assert "repaired" in report, report
+    assert "Dune" in report, report
+
+
+@test
+def test_a_queued_entry_waits_for_the_self_test(page, base_url):
+    """One GPU, one job. A pass started during a self-test would compete with
+    it for the device and make both timings a lie."""
+    stub_model_layer(page)
+    # Hold the self-test inside generation, and only the self-test: the gate
+    # opens for the first call and lets every later one straight through.
+    page.add_init_script("""
+        window.__GATE__ = new Promise(r => { window.__OPEN__ = r; });
+        const mk = window.__LELOG_TEST_WEBLLM__.CreateMLCEngine;
+        window.__LELOG_TEST_WEBLLM__.CreateMLCEngine = (id, opts) =>
+            mk(id, opts).then(engine => {
+                const inner = engine.chat.completions.create.bind(engine.chat.completions);
+                let first = true;
+                engine.chat.completions.create = (req) => {
+                    if (!first) return inner(req);
+                    first = false;
+                    return window.__GATE__.then(() => inner(req));
+                };
+                return engine;
+            });
+    """)
+    boot(page, base_url)
+    capture(page, "queued behind the self-test")
+
+    open_sheet(page)
+    page.once("dialog", lambda d: d.accept())
+    page.click("#selfTestBtn")
+    page.wait_for_function(
+        "() => /prompt/.test(document.querySelector('#diagOut').value)")
+    close_sheet(page)
+
+    enrich(page)
+    # Nothing should happen in this window — the fake model is instant, so
+    # without the guard the entry would be finished well inside it.
+    page.wait_for_timeout(400)
+    assert records(page)[0]["enrichment"]["status"] == "pending", \
+        "the entry ran while the self-test had the GPU"
+
+    page.evaluate("() => window.__OPEN__()")
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+    assert rec["title"] == "Dune", "the queue was stranded by the self-test"
+
+
 @test
 def test_enrichment_shape_in_export(page, base_url):
     boot(page, base_url)

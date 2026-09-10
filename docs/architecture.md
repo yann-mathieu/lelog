@@ -10,6 +10,8 @@
 
 **Corrections of 4 September 2026.** Phase 2's first slice shipped: on-device extraction (§3.1) and richer per-type `details`, using WebLLM/WebGPU (§6.3(b)) rather than the cloud API §7 originally named — chosen for privacy from the outset, not as a phase 5 fallback. Confidence handling (§3.2) is built as described, except the "review queue" is a passive per-entry marker for now, not an interactive screen — that's still §2.6/§8.2's question queue, not yet built. `links` and entity resolution (§3.3) are untouched; no type proposals (§4) yet either.
 
+**Addition of 10 September 2026.** Nothing in §6's threat model changes, but the on-device path gained an observability seam it needed: Settings → Enrichment → *Run self-test* executes the real path once — adapter, quantisation, module, cache state of both builds, engine load, generation, parse — and reports each step, naming the one that failed. It runs on a fixed sample sentence rather than a stored entry, and reports the prompt by length only, so the report can be pasted anywhere without carrying your text or your tag vocabulary. The reason it exists is §6.3(b)'s own consequence: choosing on-device inference puts the only copy of the failure on a device nobody debugging can reach.
+
 **Changes since v4.0:** added §1.1 — this is a log, not a diary or a notes app, and the design consequences that follow (no streaks, no calendar view, no daily prompt).
 
 **Changes since v3:** the capture model is now free text with AI enrichment (§2), which restructures much of the document. Types become emergent rather than chosen (§4). The security model changes materially (§6) because every note now passes through a language model. The quiz engine and the enrichment engine turn out to be the same machine (§8).

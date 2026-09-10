@@ -359,8 +359,12 @@
       Skip the strict output format — starts faster, output is checked anyway
     </label>
     <p id="enrichModelNote" hidden style="margin:-4px 0 10px;font-size:13px;color:var(--faint)"></p>
-    <button class="linkbtn" id="diagBtn" style="padding:8px 0;color:var(--muted)">Copy diagnostics</button>
-    <textarea id="diagOut" hidden readonly style="width:100%;height:150px;background:var(--bg);border:1px solid var(--border);border-radius:11px;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;padding:10px;margin-bottom:10px"></textarea>
+    <div class="row" style="gap:18px">
+      <button class="linkbtn" id="diagBtn" style="padding:8px 0;margin-left:0;color:var(--muted)">Copy diagnostics</button>
+      <button class="linkbtn" id="selfTestBtn" style="padding:8px 0;margin-left:0;color:var(--muted)">Run self-test</button>
+    </div>
+    <p id="selfTestNote" style="margin:2px 0 10px;font-size:13px;color:var(--faint)">The self-test runs the model once on a fixed sample sentence and reports every step — GPU, download, speed, and what it produced. None of your entries are used or included.</p>
+    <textarea id="diagOut" hidden readonly style="width:100%;height:210px;background:var(--bg);border:1px solid var(--border);border-radius:11px;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;padding:10px;margin-bottom:10px"></textarea>
     <div class="row">
       <button class="btn" id="enrichEnableBtn">Turn on</button>
       <button class="btn ghost" id="enrichDisableBtn" hidden>Turn off</button>
@@ -1311,6 +1315,10 @@
 
   function pumpEnrichQueue() {
     if (enrichRunning || !enrichQueue.length) return;
+    // A phone's GPU does one thing at a time. A queued entry waits for the
+    // self-test rather than competing with it for the device — and the
+    // self-test re-pumps the queue when it is done, so nothing is stranded.
+    if (selfTestRunning) return;
     enrichRunning = true;
     var id = enrichQueue.shift();
     delete enrichQueued[id];
@@ -1700,16 +1708,7 @@
           : { type: 'json_object' },
         max_tokens: 220
       };
-      return streamCompletion(engine, req, report).then(null, function (e) {
-        // Only fall back when streaming never produced anything — a failure
-        // partway through is a real failure, not an unsupported option, and
-        // re-running would cost another pass over the model for nothing.
-        if (live.tokens) throw e;
-        console.warn('streaming unavailable, falling back', e);
-        return engine.chat.completions.create(req).then(function (res) {
-          return res.choices[0].message.content;
-        });
-      });
+      return completeWithFallback(engine, req, report);
     }).then(function (text) {
       return parseModelJSON(text);
     });
@@ -1720,24 +1719,32 @@
   // that straight to JSON.parse throws away a minute of a phone's work over
   // one character, so this tries progressively harder, and settles for the
   // fields it can recover rather than nothing.
-  function parseModelJSON(text) {
+  // `trace`, when passed, comes back carrying which attempt worked. Nothing
+  // in the app behaves differently for it; the self-test reports it, because
+  // "parsed as-is" and "parsed after salvaging three fields out of the
+  // wreckage" are the same outcome here and very different model behaviour.
+  function parseModelJSON(text, trace) {
+    trace = trace || {};
     var raw = String(text == null ? '' : text);
-    var tries = [raw];
+    var tries = [{ s: raw, how: 'as-is' }];
 
     var open = raw.indexOf('{'), close = raw.lastIndexOf('}');
-    if (open !== -1 && close > open) tries.push(raw.slice(open, close + 1));
-    tries.push(repairJSON(open !== -1 ? raw.slice(open) : raw));
+    if (open !== -1 && close > open) {
+      tries.push({ s: raw.slice(open, close + 1), how: 'trimmed to the braces' });
+    }
+    tries.push({ s: repairJSON(open !== -1 ? raw.slice(open) : raw), how: 'repaired' });
 
     for (var i = 0; i < tries.length; i++) {
-      if (!tries[i]) continue;
+      if (!tries[i].s) continue;
       try {
-        var parsed = JSON.parse(tries[i]);
-        if (parsed && typeof parsed === 'object') return parsed;
+        var parsed = JSON.parse(tries[i].s);
+        if (parsed && typeof parsed === 'object') { trace.stage = tries[i].how; return parsed; }
       } catch (e) { /* try the next one */ }
     }
 
     var salvaged = salvageFields(raw);
-    if (salvaged) return salvaged;
+    if (salvaged) { trace.stage = 'salvaged from broken JSON'; return salvaged; }
+    trace.stage = 'unusable';
 
     // Nothing usable: say what it actually produced, since the position of a
     // syntax error tells you nothing without the text it happened in.
@@ -1776,6 +1783,26 @@
       }).filter(Boolean);
     }
     return Object.keys(out).length ? out : null;
+  }
+
+  // Streamed, falling back to a plain completion once — and only when
+  // streaming never produced anything. A failure partway through is a real
+  // failure, not an unsupported option, and re-running it would cost another
+  // pass over the model for nothing. The token count is tracked here rather
+  // than read off the live UI state, so this is usable outside a queue run
+  // (the self-test) and cannot be fooled by a previous pass's leftovers.
+  function completeWithFallback(engine, req, report) {
+    var seen = 0;
+    return streamCompletion(engine, req, function (p) {
+      if (p.tokens) seen = p.tokens;
+      report(p);
+    }).then(null, function (e) {
+      if (seen) throw e;
+      console.warn('streaming unavailable, falling back', e);
+      return engine.chat.completions.create(req).then(function (res) {
+        return res.choices[0].message.content;
+      });
+    });
   }
 
   function streamCompletion(engine, req, report) {
@@ -1928,7 +1955,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-3';
+  var APP_VERSION = 'log-v3-4';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -2624,22 +2651,255 @@
     });
   }
 
-  $('diagBtn').onclick = function () {
-    diagnostics().then(function (text) {
-      var out = $('diagOut');
-      out.value = text;
-      out.hidden = false;
-      // Clipboard access fails in plenty of ordinary situations, so the text
-      // is on screen and selectable either way rather than only copied.
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text)
-          .then(function () { toast('Diagnostics copied'); })
-          .catch(function () { out.select(); toast('Select and copy the text'); });
-      } else {
-        out.select();
-        toast('Select and copy the text');
-      }
+  // ---------- self-test ----------
+  //
+  // The device is the thing a session working on this app does not have: no
+  // WebGPU in that environment, and the model's hosts blocked, so everything
+  // from the adapter to the first token can only be observed from the phone —
+  // and observing it one error message per round trip is how this feature came
+  // to cost a dozen of them. This runs the entire real path once, in order, and
+  // writes a single report: environment, adapter, quantisation, module load,
+  // what is on disk, engine creation, a fixed sentence through the model, and
+  // the parse. Whatever breaks, the report names the step it broke at.
+  //
+  // The sentence is fixed rather than one of your entries, so two devices
+  // produce comparable reports and the paste carries none of your text. The
+  // prompt is reported by length alone for the same reason: it embeds your tag
+  // vocabulary.
+  var SELF_TEST_NOTE = 'Dinner at Le Servan in the 11th with Marie — the duck '
+    + 'was extraordinary, best meal in months. 5/5.';
+  var selfTestRunning = false;
+
+  function selfTestPad(s) {
+    while (s.length < 13) s += ' ';
+    return s;
+  }
+
+  function secsSince(t) { return ((Date.now() - t) / 1000).toFixed(1) + 's'; }
+
+  function mb(n) {
+    return typeof n === 'number' ? Math.round(n / 1048576) + 'MB' : '?';
+  }
+
+  function cacheWord(v) {
+    return v === true ? 'on this device' : v === false ? 'not downloaded' : 'unknown';
+  }
+
+  // A step that never settles would leave the report unfinished, which is the
+  // one outcome this whole thing exists to prevent. The limits are generous
+  // because a first download on a phone genuinely does take many minutes.
+  function withTimeout(p, ms, what) {
+    return new Promise(function (resolve, reject) {
+      var settled = false;
+      var timer = setTimeout(function () {
+        if (settled) return;
+        settled = true;
+        reject(new Error(what + ' did not finish within ' + Math.round(ms / 1000) + 's.'));
+      }, ms);
+      Promise.resolve(p).then(function (v) {
+        if (settled) return;
+        settled = true; clearTimeout(timer); resolve(v);
+      }, function (e) {
+        if (settled) return;
+        settled = true; clearTimeout(timer); reject(e);
+      });
     });
+  }
+
+  // onLine is called with the whole report so far, every time it grows, so a
+  // step that is still running is visible while it runs rather than only in
+  // hindsight — on a phone this is the difference between "it hung" and "it
+  // hung loading the engine, 90 seconds in, at 40%".
+  function runSelfTest(onLine) {
+    var lines = [], step = 'start', engine = null;
+
+    function say(label, value) {
+      lines.push(selfTestPad(label) + value);
+      onLine(lines.join('\n'));
+    }
+    function tick(label, value) {
+      onLine(lines.concat(selfTestPad(label) + value).join('\n'));
+    }
+
+    say('self-test', new Date().toISOString());
+    say('version', APP_VERSION);
+    say('ua', navigator.userAgent);
+    say('screen', window.innerWidth + 'x' + window.innerHeight
+      + ' @' + (window.devicePixelRatio || 1));
+
+    return Promise.resolve().then(function () {
+      step = 'storage';
+      var st = navigator.storage;
+      return Promise.all([
+        st && st.persisted ? st.persisted().catch(function () { return null; }) : null,
+        st && st.estimate ? st.estimate().catch(function () { return null; }) : null
+      ]);
+    }).then(function (r) {
+      say('storage', (r[0] === true ? 'persistent' : r[0] === false ? 'not persistent' : 'unknown')
+        + (r[1] ? ' · ' + mb(r[1].usage) + ' used of ' + mb(r[1].quota) : ''));
+
+      step = 'webgpu';
+      say('webgpu', navigator.gpu ? 'present' : 'absent');
+      if (!navigator.gpu) throw new Error('This browser has no WebGPU support.');
+      return navigator.gpu.requestAdapter();
+    }).then(function (adapter) {
+      if (!adapter) throw new Error('WebGPU is present but no GPU adapter is available on this device.');
+      say('gpu', describeAdapter(adapter) || 'unnamed');
+      var feats = [];
+      try { adapter.features.forEach(function (f) { feats.push(f); }); } catch (e) {}
+      say('shader-f16', (feats.indexOf('shader-f16') !== -1 ? 'yes' : 'no')
+        + ' · ' + feats.length + (feats.length === 1 ? ' feature' : ' features'));
+
+      step = 'module';
+      var model = chosenModel();
+      say('choice', model.key + (localStorage.getItem('enrichForceF32') === '1'
+        ? ' · 32-bit forced in Settings' : ''));
+      var t = Date.now();
+      return withTimeout(loadWebLLM(), 120000, 'Loading WebLLM').then(function (m) {
+        webllmModule = m;
+        say('module', 'loaded in ' + secsSince(t));
+        return m;
+      });
+    }).then(function (m) {
+      step = 'cache';
+      // Both builds, not just the resolved one. Flipping the 16/32-bit switch
+      // resolves a *different* model id, so a model that ran perfectly can
+      // truthfully report itself uncached — and that looked like a bug for a
+      // week. These two lines say it outright instead.
+      var model = chosenModel();
+      return Promise.all([model.f16, model.f32].map(function (id) {
+        if (!id || !m.hasModelInCache) return Promise.resolve(null);
+        return withTimeout(Promise.resolve().then(function () { return m.hasModelInCache(id); }),
+          30000, 'The cache check').catch(function () { return null; });
+      })).then(function (c) {
+        say('16-bit build', model.f16 + ' · ' + cacheWord(c[0]));
+        say('32-bit build', (model.f32 || 'none') + ' · ' + cacheWord(c[1]));
+      });
+    }).then(function () {
+      step = 'engine';
+      var t = Date.now(), peak = -1;
+      return withTimeout(getEnrichEngine(function (p) {
+        var pct = Math.round((p.progress || 0) * 100);
+        if (pct <= peak) return;
+        peak = pct;
+        tick('engine', 'loading ' + pct + '% · ' + secsSince(t));
+      }), 20 * 60 * 1000, 'Loading the model').then(function (e) {
+        engine = e;
+        say('resolved', enrichModelId);
+        say('engine', 'ready in ' + secsSince(t));
+      });
+    }).then(function () {
+      step = 'extract';
+      var ctx = buildContext();
+      var prompt = buildPrompt({ raw: SELF_TEST_NOTE, hints: [] }, ctx);
+      var strict = localStorage.getItem('enrichLooseJSON') !== '1';
+      say('prompt', prompt.length + ' chars · ' + ctx.tags.length + ' known tags · '
+        + (strict ? 'strict JSON grammar' : 'no grammar'));
+      var t = Date.now(), first = 0, n = 0;
+      return withTimeout(completeWithFallback(engine, {
+        messages: [{ role: 'user', content: prompt }],
+        response_format: strict
+          ? { type: 'json_object', schema: extractionSchema() }
+          : { type: 'json_object' },
+        max_tokens: 220
+      }, function (p) {
+        if (!p.tokens) return;
+        if (!first) first = Date.now();
+        n = p.tokens;
+        tick('generating', n + ' tokens · ' + secsSince(t));
+      }), 15 * 60 * 1000, 'The model').then(function (text) {
+        say('first token', first ? ((first - t) / 1000).toFixed(1) + 's' : 'never streamed');
+        var gen = first ? (Date.now() - first) / 1000 : 0;
+        say('finished', secsSince(t) + ' · ' + n + ' tokens'
+          + (gen > 0.5 ? ' · ' + (n / gen).toFixed(1) + '/s' : ''));
+        return text;
+      });
+    }).then(function (text) {
+      step = 'parse';
+      // Verbatim, because every parse failure so far has been obvious the
+      // moment the actual characters were visible, and invisible before that.
+      var out = String(text == null ? '' : text);
+      say('output', JSON.stringify(out.slice(0, 400)) + (out.length > 400 ? ' …' : ''));
+      var trace = {};
+      var v = validateExtraction(parseModelJSON(text, trace));
+      say('parse', trace.stage);
+      say('result', [
+        v.type || 'no type',
+        v.title ? '"' + v.title + '"' : 'no title',
+        v.rating ? v.rating + '/5' : 'no rating',
+        v.tags.length ? 'tags ' + v.tags.join(', ') : 'no tags',
+        'confidence ' + (v.confidence === null ? 'not given' : v.confidence)
+          + ' → ' + confidenceBand(v.confidence)
+      ].join(' · '));
+      say('details', Object.keys(v.details).map(function (k) {
+        return k + '=' + v.details[k];
+      }).join(' ') || 'none');
+      say('verdict', 'PASS');
+      return lines.join('\n');
+    }).catch(function (e) {
+      // The same host/driver diagnosis a real failure gets, since the point of
+      // running this is to be told why, not to be told that.
+      return withTimeout(diagnoseModelLoad(e), 30000, 'The diagnosis')
+        .catch(function () { return ''; })
+        .then(function (extra) {
+          say('verdict', 'FAILED AT ' + step);
+          say('error', errorText(e) + (extra || ''));
+          return lines.join('\n');
+        });
+    });
+  }
+
+  function showReport(text, atTop) {
+    var out = $('diagOut');
+    out.value = text;
+    out.hidden = false;
+    out.scrollTop = atTop ? 0 : out.scrollHeight;
+  }
+
+  // Clipboard access fails in plenty of ordinary situations, so the text is on
+  // screen and selectable either way rather than only copied.
+  function copyReport(text, copied) {
+    showReport(text, true);
+    var out = $('diagOut');
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text)
+        .then(function () { toast(copied); })
+        .catch(function () { out.select(); toast('Select and copy the text'); });
+    } else {
+      out.select();
+      toast('Select and copy the text');
+    }
+  }
+
+  $('selfTestBtn').onclick = function () {
+    if (selfTestRunning) return;
+    // A phone's GPU does one thing at a time, and a self-test racing a real
+    // pass would measure neither of them honestly.
+    if (enrichRunning) { toast('Wait for the entry being enriched to finish'); return; }
+    if (loadedModelKey !== chosenModel().key
+      && !confirm('Run the full self-test?\n\nIf the model is not already on '
+        + 'this device it will be downloaded first (several hundred MB). '
+        + 'Best on wi-fi.')) return;
+
+    var btn = this;
+    selfTestRunning = true;
+    btn.disabled = true;
+    btn.textContent = 'Running…';
+    runSelfTest(showReport).then(function (text) {
+      copyReport(text, 'Self-test copied');
+    }, function (e) {
+      showReport('The self-test itself fell over: ' + errorText(e));
+    }).then(function () {
+      selfTestRunning = false;
+      btn.disabled = false;
+      btn.textContent = 'Run self-test';
+      refreshEnrichUI();
+      pumpEnrichQueue();
+    });
+  };
+
+  $('diagBtn').onclick = function () {
+    diagnostics().then(function (text) { copyReport(text, 'Diagnostics copied'); });
   };
 
   $('enrichLooseJSON').onchange = function () {

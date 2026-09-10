@@ -10,7 +10,7 @@ Unscheduled ideas live in **`docs/ideas.md`** — things worth building, not yet
 
 **Phases 0 and 1 shipped, in daily use since August 2026.** One text box, list, search, edit, soft delete, export/import, and Dropbox sync. Installable PWA, works offline.
 
-**Phase 2's first slice shipped 4 September 2026:** on-device extraction (WebLLM/WebGPU, opt-in from Settings), filling type, title, tags, rating and per-type `details`. Nothing leaves the phone — no cloud API. High/medium-confidence extractions apply (medium gets a quiet review marker); low-confidence guesses sit unapplied in `enrichment.suggestion`. A model that does not report a confidence at all is treated as medium rather than as zero — small models are poor at self-rating, and discarding a correct extraction over a missing meta-field is worse than applying it with a marker. Model output is parsed forgivingly for the same reason (`parseModelJSON`): code fences and narration are stripped, truncated JSON is closed, and a broken document has its intact fields salvaged, because a minute of a phone's work should not be lost to one character. No entity resolution, no interactive review queue yet — see the roadmap.
+**Phase 2's first slice shipped 4 September 2026:** on-device extraction (WebLLM/WebGPU, opt-in from Settings), filling type, title, tags, rating and per-type `details`. Nothing leaves the phone — no cloud API. High/medium-confidence extractions apply (medium gets a quiet review marker); low-confidence guesses sit unapplied in `enrichment.suggestion`. A model that does not report a confidence at all is treated as medium rather than as zero — small models are poor at self-rating, and discarding a correct extraction over a missing meta-field is worse than applying it with a marker. Model output is parsed forgivingly for the same reason (`parseModelJSON`): code fences and narration are stripped, truncated JSON is closed, and a broken document has its intact fields salvaged, because a minute of a phone's work should not be lost to one character. Settings carries a **self-test** that runs the whole real path once on a fixed sample sentence and reports every step, so a device failure arrives as one paste rather than one symptom per round trip. No entity resolution, no interactive review queue yet — see the roadmap.
 
 **Enrichment is manual, per entry, by deliberate choice (7 September 2026).** Capture does not enqueue it and launching does not sweep a backlog: you enrich an entry from its row when you want it, or everything at once from Settings. This departs from §2.5 of the architecture doc, which has capture queue enrichment automatically. Entries staying raw for ever is a normal outcome, so `enrichment.status: 'pending'` means "never asked for", not "queued", and the UI reports it quietly rather than as work outstanding. Instructions to the extractor live in `hints` on the record and are replayed on every later pass.
 
@@ -44,7 +44,7 @@ The enrichment questioner and the quiz questioner are **the same component** at 
 
 ## Testing
 
-100 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
+106 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
 
 ```bash
 python3 test/smoke.py            # all
@@ -106,12 +106,28 @@ while serving the file itself perfectly well. It reported a reachable host
 as unreachable, and sent a debugging session off after an outage that did
 not exist. Probes use simple requests only; a test asserts it.
 
-**Ask for the diagnostics blob, not one fact at a time.** Settings →
-Enrichment → *Copy diagnostics* returns version, GPU and adapter, whether
-`shader-f16` is really supported, which model resolved and whether it is
-cached, the settings in force, entry counts, last timing and last error. One
-paste answers what previously took several exchanges. If a report arrives
-without it, ask for that before theorising.
+**Ask for the self-test report first.** Settings → Enrichment → *Run
+self-test* drives the whole real path once on a fixed sample sentence and
+reports every step in order: environment and storage, adapter and
+`shader-f16`, which model id resolved, whether **each** quantisation is on
+disk, module and engine load times, prompt size, time to first token,
+throughput, the model's output verbatim, how that output had to be parsed,
+and the validated result. A failure names the step it failed at. That is one
+paste in place of the dozen round trips this feature actually cost, and it is
+the closest thing available to running the model here.
+
+**`Copy diagnostics` is the lighter one**, for the state of the app rather
+than a live run: version, GPU and adapter, `shader-f16`, which model resolved
+and whether it is cached, the settings in force, entry counts, last timing
+and last error. Ask for it when the question is about accumulated state; ask
+for the self-test when the question is about the model. If a report arrives
+without either, ask before theorising.
+
+**A phone is not the only device.** Desktop Chrome has real WebGPU and a much
+faster GPU, and the app is the same URL with the same Dropbox sync. Running
+the self-test on both and diffing the two reports separates a driver problem
+from a code problem in one step — which is the distinction most of the
+history of this feature was spent guessing at.
 
 **Look at UI before shipping it.** Drive the app with Playwright at a phone
 width (412×915) and screenshot the state being changed. A toast with no
