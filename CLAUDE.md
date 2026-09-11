@@ -51,7 +51,20 @@ python3 test/smoke.py            # all
 python3 test/smoke.py search     # only tests matching "search"
 ```
 
-Needs Playwright once: `pip install playwright && python3 -m playwright install chromium`.
+Needs Playwright once. On any current Debian or Ubuntu a plain `pip install`
+is refused (PEP 668, "externally-managed-environment"), so use a venv — and
+put it outside the checkout, which may well be inside a synced folder:
+
+```bash
+python3 -m venv ~/.venvs/lelog
+~/.venvs/lelog/bin/pip install playwright
+~/.venvs/lelog/bin/python -m playwright install chromium
+~/.venvs/lelog/bin/python test/smoke.py     # run it with that interpreter
+```
+
+(`python3 -m venv` needing `apt install python3.x-venv` first is normal on
+Debian. `--break-system-packages` is for throwaway containers like
+`.claude/cloud-setup.sh`, not for a machine you use.)
 
 **Run it before and after every change.** Several tests exist specifically to catch regressions that would silently destroy data — the export shape, the three sync-never-deletes rules, and the v1→v2 database upgrade. When adding behaviour, add the test that fails without it, then check the test actually fails when you break the code deliberately. That practice has caught two real gaps in this suite already, both in sync paths that looked covered but were not.
 
@@ -158,6 +171,10 @@ python3 test/live.py --headless
 python3 test/live.py --model qwen-1.5b --f32
 python3 test/live.py --url https://yann-mathieu.github.io/lelog/
 ```
+
+It drives the Chrome already installed on the machine, so it does not need
+Playwright's own browser download — only the `playwright` package itself (see
+Testing above for the venv).
 
 Read two lines of its output before anything else. `webgpu absent` means the
 browser has no WebGPU and nothing below that line ran — that is what
