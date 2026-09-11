@@ -85,12 +85,16 @@ The repo is public because Pages will not serve a private repo on a free plan. `
 
 ## Working on enrichment from here
 
-**The device is the thing you do not have.** No WebGPU, and the network here
-blocks `huggingface.co`, `cdn.jsdelivr.net` and `unpkg.com`. So the model
-never runs in this environment, and anything about *this GPU* or *this
-network* can only come from the phone. Everything else can and should be
-settled here first — most of the round trips in this feature's history were
-avoidable, not device-specific.
+**The device is the thing you do not have.** A cloud session can get WebGPU
+— `test/live.py` does, via `--enable-unsafe-webgpu --enable-features=Vulkan`
+on a persistent profile — but it arrives as SwiftShader, a software renderer
+with no `shader-f16` and meaningless timings, and the network there blocks
+`esm.run`, `cdn.jsdelivr.net`, `huggingface.co` and `unpkg.com`, so the load
+dies at the module fetch regardless. The model therefore never runs in a
+cloud session, and anything about *a real GPU* or *a real network* has to
+come from a real machine. Everything else can and should be settled first —
+most of the round trips in this feature's history were avoidable, not
+device-specific.
 
 **Verify external facts, never recall them.** `registry.npmjs.org` and
 `raw.githubusercontent.com` *are* reachable. A version pin of
@@ -136,6 +140,42 @@ nowhere, both shipped because nobody looked.
 
 **Say which half is unverified.** When a change cannot be exercised here,
 state that plainly rather than implying it works.
+
+## Working from a desktop with a real GPU
+
+**This is the only place the model can actually be run**, and it closes the
+loop that every other note in this file works around: change code, run it
+against the real model, read the result, without a person relaying symptoms
+in between.
+
+`test/live.py` is that loop. It serves this checkout, opens it in the Chrome
+already installed on the machine, clicks Settings → *Run self-test*, and
+prints the report line by line as it fills in. Exit status is 0 on `PASS`.
+
+```bash
+python3 test/live.py                    # visible window, real Chrome
+python3 test/live.py --headless
+python3 test/live.py --model qwen-1.5b --f32
+python3 test/live.py --url https://yann-mathieu.github.io/lelog/
+```
+
+Read two lines of its output before anything else. `webgpu absent` means the
+browser has no WebGPU and nothing below that line ran — that is what
+`--channel bundled` gets you, and why real Chrome is the default. `gpu
+google swiftshader` means WebGPU fell back to software: it works, but f16 is
+gone and every timing is fiction.
+
+The browser profile is kept between runs (`--profile`, default
+`~/.cache/lelog-live-profile`), so the weights are downloaded once. Delete
+that directory to test a cold download — worth doing deliberately, since the
+first-run path is where most of the reported failures have been.
+
+**Do not move any of this into `test/smoke.py`.** That suite must keep
+running offline, in seconds, in a cloud session with no GPU; the moment one
+test needs real weights, it stops being runnable where most of the work
+happens. Real-model checks live here, run by hand, and the two seams
+(`__LELOG_TEST_EXTRACTOR__`, `__LELOG_TEST_WEBLLM__`) stay the way the suite
+covers that code.
 
 ## Working from a phone
 
