@@ -78,9 +78,24 @@ python3 test/smoke.py            # all tests
 python3 test/smoke.py search     # only tests matching "search"
 ```
 
-Needs Playwright once: `pip install playwright && python3 -m playwright install chromium`.
+Needs Playwright once. A plain `pip install` is refused on any current Debian or Ubuntu (PEP 668), so use a venv — kept outside the checkout, which may well sit in a synced folder:
+
+```
+python3 -m venv ~/.venvs/lelog
+~/.venvs/lelog/bin/pip install playwright
+~/.venvs/lelog/bin/python -m playwright install chromium
+~/.venvs/lelog/bin/python test/smoke.py
+```
 
 The suite serves the repo over http on an ephemeral port and drives it with headless Chromium; each test gets a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. Run it before and after any change.
+
+It never touches WebGPU or downloads real model weights — that would stop it running offline in seconds. For a real run of the on-device model, on a machine that has a GPU:
+
+```
+~/.venvs/lelog/bin/python test/live.py
+```
+
+**`docs/runbook.md` is the full guide** to both: setup, every flag, how to read a self-test report, and what a failure at each step of the model pipeline actually means.
 
 ## What's inside
 
@@ -91,7 +106,9 @@ The suite serves the repo over http on an ephemeral port and drives it with head
 | `sw.js` | Service worker, so it works offline |
 | `icon-*.png` | Home-screen icons |
 | `test/smoke.py` | Playwright smoke suite |
+| `test/live.py` | Runs the on-device model for real, on a machine with a GPU |
 | `docs/architecture.md` | Design rationale |
+| `docs/runbook.md` | Running and debugging it yourself |
 
 No build step, no dependencies, no framework.
 

@@ -4,6 +4,8 @@ A private capture app for things worth remembering: books, people, meals, places
 
 Full design rationale lives in **`docs/architecture.md`**. Read it before making architectural changes — most of the non-obvious decisions there have reasons that aren't visible from the code.
 
+Running and debugging it by hand — setup, `test/live.py`, reading a self-test report, what a failure at each step of the model pipeline means — is **`docs/runbook.md`**. It is written for a person rather than a session, but it is the fastest way to orient in the model path.
+
 Unscheduled ideas live in **`docs/ideas.md`** — things worth building, not yet committed to, with the reasoning attached. Add to it freely; don't treat anything in it as agreed work.
 
 ## Current state
