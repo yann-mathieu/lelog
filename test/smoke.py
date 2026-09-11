@@ -3107,6 +3107,26 @@ def test_unusable_output_reports_what_the_model_said(page, base_url):
 
 
 @test
+def test_a_model_stuck_in_a_loop_is_named_as_such(page, base_url):
+    """The first real-device failure of this feature was 200 characters of
+    `|n|o|n|o` pasted at the user, which names nothing. A model that has come
+    off the rails is a different failure from one that wrapped its JSON in
+    prose, and it has a different lever — a different model, or the grammar."""
+    stub_model_layer(page)
+    loop = '{"WHO practice/this is|the|n|o|r|a' + "|n|o" * 40
+    page.add_init_script(model_says(json.dumps(loop)))
+
+    boot(page, base_url)
+    capture(page, "dinner somewhere")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "failed")
+    err = rec["enrichment"]["error"]
+    assert "repeating itself" in err, f"the loop is not named: {err}"
+    assert err.count("|n|o") < 6, f"the loop is pasted at the user instead: {err}"
+
+
+@test
 def test_a_model_that_omits_confidence_still_gets_applied(page, base_url):
     """A 1B model on a phone spent 44s extracting a note correctly, then had
     the lot discarded for leaving out a self-rating it was never reliable at.

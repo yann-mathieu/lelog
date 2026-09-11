@@ -356,7 +356,7 @@
     </label>
     <label style="display:flex;gap:9px;align-items:center;font-size:13.5px;color:var(--muted);margin-bottom:10px">
       <input type="checkbox" id="enrichLooseJSON">
-      Skip the strict output format — starts faster, output is checked anyway
+      Skip the strict output format — starts faster, but a small model can then wander off and waste the whole pass
     </label>
     <p id="enrichModelNote" hidden style="margin:-4px 0 10px;font-size:13px;color:var(--faint)"></p>
     <div class="row" style="gap:18px">
@@ -1747,10 +1747,36 @@
     trace.stage = 'unusable';
 
     // Nothing usable: say what it actually produced, since the position of a
-    // syntax error tells you nothing without the text it happened in.
+    // syntax error tells you nothing without the text it happened in. The one
+    // exception is a model that has come off the rails: 200 characters of
+    // `|n|o|n|o` names nothing, and the lever for it is a different model or
+    // the strict grammar rather than a more forgiving parser.
+    if (looksDegenerate(raw)) {
+      trace.stage = 'degenerate';
+      throw new Error('The model got stuck repeating itself instead of answering — it produced '
+        + JSON.stringify(raw.trim().slice(0, 48)) + ' and went on like that. That is the model '
+        + 'failing, not your note. Pick a different one under Settings → Enrichment, and leave '
+        + 'the strict output format on.');
+    }
     var err = new Error('The model did not return usable JSON. It said: '
       + raw.trim().slice(0, 200) + (raw.length > 200 ? '…' : ''));
     throw err;
+  }
+
+  // Off-the-rails output does not look like slightly-wrong JSON; it looks like
+  // the same few characters for as many tokens as the model was given. Counting
+  // distinct characters over the tail catches both the exact loops and the
+  // wobbly ones, where looking for a repeating period only catches the exact.
+  // It runs only once nothing could be parsed or salvaged, so a false positive
+  // can change the wording of a failure and nothing else.
+  function looksDegenerate(s) {
+    var tail = String(s).slice(-160);
+    if (tail.length < 60) return false;
+    var seen = {}, distinct = 0;
+    for (var i = 0; i < tail.length; i++) {
+      if (seen[tail[i]] !== 1) { seen[tail[i]] = 1; distinct++; }
+    }
+    return distinct <= 6;
   }
 
   function repairJSON(s) {
@@ -1955,7 +1981,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-4';
+  var APP_VERSION = 'log-v3-5';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
