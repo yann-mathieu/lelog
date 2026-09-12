@@ -8,15 +8,16 @@ There is a formatted version of this page at
 **This file is the source of truth** — if the two disagree, believe this one,
 and if this one disagrees with the code, believe the code.
 
-Written at `e28943d`, 11 September 2026.
+Written 13 September 2026, at `log-v3-8`.
 
 | | |
 |---|---|
-| deployed | `log-v3-4`, Pages build succeeded |
-| tests | 106 / 106 passing |
+| version | `log-v3-8` |
+| tests | 116 / 116 passing |
 | app | `index.html`, ~3,000 lines, no build step |
-| default model | `llama-1b` → `Llama-3.2-1B-Instruct-q4f16_1-MLC` |
-| unverified | the model has never run on a real GPU under observation |
+| default model | `llama-1b` → `q4f16_1`, or `q4f32_1` where `shader-f16` is missing |
+| verified | `llama-1b` and `smol-360m` both run end to end on desktop Chrome + NVIDIA, f32 |
+| unverified | anything on the phone; the f16 build has never been run |
 
 ---
 
@@ -44,7 +45,7 @@ itself needs no dependencies at all.
 ## Three things you can run
 
 ```bash
-# 115 tests. Offline, stubbed Dropbox, no GPU, no weights. ~6 minutes.
+# 116 tests. Offline, stubbed Dropbox, no GPU, no weights. ~6 minutes.
 ~/.venvs/lelog/bin/python test/smoke.py
 ~/.venvs/lelog/bin/python test/smoke.py search   # just matching names
 ```
@@ -61,14 +62,22 @@ self-test**.
 
 `live.py` serves the checkout, opens it in the installed Chrome, clicks the
 self-test and prints the report line by line as it fills in. It exits `0` on
-`PASS`, so it drops straight into a shell loop. The browser profile persists
-at `~/.cache/lelog-live-profile`, so the weights download once — delete that
-directory to reproduce a cold download deliberately, which is where most of
-the reported failures have actually been.
+`PASS`, so it drops straight into a shell loop.
+
+**The weights download once, and it takes two things.** The profile persists
+at `~/.cache/lelog-live-profile`, *and* the port is fixed (`--port`, default
+8787) — the Cache API is keyed by origin and the port is part of the origin,
+so an ephemeral port silently gave every run an empty cache and downloaded
+the whole model again. Delete the profile directory to reproduce a cold
+download deliberately; that is where most of the reported failures have
+actually been. A second line of defence against the opposite mistake: the
+shell is served no-store behind a per-run query string, because a stable
+origin plus a kept profile let Chrome serve a cached `index.html` and report
+a version no longer on disk.
 
 Other flags: `--headless`, `--loose` (skip the strict JSON grammar),
-`--channel bundled`, `--timeout`, `--profile`. Model keys are `smol-360m`,
-`llama-1b`, `qwen-0.5b`, `qwen-1.5b`.
+`--channel bundled`, `--timeout`, `--profile`, `--port`. Model keys are
+`smol-360m`, `llama-1b`, `qwen-0.5b`, `qwen-1.5b`.
 
 ---
 
@@ -216,9 +225,28 @@ it.
    or shader is the driver, and the 32-bit build is the thing to try;
    anything naming fetch, cache or network is the download, and the report
    already names the host that refused.
+
+   `Failed to execute 'add' on 'Cache': Request failed` is the download, and
+   in practice it has meant **Hugging Face rate-limiting**: WebLLM fetches
+   shards in parallel, and `us.aws.cdn.hf.co` answers a burst of anonymous
+   requests with 429. The app's diagnosis talks you out of this — it probes
+   with a simple request, cannot read a status code off an opaque response,
+   and so reports both hosts reachable. `curl` succeeding on a shard while
+   the browser fails is the signature. `live.py` prints the 429s; waiting
+   ten minutes clears it, and not re-downloading every run avoids it.
 6. **`extract`** — the model loaded and then failed or hung generating.
    Capped at 15 minutes, so a wedged model still produces a report rather
    than a blank box.
+
+   **Zero tokens for the full cap means the grammar, not the model.**
+   XGrammar throws on schema constructs it does not support — a union type
+   (`{ type: ['string', 'null'] }`) is one, `additionalProperties` on an
+   object is another — and web-llm compiles the grammar in a promise executor
+   with no `reject`, so the throw escapes as an unhandled error and the await
+   never returns. There is nothing to catch. `--loose` generating fine while
+   the default hangs is the tell. Write nullable as
+   `anyOf: [{ type: 'string' }, { type: 'null' }]`, and see the test in
+   `smoke.py` that rejects union types.
 7. **`parse`** — output that could not be salvaged even after repair. The
    `output` line directly above prints what it actually said; that is what to
    look at, not the character offset.
@@ -271,7 +299,24 @@ its old value. That is an accident of the implementation, not a choice.
 **Is the phone's f16 claim honest?** Android drivers advertise `shader-f16`
 and then fail to compile it. The self-test prints the claim and the outcome
 in the same report, so one run on the phone settles it — and `--f32` is the
-fallback if it does not.
+fallback if it does not. Desktop turned out to be the mirror image: Chrome
+137 on Linux reports `shader-f16 no` on a Quadro T1000 that has the hardware
+for it, and the app resolved the f32 build by itself. So the f16 path is
+still unexercised everywhere.
+
+**`details` comes back `{}` every time, and the grammar is why.** The schema
+declares `details: { type: 'object' }` with no properties, and xgrammar's
+strict mode forbids what the schema does not name — so `{}` is the only
+object the grammar will allow, while the prompt asks for keys it then
+forbids. The per-type `details` that phase 2 shipped cannot be filled while
+the grammar is on. Constraining it properly means a schema that depends on
+the type the model has not picked yet, which is a real design question.
+
+**Small models classify confidently and wrongly.** `llama-1b` read a
+restaurant dinner as `type: book` and self-rated it 0.9, so it applies with
+no review marker at all — worse than the 360M's garbage, which at least
+landed as medium. Tags shred proper nouns (`le`, `servan`) when the tag
+vocabulary is empty.
 
 **The question queue.** Phase 2 shipped extraction but deferred the
 interactive review screen into phase 3, where it merges with the clarifying
@@ -296,12 +341,12 @@ different time offsets; build it once.
 Inside `index.html`, sections are marked `// ---------- name ----------`:
 
 ```
-storage        414      rendering     2015
-dropbox auth   521      actions       2164
-push           813      self-test     2654
-pull           934      boot          2971
+storage        414      rendering     2021
+dropbox auth   521      actions       2170
+push           813      self-test     2660
+pull           934      boot          2977
 sync          1131
-enrichment    1247   <- everything model-related, ~670 lines
+enrichment    1247   <- everything model-related, ~680 lines
 ```
 
 ---

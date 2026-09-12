@@ -46,7 +46,7 @@ The enrichment questioner and the quiz questioner are **the same component** at 
 
 ## Testing
 
-115 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
+116 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
 
 ```bash
 python3 test/smoke.py            # all
@@ -164,6 +164,19 @@ faster GPU, and the app is the same URL with the same Dropbox sync. Running
 the self-test on both and diffing the two reports separates a driver problem
 from a code problem in one step — which is the distinction most of the
 history of this feature was spent guessing at.
+
+**The grammar is a dependency with teeth.** XGrammar — pinned transitively
+by the WebLLM version in `index.html` — throws on schema constructs it does
+not support, and WebLLM compiles the grammar in a promise executor with no
+`reject`, so the throw becomes an unhandled error and generation waits on a
+promise that never settles. Zero tokens for the full 15-minute cap, nothing
+to catch, `completeWithFallback` useless. A union type
+(`{ type: ['string', 'null'] }`) did this; `anyOf` is the supported spelling
+and a test in `smoke.py` now rejects unions. The same strictness is why
+`details` always comes back `{}`: the schema names no properties, so the
+grammar permits no properties. Variants can be compiled in isolation — the
+xgrammar wasm is embedded in its npm package, so it needs no weights and no
+GPU, which is the cheapest real check in this whole feature.
 
 **Look at UI before shipping it.** Drive the app with Playwright at a phone
 width (412×915) and screenshot the state being changed. A toast with no
