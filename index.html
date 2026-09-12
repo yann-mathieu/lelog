@@ -1718,10 +1718,16 @@
       type: 'object',
       properties: {
         type: { enum: TYPES.concat([null]) },
-        title: { type: ['string', 'null'] },
-        occurredAt: { type: ['string', 'null'] },
+        // Nullable written as anyOf, never as { type: ['string', 'null'] }.
+        // XGrammar 0.1.0 — the version web-llm 0.2.78 pins — throws on a
+        // union type, and web-llm compiles the grammar inside a promise
+        // executor that takes resolve and no reject, so the throw escapes as
+        // an unhandled error and generation waits for a promise that never
+        // settles. Not one token, for the full 15-minute cap. anyOf compiles.
+        title: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+        occurredAt: { anyOf: [{ type: 'string' }, { type: 'null' }] },
         tags: { type: 'array', items: { type: 'string' } },
-        rating: { type: ['integer', 'null'] },
+        rating: { anyOf: [{ type: 'integer' }, { type: 'null' }] },
         details: { type: 'object' },
         confidence: { type: 'number' }
       },
@@ -2078,7 +2084,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-7';
+  var APP_VERSION = 'log-v3-8';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';

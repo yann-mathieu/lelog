@@ -2919,6 +2919,44 @@ def test_a_whole_pass_through_the_real_model_layer(page, base_url):
 
 
 @test
+def test_the_grammar_has_no_union_types(page, base_url):
+    """A union type in the schema hangs enrichment for the full 15-minute cap.
+
+    XGrammar 0.1.0, which web-llm 0.2.78 pins, throws on { type: [..] }, and
+    web-llm compiles the grammar in a promise executor holding resolve and no
+    reject: the throw escapes as an unhandled error and the await never
+    returns. Nothing rejects, so completeWithFallback cannot catch it and not
+    one token is ever produced. Verified against that xgrammar build — the
+    union threw, anyOf compiled.
+    """
+    stub_model_layer(page)
+
+    boot(page, base_url)
+    capture(page, "finished dune")
+    enrich(page)
+    wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+
+    schema = page.evaluate("() => window.__LELOG_SEEN_REQ__.response_format.schema")
+    assert schema, "the strict path should send a schema"
+    walk = json.loads(schema)
+
+    def types_of(node):
+        """Every "type" value anywhere in the schema."""
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k == "type":
+                    yield v
+                else:
+                    yield from types_of(v)
+        elif isinstance(node, list):
+            for v in node:
+                yield from types_of(v)
+
+    unions = [t for t in types_of(walk) if isinstance(t, list)]
+    assert not unions, f"union types hang the grammar; use anyOf instead: {unions}"
+
+
+@test
 def test_model_load_progress_reaches_an_entry_trigger(page, base_url):
     """The bug that shipped: load progress was wired to Settings only, so a
     pass started from a row downloaded hundreds of megabytes in silence."""
