@@ -27,6 +27,10 @@
     --accent-dim: #3a4372;
     --danger: #e07a7a;
     --ok: #7fd1a6;
+    /* Not an error — a condition that is legal but not the default, and so
+       the thing to look at first when a result is wrong. Kept in the same
+       soft, low-chroma family as the other two so it reads as one palette. */
+    --warn: #d8b071;
     --radius: 14px;
   }
   html, body {
@@ -170,6 +174,31 @@
     margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--border);
     color: var(--faint); font-size: 12px; word-break: break-word;
   }
+  /* A condition that was not the default. Legal, so not --danger; worth
+     finding at a glance, so not the same grey as everything around it. */
+  .efact.warn { color: var(--warn); }
+  /* The conditions a pass ran under, as opposed to what it produced. These
+     are instrument readings rather than the entry's own content, so they get
+     an aligned label column and tabular figures instead of the justified
+     rows the details use — two runs are meant to be read against each other. */
+  .erun { margin-top: 7px; padding-top: 7px; border-top: 1px solid var(--border); }
+  .erun-row { display: flex; gap: 10px; padding: 1.5px 0; font-size: 11.5px; line-height: 1.5; }
+  .erun-row span { flex: 0 0 68px; color: var(--faint); }
+  .erun-row b {
+    min-width: 0; flex: 1; font-weight: 500; color: var(--muted);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-numeric: tabular-nums; word-break: break-word;
+  }
+  .erun-row b.warn { color: var(--warn); }
+  .erun-row b.bad { color: var(--danger); }
+  .erun-foot { display: flex; align-items: center; gap: 12px; margin-top: 8px; }
+  .erun-foot .act-copy-run {
+    background: none; border: 1px solid var(--border); border-radius: 8px;
+    color: var(--muted); font: inherit; font-size: 11.5px; cursor: pointer;
+    padding: 5px 11px;
+  }
+  .erun-foot .act-copy-run:active { background: var(--surface-2); color: var(--accent); }
+  .erun-foot em { color: var(--faint); font-size: 11px; font-style: normal; }
   /* The model's output as it arrives — proof of life, and the only way to
      see what it is actually producing rather than only the verdict. */
   .live-stream {
@@ -350,13 +379,17 @@
     <h2>Enrichment</h2>
     <p id="enrichNote">On-device AI fills in type, title, tags and details. Nothing runs on its own and nothing leaves your phone — enrich an entry from its row when you want it.</p>
     <select id="enrichModelSel" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);font:inherit;font-size:14px;padding:10px 12px;border-radius:11px;outline:none;margin-bottom:10px"></select>
-    <label style="display:flex;gap:9px;align-items:center;font-size:13.5px;color:var(--muted);margin-bottom:10px">
-      <input type="checkbox" id="enrichForceF32">
+    <label style="display:flex;gap:9px;align-items:flex-start;font-size:13.5px;color:var(--muted);margin-bottom:10px">
+      <input type="checkbox" style="margin-top:3px;flex:0 0 auto" id="enrichForceF32">
       Use the 32-bit build — try this if loading fails on a driver that claims 16-bit support
     </label>
-    <label style="display:flex;gap:9px;align-items:center;font-size:13.5px;color:var(--muted);margin-bottom:10px">
-      <input type="checkbox" id="enrichLooseJSON">
+    <label style="display:flex;gap:9px;align-items:flex-start;font-size:13.5px;color:var(--muted);margin-bottom:10px">
+      <input type="checkbox" style="margin-top:3px;flex:0 0 auto" id="enrichLooseJSON">
       Skip the strict output format — starts faster, but a small model can then wander off and waste the whole pass
+    </label>
+    <label style="display:flex;gap:9px;align-items:flex-start;font-size:13.5px;color:var(--muted);margin-bottom:10px">
+      <input type="checkbox" style="margin-top:3px;flex:0 0 auto" id="enrichDevDetails">
+      Show the full run on each entry — model, format, timings, and how the answer parsed
     </label>
     <p id="enrichModelNote" hidden style="margin:-4px 0 10px;font-size:13px;color:var(--faint)"></p>
     <div class="row" style="gap:18px">
@@ -472,6 +505,8 @@
     if (!('error' in e)) e.error = null;
     if (!('ms' in e)) e.ms = null;
     if (!('msFirst' in e)) e.msFirst = null;
+    if (!('grammar' in e)) e.grammar = null;
+    if (!('parse' in e)) e.parse = null;
     return rec;
   }
 
@@ -1412,7 +1447,8 @@
   // What the model is doing, right now. A pass is a model download the first
   // time and then seconds of silent GPU work, so without this the only
   // honest thing the app could say was "enriching…" and hope.
-  var live = { phase: '', pct: 0, tokens: 0, partial: '', startedAt: 0, firstTokenAt: 0 };
+  var live = { phase: '', pct: 0, tokens: 0, partial: '', startedAt: 0, firstTokenAt: 0,
+               grammar: null, parse: null };
   var liveTimer = null;
   var enrichCancel = false;
   var enrichAbort = null; // rejects the in-flight pass when you press Stop
@@ -1427,11 +1463,17 @@
       live.tokens = p.tokens;
     }
     if (typeof p.partial === 'string') live.partial = p.partial;
+    // Not progress but the conditions the pass is running under, carried on
+    // the channel that already exists rather than a second one. A stubbed
+    // extractor simply never reports them and they stay null.
+    if (typeof p.grammar === 'string') live.grammar = p.grammar;
+    if (typeof p.parse === 'string') live.parse = p.parse;
     paintLive();
   }
 
   function startLive() {
-    live = { phase: 'starting', pct: 0, tokens: 0, partial: '', startedAt: Date.now() };
+    live = { phase: 'starting', pct: 0, tokens: 0, partial: '', startedAt: Date.now(),
+             grammar: null, parse: null };
     clearInterval(liveTimer);
     // Ticks the elapsed seconds even while the model is quiet, which is the
     // difference between "working" and "hung" from the outside.
@@ -1441,7 +1483,8 @@
   function stopLive() {
     clearInterval(liveTimer);
     liveTimer = null;
-    live = { phase: '', pct: 0, tokens: 0, partial: '', startedAt: 0 };
+    live = { phase: '', pct: 0, tokens: 0, partial: '', startedAt: 0,
+             grammar: null, parse: null };
   }
 
   function liveLabel() {
@@ -1701,6 +1744,7 @@
       // is made of. validateExtraction sanitises the output either way, so
       // dropping the schema costs robustness the app already provides twice.
       var strict = localStorage.getItem('enrichLooseJSON') !== '1';
+      report({ grammar: strict ? 'schema' : 'json' });
       var req = {
         messages: [{ role: 'user', content: buildPrompt(rec, ctx) }],
         response_format: strict
@@ -1710,7 +1754,16 @@
       };
       return completeWithFallback(engine, req, report);
     }).then(function (text) {
-      return parseModelJSON(text);
+      // How hard the output was to rescue is the best quality signal this
+      // feature produces, and until now it was discarded the moment a pass
+      // succeeded: a record that had to be salvaged looks identical to one
+      // that parsed cleanly.
+      var trace = {};
+      try {
+        return parseModelJSON(text, trace);
+      } finally {
+        report({ parse: trace.stage || 'unusable' });
+      }
     });
   }
 
@@ -1880,7 +1933,8 @@
       status: 'done', model: enrichModelId, at: now,
       confidence: result.confidence, needsReview: band === 'medium', suggestion: null,
       error: null, ms: live.startedAt ? Date.now() - live.startedAt : null,
-      msFirst: (live.startedAt && live.firstTokenAt) ? live.firstTokenAt - live.startedAt : null
+      msFirst: (live.startedAt && live.firstTokenAt) ? live.firstTokenAt - live.startedAt : null,
+      grammar: live.grammar, parse: live.parse
     };
     if (rec.enrichment.ms) localStorage.setItem('enrichLastMs', String(rec.enrichment.ms));
     if (band === 'low' || result.type === null) {
@@ -1915,6 +1969,11 @@
   function abandonEnrichment(rec) {
     rec.enrichment.status = 'pending';
     rec.enrichment.error = null;
+    // Back to never having been asked for, which means the conditions of the
+    // half-finished pass go too rather than sitting on the record describing
+    // a run that produced nothing.
+    rec.enrichment.grammar = null;
+    rec.enrichment.parse = null;
     return put(rec).then(function () { render(); });
   }
 
@@ -1928,6 +1987,14 @@
       rec.enrichment.status = 'failed';
       rec.enrichment.at = now;
       rec.updatedAt = now;
+      // A failure's conditions matter more than a success's, and until now a
+      // failed record kept none of them — not the model, not how long it ran.
+      rec.enrichment.model = enrichModelId;
+      rec.enrichment.ms = live.startedAt ? Date.now() - live.startedAt : null;
+      rec.enrichment.msFirst =
+        (live.startedAt && live.firstTokenAt) ? live.firstTokenAt - live.startedAt : null;
+      rec.enrichment.grammar = live.grammar;
+      rec.enrichment.parse = live.parse;
       // On the record, not in a variable: the reason has to survive a reload
       // and belong to this entry rather than to whichever failed most recently.
       rec.enrichment.error = errorText(err) + (extra || '');
@@ -1966,7 +2033,7 @@
       raw: raw,
       capturedAt: now,
       captureSource: 'text',
-      enrichment: { status: 'pending', model: null, at: null, confidence: null, needsReview: false, suggestion: null, error: null, ms: null, msFirst: null },
+      enrichment: { status: 'pending', model: null, at: null, confidence: null, needsReview: false, suggestion: null, error: null, ms: null, msFirst: null, grammar: null, parse: null },
       type: null, title: null, occurredAt: null,
       tags: [], rating: null, details: {}, links: [],
       // Things you have told the extractor about this entry. Kept out of raw
@@ -1981,7 +2048,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-5';
+  var APP_VERSION = 'log-v3-6';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -2077,15 +2144,22 @@
       return '<div class="ereadout-row"><span>' + esc(kv[0]) + '</span><b>' + esc(kv[1]) + '</b></div>';
     }).join('');
 
+    var dev = devDetails();
     var foot = '';
-    if (e.status === 'done') {
+    if (e.status === 'done' && !dev) {
       // Either half can be missing without the other being worth hiding.
+      // The last two appear only when they are not the default, so an
+      // ordinary run still reads as one quiet line and an unusual one
+      // announces itself where the result is read rather than in Settings.
       foot = [
         e.model ? esc(e.model) : '',
         typeof e.confidence === 'number' ? Math.round(e.confidence * 100) + '% confident'
-          : e.status === 'done' ? 'confidence not reported' : '',
+          : 'confidence not reported',
         e.ms ? Math.round(e.ms / 1000) + 's' : '',
-        e.msFirst ? Math.round(e.msFirst / 1000) + 's before first word' : ''
+        e.msFirst ? Math.round(e.msFirst / 1000) + 's before first word' : '',
+        e.grammar === 'json' ? '<span class="efact warn">no grammar</span>' : '',
+        (e.parse && e.parse !== 'as-is')
+          ? '<span class="efact warn">' + esc(e.parse) + '</span>' : ''
       ].filter(Boolean).join(' · ');
     } else if (e.status === 'failed') {
       foot = 'Could not enrich this entry' + (e.error ? ' — ' + esc(e.error) : '');
@@ -2106,10 +2180,67 @@
       ? '<pre class="live-stream" id="liveStream" hidden></pre>' +
         '<button class="linkbtn act-stop-enrich" style="padding:6px 0;color:var(--muted)">Stop</button>'
       : '';
-    if (!body && !sugg && !foot && !stream) return '';
+    var run = dev ? runBlock(r) : '';
+    if (!body && !sugg && !foot && !stream && !run) return '';
     return '<div class="ereadout">' + body + sugg + stream +
       (foot ? '<div class="ereadout-foot' + (body || sugg ? '' : ' bare') + '"' +
-        (r.id === enrichingId ? ' id="liveFoot"' : '') + '>' + foot + '</div>' : '') + '</div>';
+        (r.id === enrichingId ? ' id="liveFoot"' : '') + '>' + foot + '</div>' : '') +
+      run + '</div>';
+  }
+
+  function devDetails() {
+    return localStorage.getItem('enrichDevDetails') === '1';
+  }
+
+  // The conditions a pass ran under, as opposed to what it produced. Three
+  // round trips were spent recovering facts the device knew at the time and
+  // never showed: whether the strict grammar was in force, which quantisation
+  // resolved, how badly the output had to be rescued. Each is one row here.
+  function runRows(e, withError) {
+    var rows = [];
+    if (e.model) rows.push(['model', e.model, '']);
+    if (e.grammar) {
+      rows.push(e.grammar === 'schema'
+        ? ['grammar', 'strict schema', '']
+        : ['grammar', 'none · output unconstrained', 'warn']);
+    }
+    if (e.parse) rows.push(['parsed', e.parse, e.parse === 'as-is' ? '' : 'warn']);
+    if (e.status === 'done') {
+      rows.push(typeof e.confidence === 'number'
+        ? ['confidence', Math.round(e.confidence * 100) + '% · ' + confidenceBand(e.confidence), '']
+        : ['confidence', 'not reported · treated as ' + confidenceBand(null), 'warn']);
+    }
+    if (e.ms) rows.push(['total', duration(e.ms), '']);
+    if (e.msFirst) rows.push(['first word', duration(e.msFirst), '']);
+    // On screen the failure is already spelled out in the sentence above
+    // these rows; in the copied report there is no sentence, so it goes in.
+    if (withError && e.status === 'failed' && e.error) rows.push(['error', e.error, 'bad']);
+    return rows;
+  }
+
+  // Tenths of a second are the right grain for a pass that takes half a
+  // minute and the wrong one for anything under a second, which rounds to a
+  // flat 0.0s and reads as a missing measurement rather than a fast one.
+  function duration(ms) {
+    return ms < 1000 ? ms + 'ms' : (ms / 1000).toFixed(1) + 's';
+  }
+
+  function runBlock(r) {
+    var e = r.enrichment;
+    if (e.status !== 'done' && e.status !== 'failed') return '';
+    var rows = runRows(e).map(function (kv) {
+      return '<div class="erun-row"><span>' + esc(kv[0]) + '</span>' +
+        '<b' + (kv[2] ? ' class="' + kv[2] + '"' : '') + '>' + esc(kv[1]) + '</b></div>';
+    }).join('');
+    // One tap in place of the three separate things there used to be to
+    // paste, and none of them ever the right one first time. It carries the
+    // entry's own text, which is the question whenever an extraction is
+    // wrong, so the button says so rather than leaving it to be discovered.
+    return '<div class="erun">' + rows +
+      '<div class="erun-foot">' +
+        '<button class="act-copy-run" type="button">Copy run + device</button>' +
+        '<em>includes this entry\u2019s text</em>' +
+      '</div></div>';
   }
 
   function render() {
@@ -2441,6 +2572,15 @@
     // Enrich straight from the list, without going through the editor —
     // triggering one entry is the main gesture now that nothing is automatic.
     if (e.target.closest('.act-stop-enrich')) { cancelEnrichment(); return; }
+    if (e.target.closest('.act-copy-run')) {
+      var target = all.find(function (r) { return r.id === id; });
+      if (target) {
+        runReport(target).then(function (text) {
+          copyText(text, 'Run and device state copied');
+        });
+      }
+      return;
+    }
     if (e.target.closest('.act-quick-enrich')) {
       var rec = all.find(function (r) { return r.id === id; });
       if (!rec) return;
@@ -2535,6 +2675,7 @@
     sel.value = chosenModel().key;
     $('enrichForceF32').checked = localStorage.getItem('enrichForceF32') === '1';
     $('enrichLooseJSON').checked = localStorage.getItem('enrichLooseJSON') === '1';
+    $('enrichDevDetails').checked = devDetails();
     // Changing the model does not reload it there and then — the next
     // extraction does, since that is when a big download is least surprising.
     // Changing the model, or the 16/32-bit choice, means different weights
@@ -2675,6 +2816,62 @@
         ].join('\n');
       });
     });
+  }
+
+  // The single paste. There used to be three separate things to copy — the
+  // failure toast, the diagnostics blob, the self-test report — and no way to
+  // know which one answered the question before asking it. This is one pass
+  // and the device it ran on together, which is the pair a run is diagnosable
+  // against. It carries the entry's own text, because a wrong extraction is a
+  // question about the note; the button says so before you press it.
+  function runReport(rec) {
+    var e = rec.enrichment;
+    var lines = ['--- le log / enrichment run ---'];
+    function row(k, v) { lines.push(selfTestPad(k) + v); }
+
+    row('entry', rec.id + ' \u00b7 captured ' + rec.capturedAt);
+    row('note', JSON.stringify(rec.raw));
+    if (rec.hints && rec.hints.length) row('hints', rec.hints.join(' ; '));
+    row('status', e.status + (e.at ? ' at ' + e.at : ''));
+    runRows(e, true).forEach(function (kv) { row(kv[0], kv[1]); });
+    if (e.status === 'done') {
+      row('result', [
+        rec.type || 'no type',
+        rec.title ? '"' + rec.title + '"' : 'no title',
+        rec.rating ? rec.rating + '/5' : 'no rating',
+        rec.tags.length ? 'tags ' + rec.tags.join(', ') : 'no tags'
+      ].join(' \u00b7 '));
+      row('details', Object.keys(rec.details || {}).map(function (k) {
+        return k + '=' + rec.details[k];
+      }).join(' ') || 'none');
+      if (e.suggestion) row('withheld', JSON.stringify(e.suggestion).slice(0, 300));
+    }
+
+    return diagnostics().then(function (d) {
+      return lines.join('\n') + '\n\n--- device ---\n' + d;
+    });
+  }
+
+  // The Settings report has a textarea on screen to fall back to; an entry in
+  // the list does not, so this makes one and throws it away.
+  function copyText(text, ok) {
+    function manual() {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+      document.body.appendChild(ta);
+      ta.select();
+      var copied = false;
+      try { copied = document.execCommand('copy'); } catch (err) { copied = false; }
+      document.body.removeChild(ta);
+      toast(copied ? ok : 'Could not copy');
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { toast(ok); }, manual);
+    } else {
+      manual();
+    }
   }
 
   // ---------- self-test ----------
@@ -2926,6 +3123,14 @@
 
   $('diagBtn').onclick = function () {
     diagnostics().then(function (text) { copyReport(text, 'Diagnostics copied'); });
+  };
+
+  $('enrichDevDetails').onchange = function () {
+    if (this.checked) localStorage.setItem('enrichDevDetails', '1');
+    else localStorage.removeItem('enrichDevDetails');
+    // Every readout on screen changes shape, so the list has to be redrawn
+    // rather than waiting for whatever would have redrawn it next.
+    render();
   };
 
   $('enrichLooseJSON').onchange = function () {

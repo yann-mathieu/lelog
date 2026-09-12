@@ -58,7 +58,8 @@ V2_KEYS = {
 OPTIONAL_KEYS = {"deletedAt"}
 
 # The enrichment sub-object's own keys, from newRecord() in index.html.
-ENRICHMENT_KEYS = {"status", "model", "at", "confidence", "needsReview", "suggestion", "error", "ms", "msFirst"}
+ENRICHMENT_KEYS = {"status", "model", "at", "confidence", "needsReview", "suggestion",
+                   "error", "ms", "msFirst", "grammar", "parse"}
 
 
 # ---------- server ----------
@@ -203,7 +204,8 @@ def test_capture_writes_the_full_v2_schema(page, base_url):
     # Everything the model will later fill is present but empty, never absent.
     assert rec["enrichment"] == {
         "status": "pending", "model": None, "at": None, "confidence": None,
-        "needsReview": False, "suggestion": None, "error": None, "ms": None, "msFirst": None
+        "needsReview": False, "suggestion": None, "error": None, "ms": None,
+        "msFirst": None, "grammar": None, "parse": None
     }
     assert (rec["type"], rec["title"], rec["occurredAt"], rec["rating"]) == \
         (None, None, None, None)
@@ -3402,6 +3404,136 @@ def test_a_queued_entry_waits_for_the_self_test(page, base_url):
 
     rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
     assert rec["title"] == "Dune", "the queue was stranded by the self-test"
+
+
+# ---------- the conditions a run happened under ----------
+#
+# Three round trips were spent recovering facts the device knew at the time
+# and never recorded: whether the strict grammar was in force, which
+# quantisation resolved, how badly the output had to be rescued. A result
+# without its conditions cannot be diagnosed, so every pass now keeps them.
+
+
+def open_entry(page, index=0):
+    """Tap an entry to open the readout, which is where the run is shown."""
+    page.locator(".entry .raw").nth(index).click()
+    page.wait_for_selector(".ereadout")
+
+
+def dev_details(page):
+    page.add_init_script("localStorage.setItem('enrichDevDetails', '1');")
+
+
+@test
+def test_a_run_records_the_conditions_it_ran_under(page, base_url):
+    """The strict grammar and the parse stage are both decided inside the
+    real model path and were both discarded the moment a pass succeeded."""
+    stub_model_layer(page)
+
+    boot(page, base_url)
+    capture(page, "finished dune")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+    assert rec["enrichment"]["grammar"] == "schema", rec["enrichment"]
+    assert rec["enrichment"]["parse"] == "as-is", rec["enrichment"]
+
+
+@test
+def test_a_run_without_the_strict_grammar_says_so(page, base_url):
+    """The setting that caused every symptom in this feature's worst week was
+    invisible everywhere results are read. One row, in warning colour."""
+    stub_model_layer(page)
+    page.add_init_script("localStorage.setItem('enrichLooseJSON', '1');")
+    dev_details(page)
+
+    boot(page, base_url)
+    capture(page, "finished dune")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+    assert rec["enrichment"]["grammar"] == "json", rec["enrichment"]
+
+    open_entry(page)
+    row = page.locator(".erun-row", has_text="grammar")
+    assert "unconstrained" in row.inner_text()
+    marked = row.locator("b").get_attribute("class") or ""
+    assert "warn" in marked, "an unconstrained run is not marked as unusual"
+
+
+@test
+def test_a_failed_run_keeps_its_conditions_too(page, base_url):
+    """A failure's conditions matter more than a success's, and a failed
+    record used to keep none of them — not the model, not how long it ran."""
+    stub_model_layer(page)
+    page.add_init_script(model_says(r"'not JSON at all, just prose'"))
+
+    boot(page, base_url)
+    capture(page, "a refusal")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "failed")
+    e = rec["enrichment"]
+    assert e["model"], f"a failed run recorded no model: {e}"
+    assert e["grammar"] == "schema", e
+    assert e["parse"] == "unusable", e
+    assert isinstance(e["ms"], int), e
+
+
+@test
+def test_the_run_is_hidden_until_you_ask_for_it(page, base_url):
+    """Reading an entry is the normal gesture; a wall of instrument readings
+    under every one of them is not. The rows are opt-in from Settings."""
+    stub_model_layer(page)
+
+    boot(page, base_url)
+    capture(page, "finished dune")
+    enrich(page)
+    wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+
+    open_entry(page)
+    assert page.locator(".erun-row").count() == 0
+    # But the compact line still carries the model and the confidence.
+    assert "Llama" in page.locator(".ereadout-foot").inner_text()
+
+    # Turning it on redraws the list, so the entry already open gains the
+    # rows in place rather than needing to be opened again.
+    open_sheet(page)
+    page.check("#enrichDevDetails")
+    close_sheet(page)
+    page.wait_for_selector(".erun-row")
+    labels = page.locator(".erun-row span").all_inner_texts()
+    assert {"model", "grammar", "parsed", "confidence"} <= set(labels), labels
+
+
+@test
+def test_copying_a_run_carries_the_device_with_it(page, base_url):
+    """There used to be three separate things to paste and no way to know
+    which one answered the question. This is the pair that always does."""
+    stub_model_layer(page)
+    dev_details(page)
+    page.add_init_script("""
+        window.__COPIED__ = null;
+        navigator.clipboard.writeText = t => { window.__COPIED__ = t; return Promise.resolve(); };
+    """)
+
+    boot(page, base_url)
+    capture(page, "dinner at le servan")
+    enrich(page)
+    wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+
+    open_entry(page)
+    page.click(".act-copy-run")
+    page.wait_for_function("() => window.__COPIED__")
+    text = page.evaluate("() => window.__COPIED__")
+
+    # The run.
+    assert "dinner at le servan" in text, text
+    assert "grammar" in text and "schema" in text
+    assert "parsed" in text
+    # And the device it ran on, without a second trip to Settings.
+    assert "--- device ---" in text, text
+    assert "looseJSON=" in text and "shader-f16" in text
 
 
 @test

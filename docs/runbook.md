@@ -44,7 +44,7 @@ itself needs no dependencies at all.
 ## Three things you can run
 
 ```bash
-# 106 tests. Offline, stubbed Dropbox, no GPU, no weights. ~6 minutes.
+# 112 tests. Offline, stubbed Dropbox, no GPU, no weights. ~6 minutes.
 ~/.venvs/lelog/bin/python test/smoke.py
 ~/.venvs/lelog/bin/python test/smoke.py search   # just matching names
 ```
@@ -69,6 +69,48 @@ the reported failures have actually been.
 Other flags: `--headless`, `--loose` (skip the strict JSON grammar),
 `--channel bundled`, `--timeout`, `--profile`. Model keys are `smol-360m`,
 `llama-1b`, `qwen-0.5b`, `qwen-1.5b`.
+
+---
+
+## When one entry came out wrong
+
+The self-test answers *does the model work here*. It does not answer *why did
+this entry come out like that* — that needs the conditions **that** pass ran
+under, which are now kept on the record itself.
+
+Turn on **Settings → Enrichment → Show the full run on each entry**, then tap
+the entry. Under the extracted fields you get:
+
+```
+model       Llama-3.2-1B-Instruct-q4f32_1-MLC
+grammar     none · output unconstrained
+parsed      salvaged from broken JSON
+confidence  not reported · treated as medium
+total       27.4s
+first word  15.2s
+```
+
+Anything in amber was not the default, and is the first thing to look at:
+
+| Row | What amber means |
+|---|---|
+| `grammar` | The strict schema was skipped. The model may return anything, including a key that is not in the schema at all, and a whole pass can be lost to it. |
+| `parsed` | The output did not parse cleanly. `repaired` is ordinary; `salvaged from broken JSON` means fields were pulled out of a broken document; `degenerate` means the model looped instead of answering. |
+| `confidence` | The model did not rate itself. Treated as medium and applied, deliberately — but under the strict grammar this **cannot** happen, because `confidence` is a required property. If you see it, the grammar was not in force. |
+
+`model` carries the quantisation: `q4f16_1` is the 16-bit build, `q4f32_1`
+the 32-bit one, which is roughly twice the download and slower. You get f32
+either by ticking *Use the 32-bit build* or because the GPU does not report
+`shader-f16` — the row cannot tell you which, and `Copy diagnostics` can.
+
+**Copy run + device** puts that run and the whole diagnostics blob on the
+clipboard in one go. It includes the entry's own text, because a wrong
+extraction is a question about the note; the button says so next to it. This
+is the paste to send when a specific entry came out wrong — unlike the
+self-test, it needs no model download.
+
+Conditions are recorded per pass, so an old entry reports what it actually
+ran under rather than today's settings.
 
 ---
 
