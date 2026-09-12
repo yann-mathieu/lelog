@@ -13,9 +13,10 @@ in.
     python3 test/live.py --model qwen-1.5b --f32
     python3 test/live.py --url https://yann-mathieu.github.io/lelog/
 
-The browser profile is kept between runs (see --profile), so the model is
-downloaded once and every later run starts from cache. Delete that directory
-to test a cold download.
+The browser profile is kept between runs (see --profile) and the port is
+fixed (see --port), so the model is downloaded once and every later run starts
+from cache. Both matter: the Cache API is keyed by origin, and the port is
+part of the origin. Delete the profile directory to test a cold download.
 
 Read two lines of the report before anything else:
 
@@ -49,9 +50,25 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a):
         pass  # the report is the output; access logs bury it
 
+    def end_headers(self):
+        # Never let the browser reuse a previous run's copy. The origin is
+        # stable now and the profile persists, so without this a run serves the
+        # index.html it cached earlier: one reported a stale APP_VERSION and
+        # tested a schema that was no longer on disk, which looks exactly like
+        # a fix that did not work.
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        super().end_headers()
 
-def serve(root):
-    """Serve the repo on an ephemeral port. IndexedDB needs a real origin."""
+
+DEFAULT_PORT = 8787
+
+
+def serve(root, port=DEFAULT_PORT):
+    """Serve the repo on a fixed port. IndexedDB needs a real origin — and the
+    port is part of that origin, so an ephemeral one gave every run a fresh,
+    empty Cache and re-downloaded the weights. That is what the profile being
+    kept between runs was supposed to avoid, and it is how three runs in ten
+    minutes walked into Hugging Face's rate limiter."""
     handler = functools.partial(Handler, directory=root)
 
     class Quiet(socketserver.TCPServer):
@@ -60,9 +77,22 @@ def serve(root):
         def handle_error(self, *a):
             pass
 
-    srv = Quiet(("127.0.0.1", 0), handler)
+    try:
+        srv = Quiet(("127.0.0.1", port), handler)
+    except OSError as e:
+        # Falling back keeps the run working, but say so: this run starts from
+        # an empty cache and will download the weights again.
+        print(f"port {port} is taken ({e}); using an ephemeral one, so this "
+              f"run is a different origin and re-downloads the weights.",
+              file=sys.stderr)
+        srv = Quiet(("127.0.0.1", 0), handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return srv, f"http://127.0.0.1:{srv.server_address[1]}/index.html"
+    # A unique query per run, because Chrome served index.html straight from
+    # its disk cache without revalidating — heuristic freshness on a response
+    # that carried no cache headers. Same origin, so the downloaded weights in
+    # the Cache API still survive; only the shell is forced to be current.
+    return srv, (f"http://127.0.0.1:{srv.server_address[1]}/index.html"
+                 f"?run={int(time.time())}")
 
 
 def main():
@@ -76,6 +106,9 @@ def main():
     ap.add_argument("--loose", action="store_true", help="skip the strict JSON grammar")
     ap.add_argument("--channel", default="chrome",
                     help="browser channel; 'bundled' uses Playwright's Chromium")
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT,
+                    help=f"port to serve on (default {DEFAULT_PORT}); it is part "
+                         f"of the origin, so changing it empties the model cache")
     ap.add_argument("--timeout", type=int, default=1200,
                     help="seconds to wait for the report (default 1200)")
     args = ap.parse_args()
@@ -84,7 +117,7 @@ def main():
     if args.url:
         url = args.url
     else:
-        srv, url = serve(ROOT)
+        srv, url = serve(ROOT, args.port)
 
     prefs = []
     if args.model:
@@ -103,7 +136,13 @@ def main():
     os.makedirs(args.profile, exist_ok=True)
 
     with sync_playwright() as p:
-        launch = dict(user_data_dir=args.profile, headless=args.headless, args=flags)
+        # Service workers blocked: this tool must run the checkout, not a shell
+        # a previous run cached. With the port fixed the origin is stable, so a
+        # registered worker persists between runs and will happily serve the
+        # old index.html — a run that reported a stale APP_VERSION and silently
+        # tested code that was no longer on disk.
+        launch = dict(user_data_dir=args.profile, headless=args.headless,
+                      args=flags, service_workers="block")
         if args.channel != "bundled":
             launch["channel"] = args.channel
         try:
@@ -117,6 +156,20 @@ def main():
             ctx = p.chromium.launch_persistent_context(**launch)
 
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
+
+        # The report names the step that failed; these name the URL or the line
+        # that did it. The engine step fetches hundreds of files, and "Request
+        # failed" on its own has cost more than one debugging session.
+        page.on("requestfailed", lambda r: print(
+            "  ! failed   %s  %s" % (r.failure, r.url[:150]),
+            file=sys.stderr, flush=True))
+        page.on("response", lambda r: r.status >= 400 and print(
+            "  ! http %s  %s" % (r.status, r.url[:150]),
+            file=sys.stderr, flush=True))
+        page.on("pageerror", lambda e: print(
+            "  ! page    %s" % str(e)[:300], file=sys.stderr, flush=True))
+        page.on("console", lambda m: m.type == "error" and print(
+            "  ! console %s" % m.text[:300], file=sys.stderr, flush=True))
         page.add_init_script("\n".join(prefs))
         page.goto(url)
         page.wait_for_selector("#list")
@@ -128,14 +181,24 @@ def main():
 
         # Printed as it grows rather than at the end, so a long download or a
         # hung step is visible while it is happening.
-        shown, deadline = 0, time.time() + args.timeout
+        # Diffed by content rather than by line count, because the report's
+        # last line is volatile: a progress tick is rendered as a line that is
+        # not part of the report yet, so the next real line reuses its index.
+        # Counting lost the one line that matters — "verdict FAILED AT <step>"
+        # landed on a spent tick's index and was never printed — and froze the
+        # engine's progress at whatever percentage arrived first.
+        emitted, deadline = [], time.time() + args.timeout
         report = ""
         while time.time() < deadline:
             report = page.input_value("#diagOut")
             lines = report.split("\n")
-            for line in lines[shown:]:
-                print(line, flush=True)
-            shown = len(lines)
+            for i, line in enumerate(lines):
+                if i >= len(emitted):
+                    print(line, flush=True)
+                    emitted.append(line)
+                elif emitted[i] != line:
+                    print(line, flush=True)
+                    emitted[i] = line
             if report.startswith("verdict") or "\nverdict" in report:
                 break
             page.wait_for_timeout(500)
