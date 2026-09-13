@@ -1646,11 +1646,40 @@
       .catch(function () { return null; });
   }
 
+  // Chrome can take the GPU device away mid-life: Android reclaiming memory,
+  // a driver reset, the tab backgrounded long enough. Dawn reports it as "A
+  // valid external Instance reference no longer exists" (its
+  // DeviceLostEvent::Complete path), and TVM's own device.lost handler
+  // responds by disposing the instance — so every later call lands on a dead
+  // handle. None of those words are "device lost", which is why this arrived
+  // as a bare Dawn string with no diagnosis at all.
+  function isDeviceLost(msg) {
+    return /valid external instance|instance reference no longer|device (was )?lost/i.test(msg);
+  }
+
+  // The engine is cached for the life of the page and was only ever discarded
+  // when *creation* failed, so one device loss broke enrichment until the page
+  // was reloaded — which nobody would think to do. WebLLM's own guidance for
+  // a lost device is to create the engine again, and that is cheap here: the
+  // weights are already in the Cache API, so the rebuild downloads nothing.
+  function discardEnrichEngine() {
+    enrichEngine = null;
+    enrichEngineInstance = null;
+    loadedModelKey = null;
+  }
+
   function diagnoseModelLoad(err) {
     var msg = errorText(err);
+    if (isDeviceLost(msg)) {
+      return Promise.resolve(' Chrome took the GPU device back — usually Android'
+        + ' reclaiming memory, or the tab left in the background too long. Not your'
+        + ' note and not the model. The dead engine has been thrown away, so pressing'
+        + ' Enrich again rebuilds it from the weights already on this device, without'
+        + ' downloading anything.');
+    }
     // A driver that refuses to compile the model's shaders has nothing to do
     // with the download, and probing hosts would say something misleading.
-    if (/vk_|vulkan|dawn|pipeline|shader|device lost|out of memory/i.test(msg)) {
+    if (/vk_|vulkan|dawn|pipeline|shader|out of memory/i.test(msg)) {
       var f32 = localStorage.getItem('enrichForceF32') === '1';
       return Promise.resolve(' Your GPU driver refused to build the model'
         + (enrichModelId ? ' (' + enrichModelId + ')' : '')
@@ -1980,6 +2009,7 @@
   function markEnrichmentFailed(rec, err) {
     var now = new Date().toISOString();
     console.error('enrichment failed for', rec.id, err);
+    if (isDeviceLost(errorText(err))) discardEnrichEngine();
     // The same diagnosis Settings does. It used to run only there, so a
     // failure triggered from an entry — which is now the only way anyone
     // triggers one — arrived as a bare message naming no host and no cause.
@@ -2048,7 +2078,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-6';
+  var APP_VERSION = 'log-v3-7';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -3060,6 +3090,10 @@
       say('verdict', 'PASS');
       return lines.join('\n');
     }).catch(function (e) {
+      // A lost device strands the cached engine here exactly as it does on a
+      // real pass, and a self-test that left it stranded would report the
+      // same failure for ever however many times you pressed it.
+      if (isDeviceLost(errorText(e))) discardEnrichEngine();
       // The same host/driver diagnosis a real failure gets, since the point of
       // running this is to be told why, not to be told that.
       return withTimeout(diagnoseModelLoad(e), 30000, 'The diagnosis')

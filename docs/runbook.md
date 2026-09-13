@@ -44,7 +44,7 @@ itself needs no dependencies at all.
 ## Three things you can run
 
 ```bash
-# 112 tests. Offline, stubbed Dropbox, no GPU, no weights. ~6 minutes.
+# 115 tests. Offline, stubbed Dropbox, no GPU, no weights. ~6 minutes.
 ~/.venvs/lelog/bin/python test/smoke.py
 ~/.venvs/lelog/bin/python test/smoke.py search   # just matching names
 ```
@@ -170,6 +170,27 @@ verdict      PASS
 
 Otherwise `FAILED AT <step>`, with an `error` line carrying the driver or
 host diagnosis.
+
+---
+
+### When it says the GPU device is gone
+
+> Could not enrich this entry — A valid external Instance reference no longer exists.
+
+That is Chrome's WebGPU implementation (Dawn) reporting a **lost device**, not
+anything to do with the model or your note. Android reclaims GPU memory under
+pressure, and a tab left in the background long enough loses its device. TVM's
+own `device.lost` handler then disposes the instance, so every later call lands
+on a dead handle.
+
+The app now throws the dead engine away when this happens, so pressing
+**Enrich** again rebuilds it — from the weights already on the device, with no
+download. Before that fix the engine was cached for the life of the page and
+only ever discarded when *creation* failed, so one device loss broke enrichment
+until the page was reloaded, and nothing said so.
+
+If it happens repeatedly rather than once, the model is probably too big for
+the device's GPU memory: try a smaller one in Settings.
 
 ---
 

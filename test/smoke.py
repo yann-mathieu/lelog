@@ -3406,6 +3406,98 @@ def test_a_queued_entry_waits_for_the_self_test(page, base_url):
     assert rec["title"] == "Dune", "the queue was stranded by the self-test"
 
 
+# ---------- a lost GPU device ----------
+#
+# Chrome takes the device back under memory pressure. Dawn calls that "A valid
+# external Instance reference no longer exists" and TVM disposes itself, so
+# every later call hits a dead handle. The engine is cached for the life of the
+# page, so without this the first loss breaks enrichment until a page reload.
+
+DEVICE_LOST = "A valid external Instance reference no longer exists."
+
+
+def engine_that_dies_once(message):
+    """A module whose first engine generates once, then reports a lost device.
+
+    Counts creations, so a test can prove the dead engine was thrown away
+    rather than handed out again.
+    """
+    return """
+        window.__CREATED__ = 0;
+        const mk = window.__LELOG_TEST_WEBLLM__.CreateMLCEngine;
+        window.__LELOG_TEST_WEBLLM__.CreateMLCEngine = (id, opts) => {
+            const nth = ++window.__CREATED__;
+            return mk(id, opts).then(engine => {
+                if (nth === 1) {
+                    engine.chat.completions.create = () => Promise.reject(new Error(%s));
+                }
+                return engine;
+            });
+        };
+    """ % json.dumps(message)
+
+
+@test
+def test_a_lost_gpu_device_is_explained_not_pasted(page, base_url):
+    """Dawn's wording contains none of the words the diagnosis matched on, so
+    this arrived as a bare engine string with no explanation attached."""
+    stub_model_layer(page)
+    page.add_init_script(engine_that_dies_once(DEVICE_LOST))
+
+    boot(page, base_url)
+    capture(page, "the big short, on audio")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "failed")
+    err = rec["enrichment"]["error"]
+    assert "took the GPU device back" in err, err
+    # And it must not be diagnosed as a driver that refused to build shaders,
+    # which is a different failure with a different remedy.
+    assert "refused to build" not in err, err
+
+
+@test
+def test_a_lost_device_does_not_strand_the_engine(page, base_url):
+    """The engine was cached for the life of the page and only ever discarded
+    when creation failed. One device loss therefore broke enrichment until a
+    reload — and nothing in the app ever said so."""
+    stub_model_layer(page)
+    page.add_init_script(engine_that_dies_once(DEVICE_LOST))
+
+    boot(page, base_url)
+    capture(page, "the big short, on audio")
+    enrich(page)
+    wait_for_record(page, lambda r: r["enrichment"]["status"] == "failed")
+    assert page.evaluate("() => window.__CREATED__") == 1
+
+    # Pressing Enrich again must build a new engine, not hand back the dead one.
+    enrich(page)
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done",
+                          timeout=15000)
+    assert rec, "the second attempt never succeeded — the dead engine was handed back"
+    assert rec["type"] == "book", rec
+    assert page.evaluate("() => window.__CREATED__") == 2, \
+        "a second engine was never built, so the cache still held the dead one"
+
+
+@test
+def test_an_ordinary_failure_keeps_the_engine(page, base_url):
+    """Only a lost device justifies throwing away a loaded model. A model that
+    merely returned prose must not cost the next pass a reload."""
+    stub_model_layer(page)
+    page.add_init_script(engine_that_dies_once("not JSON, just prose"))
+
+    boot(page, base_url)
+    capture(page, "the big short, on audio")
+    enrich(page)
+    wait_for_record(page, lambda r: r["enrichment"]["status"] == "failed")
+
+    enrich(page)
+    wait_for_record(page, lambda r: r["enrichment"]["status"] == "done", timeout=15000)
+    assert page.evaluate("() => window.__CREATED__") == 1, \
+        "a loaded model was thrown away over a failure that had nothing to do with the GPU"
+
+
 # ---------- the conditions a run happened under ----------
 #
 # Three round trips were spent recovering facts the device knew at the time
