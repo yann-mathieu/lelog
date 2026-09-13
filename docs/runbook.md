@@ -240,8 +240,8 @@ it.
 
    **Zero tokens for the full cap means the grammar, not the model.**
    XGrammar throws on schema constructs it does not support — a union type
-   (`{ type: ['string', 'null'] }`) is one, `additionalProperties` on an
-   object is another — and web-llm compiles the grammar in a promise executor
+   (`{ type: ['string', 'null'] }`) is one — and web-llm compiles the grammar
+   in a promise executor
    with no `reject`, so the throw escapes as an unhandled error and the await
    never returns. There is nothing to catch. `--loose` generating fine while
    the default hangs is the tell. Write nullable as
@@ -304,13 +304,17 @@ fallback if it does not. Desktop turned out to be the mirror image: Chrome
 for it, and the app resolved the f32 build by itself. So the f16 path is
 still unexercised everywhere.
 
-**`details` comes back `{}` every time, and the grammar is why.** The schema
-declares `details: { type: 'object' }` with no properties, and xgrammar's
-strict mode forbids what the schema does not name — so `{}` is the only
-object the grammar will allow, while the prompt asks for keys it then
-forbids. The per-type `details` that phase 2 shipped cannot be filled while
-the grammar is on. Constraining it properly means a schema that depends on
-the type the model has not picked yet, which is a real design question.
+**`details` comes back `{}` every time, and the grammar is not why.** That
+was the first guess and it was wrong: `details: { type: 'object' }` compiles
+to xgrammar's `basic_object`, which permits `{"anyKey": anyValue, ...}`. The
+schema already allows free-form details. The model simply declines to fill
+them — `llama-1b` writes `"details": {}` with the keys available to it, on a
+note that plainly states a cuisine and a dish. So this is the prompt or the
+model, not the schema. The prompt names every type's keys in one dense line
+(`book author/genre/format; restaurant cuisine/...`), and a 1B model picking
+a type and then the right sub-list is evidently a step too far. Read the
+emitted grammar before blaming it — `Grammar.fromJSONSchema(...)` stringifies
+to the EBNF, and its wasm needs no weights and no GPU.
 
 **Small models classify confidently and wrongly.** `llama-1b` read a
 restaurant dinner as `type: book` and self-rated it 0.9, so it applies with

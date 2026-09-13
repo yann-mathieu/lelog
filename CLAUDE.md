@@ -172,9 +172,12 @@ not support, and WebLLM compiles the grammar in a promise executor with no
 promise that never settles. Zero tokens for the full 15-minute cap, nothing
 to catch, `completeWithFallback` useless. A union type
 (`{ type: ['string', 'null'] }`) did this; `anyOf` is the supported spelling
-and a test in `smoke.py` now rejects unions. The same strictness is why
-`details` always comes back `{}`: the schema names no properties, so the
-grammar permits no properties. Variants can be compiled in isolation — the
+and a test in `smoke.py` now rejects unions. Read the grammar it emits
+rather than reasoning about what strict mode ought to forbid: `details:
+{ type: 'object' }` looks restrictive and in fact compiles to
+`basic_object`, which allows any key — `details` comes back `{}` because the
+model declines to fill it, which is a prompt problem wearing a schema
+costume. Variants can be compiled in isolation — the
 xgrammar wasm is embedded in its npm package, so it needs no weights and no
 GPU, which is the cheapest real check in this whole feature.
 
