@@ -10,7 +10,7 @@ in.
 
     python3 test/live.py                 # real Chrome, visible window
     python3 test/live.py --headless      # no window (WebGPU may be absent)
-    python3 test/live.py --model qwen-1.5b --f32
+    python3 test/live.py --model qwen-1.5b
     python3 test/live.py --url https://yann-mathieu.github.io/lelog/
 
 The browser profile is kept between runs (see --profile) and the port is
@@ -102,7 +102,6 @@ def main():
     ap.add_argument("--profile", default=DEFAULT_PROFILE,
                     help=f"browser profile dir, kept between runs (default {DEFAULT_PROFILE})")
     ap.add_argument("--model", help="model key: smol-360m, llama-1b, qwen-0.5b, qwen-1.5b")
-    ap.add_argument("--f32", action="store_true", help="force the 32-bit build")
     ap.add_argument("--loose", action="store_true", help="skip the strict JSON grammar")
     ap.add_argument("--channel", default="chrome",
                     help="browser channel; 'bundled' uses Playwright's Chromium")
@@ -122,8 +121,6 @@ def main():
     prefs = []
     if args.model:
         prefs.append(f"localStorage.setItem('enrichModel', {args.model!r});")
-    prefs.append("localStorage.%s('enrichForceF32'%s);"
-                 % (("setItem", ", '1'") if args.f32 else ("removeItem", "")))
     prefs.append("localStorage.%s('enrichLooseJSON'%s);"
                  % (("setItem", ", '1'") if args.loose else ("removeItem", "")))
 

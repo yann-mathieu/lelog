@@ -15,9 +15,9 @@ Written 13 September 2026, at `log-v3-8`.
 | version | `log-v3-8` |
 | tests | 116 / 116 passing |
 | app | `index.html`, ~3,000 lines, no build step |
-| default model | `llama-1b` → `q4f16_1`, or `q4f32_1` where `shader-f16` is missing |
+| default model | `llama-1b` → `q4f32_1`, always — the 16-bit build is never used |
 | verified | `llama-1b` and `smol-360m` both run end to end on desktop Chrome + NVIDIA, f32 |
-| unverified | anything on the phone; the f16 build has never been run |
+| unverified | extraction quality on the phone; `details` has never come back filled |
 
 ---
 
@@ -53,7 +53,7 @@ itself needs no dependencies at all.
 ```bash
 # The real thing: your Chrome, your GPU, real weights, real model.
 ~/.venvs/lelog/bin/python test/live.py
-~/.venvs/lelog/bin/python test/live.py --model qwen-1.5b --f32
+~/.venvs/lelog/bin/python test/live.py --model qwen-1.5b
 ~/.venvs/lelog/bin/python test/live.py --url https://yann-mathieu.github.io/lelog/
 ```
 
@@ -107,10 +107,13 @@ Anything in amber was not the default, and is the first thing to look at:
 | `parsed` | The output did not parse cleanly. `repaired` is ordinary; `salvaged from broken JSON` means fields were pulled out of a broken document; `degenerate` means the model looped instead of answering. |
 | `confidence` | The model did not rate itself. Treated as medium and applied, deliberately — but under the strict grammar this **cannot** happen, because `confidence` is a required property. If you see it, the grammar was not in force. |
 
-`model` carries the quantisation: `q4f16_1` is the 16-bit build, `q4f32_1`
-the 32-bit one, which is roughly twice the download and slower. You get f32
-either by ticking *Use the 32-bit build* or because the GPU does not report
-`shader-f16` — the row cannot tell you which, and `Copy diagnostics` can.
+`model` always ends `q4f32_1` now. The app used to follow the adapter's
+`shader-f16` feature, with a Settings switch for drivers that advertise it
+and then fail — which a Qualcomm Adreno 7xx does, reporting `shader-f16 yes`
+and then killing `CreateComputePipelines` with `VK_ERROR_UNKNOWN`. The flag
+cannot be trusted and the switch only helped someone who already knew to
+reach for it, so the 32-bit build — bigger, slower, runs anywhere WebGPU
+does — is now the only one built.
 
 **Copy run + device** puts that run and the whole diagnostics blob on the
 clipboard in one go. It includes the entry's own text, because a wrong
@@ -131,7 +134,7 @@ report is safe to paste anywhere and comparable between two machines.
 ```
 webgpu       present
 gpu          qualcomm adreno-7xx
-shader-f16   yes · 19 features
+shader-f16   advertised (unused) · 19 features
 ```
 
 **Read those two first.** `absent` means the browser has no WebGPU and
@@ -140,15 +143,14 @@ to software rendering: it works, but f16 is gone and every timing below is
 fiction.
 
 ```
-16-bit build Llama-3.2-1B-Instruct-q4f16_1-MLC · on this device
-32-bit build Llama-3.2-1B-Instruct-q4f32_1-MLC · not downloaded
-resolved     Llama-3.2-1B-Instruct-q4f16_1-MLC
+on disk      Llama-3.2-1B-Instruct-q4f32_1-MLC · on this device
+resolved     Llama-3.2-1B-Instruct-q4f32_1-MLC
 ```
 
-**Both builds, deliberately.** Flipping the 32-bit switch in Settings
-resolves a *different model id*, so a model that has just run perfectly can
-truthfully report itself uncached. That looked like a bug for a week; these
-three lines are the answer to it.
+This used to report *both* quantisations, because the 16/32-bit switch
+resolved a different model id and a model that had just run perfectly could
+truthfully report itself uncached — which looked like a bug for a week. With
+the switch gone there is one id, and it is named outright.
 
 ```
 prompt       528 chars · 12 known tags · strict JSON grammar
@@ -222,7 +224,8 @@ it.
 5. **`engine`** — *the interesting one.* Either the download fell over
    (retried once automatically) or the driver refused to compile the shaders.
    The error text says which: anything naming `VK_`, Vulkan, Dawn, pipeline
-   or shader is the driver, and the 32-bit build is the thing to try;
+   or shader is the driver, and since this is already the 32-bit build the
+   lever is a smaller model, not the quantisation;
    anything naming fetch, cache or network is the download, and the report
    already names the host that refused.
 
@@ -296,13 +299,13 @@ a second pass overwrites `type`, `title`, `tags`, `rating` and `details` for
 any field not in `userEdited`, but a field the new pass simply omits keeps
 its old value. That is an accident of the implementation, not a choice.
 
-**Is the phone's f16 claim honest?** Android drivers advertise `shader-f16`
-and then fail to compile it. The self-test prints the claim and the outcome
-in the same report, so one run on the phone settles it — and `--f32` is the
-fallback if it does not. Desktop turned out to be the mirror image: Chrome
-137 on Linux reports `shader-f16 no` on a Quadro T1000 that has the hardware
-for it, and the app resolved the f32 build by itself. So the f16 path is
-still unexercised everywhere.
+**Settled: the phone's f16 claim is a lie.** A Qualcomm Adreno 7xx on
+Android 10 reports `shader-f16 yes` and then fails
+`CreateComputePipelines` with `VK_ERROR_UNKNOWN`. Desktop was the mirror
+image — Chrome 137 on Linux reports `shader-f16 no` on a Quadro T1000 that
+has the hardware. The flag was wrong in both directions, so the app stopped
+reading it: every build is `q4f32_1`. Diagnostics still prints the claim,
+marked `(unused)`, because it is a fact about the device and not a lever.
 
 **`details` comes back `{}` every time, and the grammar is not why.** That
 was the first guess and it was wrong: `details: { type: 'object' }` compiles

@@ -2978,17 +2978,21 @@ def test_model_load_progress_reaches_an_entry_trigger(page, base_url):
 
 
 @test
-def test_the_quantisation_follows_the_adapter(page, base_url):
-    """A driver without shader-f16 must get the 32-bit build, and this is the
-    decision that took a week of round trips to get right."""
-    stub_model_layer(page, f16=False)
+def test_the_32_bit_build_is_used_even_when_f16_is_advertised(page, base_url):
+    """The feature flag cannot be trusted. A Qualcomm Adreno 7xx reports
+    `shader-f16 yes` and then kills CreateComputePipelines with
+    VK_ERROR_UNKNOWN, so the adapter no longer gets a vote — and the Settings
+    escape hatch that used to cover this only helped someone who already knew
+    to reach for it."""
+    stub_model_layer(page, f16=True)   # the adapter says yes, and is wrong
 
     boot(page, base_url)
-    capture(page, "no f16 here")
+    capture(page, "either way, 32-bit")
     enrich(page)
     wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
 
-    assert page.evaluate("() => window.__LELOG_SEEN_MODEL__").endswith("q4f32_1-MLC")
+    seen = page.evaluate("() => window.__LELOG_SEEN_MODEL__")
+    assert seen.endswith("q4f32_1-MLC"), f"resolved {seen} on an adapter claiming f16"
 
 
 @test
@@ -3271,7 +3275,10 @@ def test_diagnostics_gathers_the_whole_picture(page, base_url):
                   "settings", "entries", "last timing", "last error"]:
         assert field in text, f"diagnostics omitted {field}"
     assert "testgpu" in text, "the GPU is not named"
-    assert "yes" in text.split("shader-f16")[1][:10]
+    # Reported as a device fact, and marked unused: this is the line that
+    # sent a debugging session after the wrong lever.
+    assert "advertised (unused)" in text.split("shader-f16")[1][:40], text
+    assert "forceF32" not in text, "a removed setting is still being reported"
 
 
 # ---------- the self-test ----------
@@ -3304,8 +3311,8 @@ def test_self_test_walks_the_whole_real_path(page, base_url):
     report = run_self_test(page)
 
     for label in ["version", "ua", "screen", "storage", "webgpu", "gpu",
-                  "shader-f16", "choice", "module", "16-bit build",
-                  "32-bit build", "resolved", "engine", "prompt",
+                  "shader-f16", "choice", "module", "on disk",
+                  "resolved", "engine", "prompt",
                   "first token", "finished", "output", "parse", "result",
                   "details", "verdict"]:
         assert label in report, f"the self-test never reported {label}\n{report}"
@@ -3334,14 +3341,15 @@ def test_self_test_names_the_step_that_failed(page, base_url):
     # The driver diagnosis rides along, and the steps before it still
     # reported — a failure with no context is what we already had.
     assert "GPU driver refused" in report, report
-    assert "shader-f16" in report and "16-bit build" in report, report
+    assert "shader-f16" in report and "on disk" in report, report
 
 
 @test
-def test_self_test_reports_both_builds_separately(page, base_url):
-    """The question that took a week: a model which had just run successfully
-    reporting itself uncached, because flipping the 16/32-bit switch resolves
-    a different model id and therefore a different download."""
+def test_self_test_names_the_build_it_checked_on_disk(page, base_url):
+    """This used to report both quantisations, because the 16/32-bit switch
+    resolved a different model id and a model that had just run could
+    truthfully report itself uncached. With the switch gone there is one id,
+    and the report must name it rather than leave it to be inferred."""
     stub_model_layer(page)
     page.add_init_script("""
         window.__LELOG_TEST_WEBLLM__.hasModelInCache =
@@ -3351,10 +3359,9 @@ def test_self_test_reports_both_builds_separately(page, base_url):
 
     report = run_self_test(page)
 
-    f16 = next(l for l in report.split("\n") if l.startswith("16-bit build"))
-    f32 = next(l for l in report.split("\n") if l.startswith("32-bit build"))
-    assert "q4f16_1" in f16 and "not downloaded" in f16, f16
-    assert "q4f32_1" in f32 and "on this device" in f32, f32
+    line = next(l for l in report.split("\n") if l.startswith("on disk"))
+    assert "q4f32_1" in line and "on this device" in line, line
+    assert "q4f16_1" not in report, "a build the app never uses is still reported"
 
 
 @test

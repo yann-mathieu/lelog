@@ -128,8 +128,7 @@ not exist. Probes use simple requests only; a test asserts it.
 **Ask for the self-test report first.** Settings → Enrichment → *Run
 self-test* drives the whole real path once on a fixed sample sentence and
 reports every step in order: environment and storage, adapter and
-`shader-f16`, which model id resolved, whether **each** quantisation is on
-disk, module and engine load times, prompt size, time to first token,
+`shader-f16`, which model id resolved, whether it is on disk, module and engine load times, prompt size, time to first token,
 throughput, the model's output verbatim, how that output had to be parsed,
 and the validated result. A failure names the step it failed at. That is one
 paste in place of the dozen round trips this feature actually cost, and it is
@@ -158,6 +157,16 @@ and whether it is cached, the settings in force, entry counts, last timing
 and last error. Ask for it when the question is about accumulated state; ask
 for the self-test when the question is about the model. If a report arrives
 without either, ask before theorising.
+
+**The `shader-f16` flag is not to be trusted, in either direction.** A
+Qualcomm Adreno 7xx on Android 10 advertises it and then fails
+`CreateComputePipelines` with `VK_ERROR_UNKNOWN`; Chrome 137 on Linux denies
+it on a Quadro T1000 that has the hardware. The app therefore stopped reading
+it and builds `q4f32_1` always — bigger and slower, and it runs anywhere
+WebGPU does. There is no 16/32-bit setting: the escape hatch that used to
+cover this only helped someone who already knew to reach for it, and the one
+person who needed it had to be told. Diagnostics still reports the claim,
+marked `(unused)`, because it is a fact about the device rather than a lever.
 
 **A phone is not the only device.** Desktop Chrome has real WebGPU and a much
 faster GPU, and the app is the same URL with the same Dropbox sync. Running
@@ -203,7 +212,7 @@ prints the report line by line as it fills in. Exit status is 0 on `PASS`.
 ```bash
 python3 test/live.py                    # visible window, real Chrome
 python3 test/live.py --headless
-python3 test/live.py --model qwen-1.5b --f32
+python3 test/live.py --model qwen-1.5b
 python3 test/live.py --url https://yann-mathieu.github.io/lelog/
 ```
 

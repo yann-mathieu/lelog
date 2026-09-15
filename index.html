@@ -380,10 +380,6 @@
     <p id="enrichNote">On-device AI fills in type, title, tags and details. Nothing runs on its own and nothing leaves your phone — enrich an entry from its row when you want it.</p>
     <select id="enrichModelSel" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);font:inherit;font-size:14px;padding:10px 12px;border-radius:11px;outline:none;margin-bottom:10px"></select>
     <label style="display:flex;gap:9px;align-items:flex-start;font-size:13.5px;color:var(--muted);margin-bottom:10px">
-      <input type="checkbox" style="margin-top:3px;flex:0 0 auto" id="enrichForceF32">
-      Use the 32-bit build — try this if loading fails on a driver that claims 16-bit support
-    </label>
-    <label style="display:flex;gap:9px;align-items:flex-start;font-size:13.5px;color:var(--muted);margin-bottom:10px">
       <input type="checkbox" style="margin-top:3px;flex:0 0 auto" id="enrichLooseJSON">
       Skip the strict output format — starts faster, but a small model can then wander off and waste the whole pass
     </label>
@@ -1550,14 +1546,18 @@
       if (!adapter) throw new Error('WebGPU is present but no GPU adapter is available on this device.');
       enrichAdapter = describeAdapter(adapter);
       var model = chosenModel();
-      // Some mobile drivers advertise shader-f16 and then fail to compile
-      // f16 shaders, so the choice can be overridden in Settings.
-      var f16 = localStorage.getItem('enrichForceF32') !== '1'
-        && !!(adapter.features && adapter.features.has('shader-f16'));
-      enrichModelId = f16 ? model.f16 : (model.f32 || null);
+      // Always the 32-bit build. This used to follow the adapter's
+      // shader-f16 feature, with a Settings escape hatch for drivers that
+      // advertise it and then fail — and a Qualcomm Adreno 7xx does exactly
+      // that: `shader-f16 yes`, then CreateComputePipelines dies with
+      // VK_ERROR_UNKNOWN. The feature flag cannot be trusted, and the escape
+      // hatch only worked for someone who already knew to reach for it. The
+      // 32-bit build is bigger and slower and it runs anywhere WebGPU does,
+      // which is the trade this feature should have been making all along.
+      enrichModelId = model.f32 || model.f16 || null;
       if (!enrichModelId) {
-        throw new Error(model.label.split(' —')[0] + ' needs the WebGPU shader-f16 feature, which this'
-          + ' device does not have. Pick a different model in Settings.');
+        throw new Error(model.label.split(' —')[0] + ' has no build this app can run.'
+          + ' Pick a different model in Settings.');
       }
       return loadWebLLM();
     }).then(function (webllm) {
@@ -1680,15 +1680,12 @@
     // A driver that refuses to compile the model's shaders has nothing to do
     // with the download, and probing hosts would say something misleading.
     if (/vk_|vulkan|dawn|pipeline|shader|out of memory/i.test(msg)) {
-      var f32 = localStorage.getItem('enrichForceF32') === '1';
       return Promise.resolve(' Your GPU driver refused to build the model'
         + (enrichModelId ? ' (' + enrichModelId + ')' : '')
         + (enrichAdapter ? ' on ' + enrichAdapter : '')
-        + ', not a download problem — the model arrived fine.'
-        + (f32 ? ' A 32-bit build failed too, so this driver cannot run these'
-               + ' shaders at all and no model choice here will change that.'
-               : ' Some drivers claim 16-bit shader support and then fail to'
-               + ' compile it — try the 32-bit option in Settings.'));
+        + ', not a download problem — the model arrived fine. This is already the'
+        + ' 32-bit build, which is the most compatible one there is, so the'
+        + ' quantisation is not the lever — a smaller model in Settings is.');
     }
     if (!/cache|fetch|network|load model|failed to/i.test(msg)) return Promise.resolve('');
     var rec = modelRecord();
@@ -2084,7 +2081,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-8';
+  var APP_VERSION = 'log-v3-9';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -2709,7 +2706,6 @@
       });
     }
     sel.value = chosenModel().key;
-    $('enrichForceF32').checked = localStorage.getItem('enrichForceF32') === '1';
     $('enrichLooseJSON').checked = localStorage.getItem('enrichLooseJSON') === '1';
     $('enrichDevDetails').checked = devDetails();
     // Changing the model does not reload it there and then — the next
@@ -2804,12 +2800,10 @@
     refreshEnrichUI();
   };
 
-  $('enrichForceF32').onchange = function () {
-    if (this.checked) localStorage.setItem('enrichForceF32', '1');
-    else localStorage.removeItem('enrichForceF32');
-    enrichEngine = null;
-    $('enrichError').hidden = true;
-  };
+  // The 32-bit choice used to live here. A stale flag from before it was
+  // removed would do nothing, but it would still show up in a pasted
+  // diagnostics blob and invite a wrong reading, so it is cleared on load.
+  try { localStorage.removeItem('enrichForceF32'); } catch (e) {}
 
   // Everything a session working on this app would otherwise have to extract
   // from someone one question at a time, over one round trip each. If the
@@ -2836,14 +2830,16 @@
           'ua           ' + navigator.userAgent,
           'webgpu       ' + gpu + (adapter ? ', adapter ok' : ', no adapter'),
           'gpu          ' + (adapter ? (describeAdapter(adapter) || 'unnamed') : '—'),
+          // Reported because it is a fact about the device, flagged because
+          // it is a fact that lies: this is the line that sent a debugging
+          // session after the wrong lever. Nothing reads it any more.
           'shader-f16   ' + (adapter && adapter.features
-            ? (adapter.features.has('shader-f16') ? 'yes' : 'no') : '—'),
+            ? (adapter.features.has('shader-f16') ? 'advertised (unused)' : 'no') : '—'),
           'model        ' + chosenModel().key + ' → ' + (enrichModelId || 'not resolved yet'),
           'model state  ' + (loadedModelKey === chosenModel().key ? 'loaded in this session'
             : cached === true ? 'downloaded, not loaded'
             : cached === false ? 'not downloaded' : 'unknown'),
           'settings     enrichment=' + (enrichmentEnabled() ? 'on' : 'off') +
-            ' forceF32=' + (localStorage.getItem('enrichForceF32') === '1') +
             ' looseJSON=' + (localStorage.getItem('enrichLooseJSON') === '1'),
           'entries      ' + live.length + ' (' + counts.done + ' enriched, ' +
             counts.pending + ' raw, ' + counts.failed + ' failed)',
@@ -3006,13 +3002,12 @@
       say('gpu', describeAdapter(adapter) || 'unnamed');
       var feats = [];
       try { adapter.features.forEach(function (f) { feats.push(f); }); } catch (e) {}
-      say('shader-f16', (feats.indexOf('shader-f16') !== -1 ? 'yes' : 'no')
+      say('shader-f16', (feats.indexOf('shader-f16') !== -1 ? 'advertised (unused)' : 'no')
         + ' · ' + feats.length + (feats.length === 1 ? ' feature' : ' features'));
 
       step = 'module';
       var model = chosenModel();
-      say('choice', model.key + (localStorage.getItem('enrichForceF32') === '1'
-        ? ' · 32-bit forced in Settings' : ''));
+      say('choice', model.key + ' · 32-bit');
       var t = Date.now();
       return withTimeout(loadWebLLM(), 120000, 'Loading WebLLM').then(function (m) {
         webllmModule = m;
@@ -3021,19 +3016,15 @@
       });
     }).then(function (m) {
       step = 'cache';
-      // Both builds, not just the resolved one. Flipping the 16/32-bit switch
-      // resolves a *different* model id, so a model that ran perfectly can
-      // truthfully report itself uncached — and that looked like a bug for a
-      // week. These two lines say it outright instead.
-      var model = chosenModel();
-      return Promise.all([model.f16, model.f32].map(function (id) {
-        if (!id || !m.hasModelInCache) return Promise.resolve(null);
-        return withTimeout(Promise.resolve().then(function () { return m.hasModelInCache(id); }),
-          30000, 'The cache check').catch(function () { return null; });
-      })).then(function (c) {
-        say('16-bit build', model.f16 + ' · ' + cacheWord(c[0]));
-        say('32-bit build', (model.f32 || 'none') + ' · ' + cacheWord(c[1]));
-      });
+      // This used to report both builds, because flipping the 16/32-bit
+      // switch resolved a *different* model id and a model that had run
+      // perfectly could truthfully report itself uncached. There is no switch
+      // now, so there is one id to report.
+      var id = enrichModelId || chosenModel().f32;
+      if (!id || !m.hasModelInCache) { say('on disk', 'unknown'); return; }
+      return withTimeout(Promise.resolve().then(function () { return m.hasModelInCache(id); }),
+        30000, 'The cache check').catch(function () { return null; })
+        .then(function (c) { say('on disk', id + ' · ' + cacheWord(c)); });
     }).then(function () {
       step = 'engine';
       var t = Date.now(), peak = -1;
