@@ -139,7 +139,7 @@
     color: var(--accent); border-color: var(--accent-dim);
     display: inline-flex; align-items: center; gap: 5px; padding-right: 5px;
   }
-  .chip.hint .act-hint-del {
+  .chip.hint .act-hint-del, .chip.hint .act-tag-del {
     background: none; border: none; color: var(--faint); cursor: pointer;
     font-size: 15px; line-height: 1; padding: 0 3px;
   }
@@ -215,14 +215,6 @@
     padding: 10px 12px; outline: none;
   }
   .hint-input::placeholder { color: var(--faint); }
-  .entry.editing { border-color: var(--accent-dim); background: var(--surface-2); }
-  .entry textarea {
-    width: 100%; background: var(--bg); border: 1px solid var(--border);
-    border-radius: 9px; color: var(--text); font: inherit; resize: vertical;
-    padding: 11px; outline: none; min-height: 90px;
-  }
-  .entry-actions { display: flex; gap: 8px; margin-top: 10px; }
-  .entry-actions .btn { padding: 7px 15px; font-size: 14px; }
   .linkbtn {
     background: none; border: none; color: var(--danger); font: inherit;
     font-size: 14px; cursor: pointer; padding: 7px 6px; margin-left: auto;
@@ -244,6 +236,66 @@
     display: none; backdrop-filter: blur(2px);
   }
   .scrim.open { display: block; }
+  /* Full screen rather than a sheet: this is a place you go, not a panel you
+     peek at, and on a phone the difference is whether the note has room. */
+  .entryview {
+    position: fixed; inset: 0; z-index: 60; background: var(--bg);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  /* An author `display` beats the UA stylesheet's [hidden] rule, so without
+     this the "hidden" overlay covers the app and swallows every tap. */
+  .entryview[hidden] { display: none; }
+  .ev-bar {
+    display: flex; align-items: center; gap: 10px; flex: 0 0 auto;
+    padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
+    border-bottom: 1px solid var(--border); background: var(--bg);
+  }
+  .ev-when { flex: 1; min-width: 0; color: var(--muted); font-size: 13.5px; }
+  .ev-icon {
+    background: none; border: 1px solid var(--border); border-radius: 11px;
+    color: var(--muted); cursor: pointer; padding: 8px 10px; line-height: 0;
+  }
+  .ev-icon:active { background: var(--surface-2); }
+  .ev-icon.danger { color: var(--danger); }
+  .ev-body {
+    flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    padding: 16px 18px calc(28px + env(safe-area-inset-bottom));
+    max-width: 720px; width: 100%; margin: 0 auto;
+  }
+  .ev-sec { margin-bottom: 22px; }
+  .ev-sec > h3 {
+    margin: 0 0 9px; font-size: 12px; font-weight: 600; letter-spacing: .07em;
+    text-transform: uppercase; color: var(--faint);
+  }
+  .ev-raw {
+    width: 100%; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 11px; color: var(--text); font: inherit; font-size: 16px;
+    line-height: 1.55; padding: 13px; outline: none; resize: vertical; min-height: 120px;
+  }
+  .ev-raw:focus { border-color: var(--accent-dim); }
+  .ev-field { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+  .ev-field > label {
+    flex: 0 0 62px; color: var(--faint); font-size: 13px;
+  }
+  .ev-input, .ev-select {
+    flex: 1; min-width: 0; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 10px; color: var(--text); font: inherit; font-size: 14.5px;
+    padding: 9px 11px; outline: none;
+  }
+  .ev-input:focus, .ev-select:focus { border-color: var(--accent-dim); }
+  .ev-input::placeholder { color: var(--faint); }
+  /* A hand-edited field is never re-derived (invariant 1), which is a promise
+     worth showing rather than only keeping. */
+  .ev-field.edited > label { color: var(--accent); }
+  .ev-stars { display: flex; gap: 2px; }
+  .ev-star {
+    background: none; border: none; cursor: pointer; padding: 4px 3px;
+    font-size: 19px; line-height: 1; color: var(--border);
+  }
+  .ev-star.on { color: var(--accent); }
+  .ev-note { margin: 4px 0 0; color: var(--faint); font-size: 12.5px; }
+  .ev-actions { display: flex; gap: 9px; align-items: center; margin-top: 11px; }
+
   .sheet {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
     background: var(--surface); border-top: 1px solid var(--border);
@@ -332,6 +384,22 @@
 </div>
 
 <div class="scrim" id="scrim"></div>
+<!-- A whole screen for one entry. The list tile is a summary; everything you
+     can do to an entry happens here, including the first surface in this app
+     for correcting what the model decided. -->
+<div class="entryview" id="entryView" hidden>
+  <header class="ev-bar">
+    <button class="ev-icon" id="evBack" aria-label="Back to the log">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+    </button>
+    <span class="ev-when" id="evWhen"></span>
+    <button class="ev-icon danger" id="evDelete" aria-label="Delete this entry">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>
+    </button>
+  </header>
+  <div class="ev-body" id="evBody"></div>
+</div>
+
 <div class="sheet" id="sheet">
   <div class="grabber"></div>
   <div class="version" id="appVersion"></div>
@@ -1575,6 +1643,8 @@
     if (badge) badge.textContent = liveLabel();
     var foot = document.getElementById('liveFoot');
     if (foot) foot.textContent = liveLabel();
+    var evState = document.getElementById('evState');
+    if (evState && viewingId === enrichingId) evState.textContent = liveLabel();
     var stream = document.getElementById('liveStream');
     if (stream) {
       stream.textContent = live.partial || '';
@@ -2208,8 +2278,8 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-13';
-  var all = [], query = '', editingId = null;
+  var APP_VERSION = 'log-v3-15';
+  var all = [], query = '';
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
 
@@ -2290,64 +2360,6 @@
     return '';
   }
 
-  // The whole of what the model made of an entry, shown where you are
-  // already standing when you tap one — including the fields the chip row
-  // has no room for, and the guesses it was not confident enough to apply.
-  function enrichReadout(r) {
-    var e = r.enrichment, rows = [];
-    if (r.occurredAt) rows.push(['when', r.occurredAt]);
-    Object.keys(r.details || {}).forEach(function (k) {
-      var v = r.details[k];
-      if (v !== null && v !== '' && typeof v !== 'object') rows.push([k, String(v)]);
-    });
-    var body = rows.map(function (kv) {
-      return '<div class="ereadout-row"><span>' + esc(kv[0]) + '</span><b>' + esc(kv[1]) + '</b></div>';
-    }).join('');
-
-    var dev = devDetails();
-    var foot = '';
-    if (e.status === 'done' && !dev) {
-      // Either half can be missing without the other being worth hiding.
-      // The last two appear only when they are not the default, so an
-      // ordinary run still reads as one quiet line and an unusual one
-      // announces itself where the result is read rather than in Settings.
-      foot = [
-        e.model ? esc(e.model) : '',
-        typeof e.confidence === 'number' ? Math.round(e.confidence * 100) + '% confident'
-          : 'confidence not reported',
-        e.ms ? Math.round(e.ms / 1000) + 's' : '',
-        e.msFirst ? Math.round(e.msFirst / 1000) + 's before first word' : '',
-        e.grammar === 'json' ? '<span class="efact warn">no grammar</span>' : '',
-        (e.parse && e.parse !== 'as-is')
-          ? '<span class="efact warn">' + esc(e.parse) + '</span>' : ''
-      ].filter(Boolean).join(' · ');
-    } else if (e.status === 'failed') {
-      foot = 'Could not enrich this entry' + (e.error ? ' — ' + esc(e.error) : '');
-    } else if (r.id === enrichingId) {
-      foot = esc(liveLabel());
-    } else if (e.status === 'pending') {
-      foot = enrichmentEnabled() ? 'Waiting its turn' : 'Enrichment is off — turn it on in Settings';
-    }
-
-    var sugg = '';
-    if (e.suggestion && e.suggestion.type) {
-      sugg = '<div class="ereadout-row suggestion"><span>unsure</span><b>' +
-        esc(e.suggestion.type) + (e.suggestion.title ? ' · ' + esc(e.suggestion.title) : '') +
-        '</b></div>';
-    }
-
-    var stream = r.id === enrichingId
-      ? '<pre class="live-stream" id="liveStream" hidden></pre>' +
-        '<button class="linkbtn act-stop-enrich" style="padding:6px 0;color:var(--muted)">Stop</button>'
-      : '';
-    var run = dev ? runBlock(r) : '';
-    if (!body && !sugg && !foot && !stream && !run) return '';
-    return '<div class="ereadout">' + body + sugg + stream +
-      (foot ? '<div class="ereadout-foot' + (body || sugg ? '' : ' bare') + '"' +
-        (r.id === enrichingId ? ' id="liveFoot"' : '') + '>' + foot + '</div>' : '') +
-      run + '</div>';
-  }
-
   function devDetails() {
     return localStorage.getItem('enrichDevDetails') === '1';
   }
@@ -2424,30 +2436,7 @@
         html += '<div class="daygroup"><div class="daylabel">' + esc(dayLabel(r.capturedAt)) + '</div>';
         lastDay = k;
       }
-      if (r.id === editingId) {
-        var hints = (r.hints || []).map(function (h, i) {
-          return '<span class="chip hint">' + esc(h) +
-            '<button class="act-hint-del" data-i="' + i + '" aria-label="Remove">×</button></span>';
-        }).join('');
-        var eChips = r.type ? '<div class="chips"><span class="chip">' + esc(r.type) + '</span>' +
-          (r.title ? '<span class="chip title">' + esc(r.title) + '</span>' : '') +
-          r.tags.map(function (t) { return '<span class="chip">' + esc(t) + '</span>'; }).join('') +
-          (r.rating ? '<span class="chip rating">' + '★'.repeat(r.rating) + '</span>' : '') +
-          '</div>' : '';
-        html += '<div class="entry editing" data-id="' + r.id + '">' +
-          '<textarea class="edit-area">' + esc(r.raw) + '</textarea>' +
-          eChips + enrichReadout(r) +
-          (hints ? '<div class="chips">' + hints + '</div>' : '') +
-          '<div class="hint-row">' +
-            '<input class="hint-input" placeholder="Tell the AI what to add or focus on…">' +
-            '<button class="btn act-enrich">Enrich</button>' +
-          '</div>' +
-          '<div class="entry-actions">' +
-            '<button class="btn act-save">Save</button>' +
-            '<button class="btn ghost act-cancel">Cancel</button>' +
-            '<button class="linkbtn act-delete">Delete</button>' +
-          '</div></div>';
-      } else {
+      {
         var chips = r.type ? '<div class="chips"><span class="chip">' + esc(r.type) + '</span>' +
           (r.title ? '<span class="chip title">' + esc(r.title) + '</span>' : '') +
           r.tags.map(function (t) { return '<span class="chip">' + esc(t) + '</span>'; }).join('') +
@@ -2479,6 +2468,220 @@
     el.style.height = Math.min(el.scrollHeight, 400) + 'px';
   }
 
+  // ---------- one entry, full screen ----------
+  //
+  // The list tile is a summary and the tap target; everything you can do to an
+  // entry happens here. It is also the first place in this app where a person
+  // can correct the model: invariant 1 has recorded hand-edited fields in
+  // `userEdited` since v0 and nothing could ever write to it, so the promise
+  // that an edit is never re-derived has been untested machinery until now.
+
+  var viewingId = null;
+
+  function openEntry(id) {
+    var rec = all.find(function (r) { return r.id === id; });
+    if (!rec || rec.deleted) return;
+    viewingId = id;
+    renderEntryView();
+    $('entryView').hidden = false;
+    // Same trick the settings sheet uses, so Android's back button leaves the
+    // entry rather than the app.
+    history.pushState({ entry: id }, '');
+  }
+
+  function closeEntry() {
+    if (history.state && history.state.entry) history.back();
+    else hideEntry();
+  }
+
+  function hideEntry() {
+    viewingId = null;
+    $('entryView').hidden = true;
+    render();
+  }
+
+  function viewedRecord() {
+    return viewingId ? all.find(function (r) { return r.id === viewingId; }) : null;
+  }
+
+  function saveViewed(rec, field) {
+    // The value is already on the record; this only records that a person put
+    // it there, so enrichment never re-derives it. Deliberately not
+    // markUserEdited(), which sets the value too — two functions of the same
+    // name in one file is how the seed helper quietly stopped seeding.
+    if (field && rec.userEdited.indexOf(field) === -1) rec.userEdited.push(field);
+    rec.updatedAt = new Date().toISOString();
+    return put(rec).then(function () {
+      renderEntryView();
+      refreshStats();
+      scheduleSync();
+    });
+  }
+
+  function labelField(rec, key, label, control) {
+    var edited = rec.userEdited.indexOf(key) !== -1;
+    return '<div class="ev-field' + (edited ? ' edited' : '') + '">'
+      + '<label for="ev-' + key + '">' + esc(label) + '</label>' + control + '</div>';
+  }
+
+  function renderEntryView() {
+    var rec = viewedRecord();
+    if (!rec) return;
+    var e = rec.enrichment;
+
+    $('evWhen').textContent = new Date(rec.capturedAt).toLocaleString();
+
+    var typeOpts = ['<option value="">no type</option>'].concat(
+      TYPES.map(function (t) {
+        return '<option value="' + t + '"' + (rec.type === t ? ' selected' : '') + '>'
+          + esc(t) + '</option>';
+      })).join('');
+
+    var stars = '';
+    for (var i = 1; i <= 5; i++) {
+      stars += '<button class="ev-star' + (rec.rating >= i ? ' on' : '')
+        + '" data-star="' + i + '" type="button" aria-label="' + i + ' out of 5">\u2605</button>';
+    }
+
+    var tagChips = rec.tags.map(function (t, i) {
+      return '<span class="chip hint">' + esc(t)
+        + '<button class="act-tag-del" data-i="' + i + '" aria-label="Remove ' + esc(t) + '">\u00d7</button></span>';
+    }).join('');
+
+    var hintChips = (rec.hints || []).map(function (h, i) {
+      return '<span class="chip hint">' + esc(h)
+        + '<button class="act-hint-del" data-i="' + i + '" aria-label="Remove">\u00d7</button></span>';
+    }).join('');
+
+    var detailRows = Object.keys(rec.details || {}).map(function (k) {
+      return '<div class="ereadout-row"><span>' + esc(k) + '</span><b>'
+        + esc(String(rec.details[k])) + '</b></div>';
+    }).join('');
+
+    $('evBody').innerHTML =
+      '<div class="ev-sec">'
+        + '<h3>Your note</h3>'
+        + '<textarea class="ev-raw" id="evRaw">' + esc(rec.raw) + '</textarea>'
+        + '<div class="ev-actions">'
+          + '<button class="btn" id="evSave" disabled>Save</button>'
+          + '<span class="ev-note" id="evSaveNote"></span>'
+        + '</div>'
+      + '</div>'
+
+      + '<div class="ev-sec">'
+        + '<h3>Labels</h3>'
+        + labelField(rec, 'type', 'type',
+            '<select class="ev-select" id="ev-type">' + typeOpts + '</select>')
+        + labelField(rec, 'title', 'title',
+            '<input class="ev-input" id="ev-title" value="' + esc(rec.title || '')
+            + '" placeholder="none">')
+        + labelField(rec, 'occurredAt', 'when',
+            '<input class="ev-input" id="ev-occurredAt" value="' + esc(rec.occurredAt || '')
+            + '" placeholder="YYYY-MM-DD">')
+        + labelField(rec, 'rating', 'rating', '<div class="ev-stars">' + stars + '</div>')
+        + '<div class="ev-field' + (rec.userEdited.indexOf('tags') !== -1 ? ' edited' : '')
+          + '" style="align-items:flex-start"><label>tags</label><div style="flex:1;min-width:0">'
+          + (tagChips ? '<div class="chips">' + tagChips + '</div>' : '')
+          + '<div class="hint-row"><input class="hint-input" id="evTagInput" placeholder="Add a tag\u2026">'
+          + '<button class="btn ghost" id="evTagAdd">Add</button></div>'
+        + '</div></div>'
+        + '<p class="ev-note">A label you set by hand is never rewritten by the model.</p>'
+      + '</div>'
+
+      + (detailRows ? '<div class="ev-sec"><h3>Details</h3>'
+          + '<div class="ereadout">' + detailRows + '</div></div>' : '')
+
+      + '<div class="ev-sec">'
+        + '<h3>Ask the model</h3>'
+        + (hintChips ? '<div class="chips">' + hintChips + '</div>' : '')
+        + '<div class="hint-row">'
+          + '<input class="hint-input" id="evHint" placeholder="Tell the AI what to add or focus on\u2026">'
+          + '<button class="btn" id="evEnrich">Enrich</button>'
+        + '</div>'
+        + '<p class="ev-note" id="evState">' + esc(entryStateLine(rec)) + '</p>'
+        // The model's output as it arrives. Proof of life on a pass that can
+        // take a minute, and the only way to see what it is producing rather
+        // than only the verdict on it.
+        + (rec.id === enrichingId
+            ? '<pre class="live-stream" id="liveStream" hidden></pre>'
+              + '<button class="linkbtn act-stop-enrich" style="padding:6px 0;margin-left:0;color:var(--muted)">Stop</button>'
+            : '')
+        + (devDetails() ? runBlock(rec) : '')
+      + '</div>';
+
+    wireEntryView(rec);
+  }
+
+  function entryStateLine(rec) {
+    var e = rec.enrichment;
+    if (rec.id === enrichingId) return liveLabel();
+    if (enrichQueued[rec.id]) return 'Queued';
+    if (e.status === 'failed') return 'Could not enrich \u2014 ' + (e.error || 'unknown');
+    if (e.status === 'done') {
+      return [e.model || '', e.ms ? Math.round(e.ms / 1000) + 's' : '',
+        typeof e.confidence === 'number' ? Math.round(e.confidence * 100) + '% confident'
+          : 'confidence not reported'].filter(Boolean).join(' \u00b7 ');
+    }
+    return enrichmentEnabled() ? 'Not enriched yet' : 'Enrichment is off \u2014 turn it on in Settings';
+  }
+
+  function wireEntryView(rec) {
+    var raw = $('evRaw'), saveBtn2 = $('evSave');
+    autosize(raw);
+    raw.addEventListener('input', function () {
+      autosize(raw);
+      saveBtn2.disabled = raw.value.trim() === rec.raw || !raw.value.trim();
+    });
+    saveBtn2.onclick = function () {
+      var t = raw.value.trim();
+      if (!t) return;
+      rec.raw = t;
+      // raw is the user's own sentence, never a derived field, so it is not
+      // recorded in userEdited — that list is about fields the model fills.
+      saveViewed(rec, null).then(function () { toast('Updated'); });
+    };
+
+    $('ev-type').onchange = function () {
+      rec.type = this.value || null;
+      saveViewed(rec, 'type');
+    };
+    $('ev-title').onchange = function () {
+      rec.title = this.value.trim() || null;
+      saveViewed(rec, 'title');
+    };
+    $('ev-occurredAt').onchange = function () {
+      rec.occurredAt = this.value.trim() || null;
+      saveViewed(rec, 'occurredAt');
+    };
+    $('evTagAdd').onclick = function () {
+      var el = $('evTagInput'), t = el.value.trim();
+      if (!t) return;
+      if (rec.tags.some(function (x) { return x.toLowerCase() === t.toLowerCase(); })) {
+        el.value = ''; return;
+      }
+      rec.tags = rec.tags.concat([t]);
+      el.value = '';
+      saveViewed(rec, 'tags');
+    };
+    $('evEnrich').onclick = function () {
+      enrichFromView(rec, $('evRaw').value, $('evHint').value);
+    };
+  }
+
+  function enrichFromView(rec, text, hint) {
+    var t = String(text).trim(), h = String(hint).trim();
+    if (t) rec.raw = t;
+    if (h) rec.hints = (rec.hints || []).concat([h]);
+    rec.enrichment.status = 'pending';
+    rec.updatedAt = new Date().toISOString();
+    put(rec).then(function () {
+      renderEntryView(); render(); refreshStats(); scheduleSync();
+      if (!enrichmentEnabled()) { toast('Turn on enrichment in Settings'); return; }
+      enqueueEnrich(rec.id);
+      toast('Enriching\u2026');
+    });
+  }
+
   // ---------- actions ----------
   function save() {
     var raw = input.value.trim();
@@ -2502,50 +2705,6 @@
     });
   }
 
-  // Enrich this one entry now, optionally with a new instruction. Saves any
-  // text change first so pressing Enrich can never quietly discard an edit
-  // sitting in the textarea.
-  function enrichNow(id, text, hint) {
-    var rec = all.find(function (r) { return r.id === id; });
-    if (!rec) return;
-    var t = text.trim(), h = hint.trim();
-    if (t) rec.raw = t;
-    if (h) {
-      rec.hints = (rec.hints || []).concat([h]);
-      // A new instruction is only worth anything if it is acted on, so this
-      // pass is not skipped even when the record was already enriched.
-    }
-    rec.enrichment.status = 'pending';
-    rec.updatedAt = new Date().toISOString();
-    put(rec).then(function () {
-      editingId = null;
-      render(); refreshStats(); scheduleSync();
-      if (!enrichmentEnabled()) { toast('Turn on enrichment in Settings'); return; }
-      enqueueEnrich(id);
-      toast('Enriching…');
-    });
-  }
-
-  function removeHint(id, i) {
-    var rec = all.find(function (r) { return r.id === id; });
-    if (!rec || !rec.hints || i < 0 || i >= rec.hints.length) return;
-    rec.hints.splice(i, 1);
-    rec.updatedAt = new Date().toISOString();
-    put(rec).then(function () { render(); scheduleSync(); });
-  }
-
-  function commitEdit(id, text) {
-    var rec = all.find(function (r) { return r.id === id; });
-    if (!rec) return;
-    var t = text.trim();
-    if (!t) { editingId = null; render(); return; }
-    rec.raw = t;
-    rec.updatedAt = new Date().toISOString();
-    put(rec).then(function () {
-      editingId = null; render(); toast('Updated'); scheduleSync();
-    });
-  }
-
   function removeEntry(id) {
     var rec = all.find(function (r) { return r.id === id; });
     if (!rec) return;
@@ -2553,7 +2712,8 @@
     rec.deletedAt = new Date().toISOString();
     rec.updatedAt = rec.deletedAt;
     put(rec).then(function () {
-      editingId = null; render(); refreshStats(); toast('Deleted'); scheduleSync();
+      if (viewingId === id) closeEntry();
+      render(); refreshStats(); toast('Deleted'); scheduleSync();
     });
   }
 
@@ -2676,9 +2836,16 @@
     else hideSheet();
   }
 
-  window.addEventListener('popstate', hideSheet);
+  window.addEventListener('popstate', function () {
+    // Whichever is on top. The entry view sits above the sheet, and a back
+    // gesture should peel one layer, not the whole app.
+    if (viewingId) hideEntry();
+    else hideSheet();
+  });
   document.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape' && sheet.classList.contains('open')) closeSheet();
+    if (e.key !== 'Escape') return;
+    if (viewingId) closeEntry();
+    else if (sheet.classList.contains('open')) closeSheet();
   });
 
   $('settingsBtn').onclick = openSheet;
@@ -2713,35 +2880,9 @@
     if (!entry) return;
     var id = entry.getAttribute('data-id');
 
-    if (e.target.closest('.act-save')) {
-      commitEdit(id, entry.querySelector('.edit-area').value); return;
-    }
-    if (e.target.closest('.act-hint-del')) {
-      removeHint(id, +e.target.closest('.act-hint-del').getAttribute('data-i'));
-      return;
-    }
-    if (e.target.closest('.act-enrich')) {
-      enrichNow(id, entry.querySelector('.edit-area').value,
-                entry.querySelector('.hint-input').value);
-      return;
-    }
-    if (e.target.closest('.act-cancel')) { editingId = null; render(); return; }
-    if (e.target.closest('.act-delete')) {
-      if (confirm('Delete this entry?')) removeEntry(id);
-      return;
-    }
-    // Enrich straight from the list, without going through the editor —
-    // triggering one entry is the main gesture now that nothing is automatic.
+    // Stop and enrich stay on the tile: triggering one entry is the main
+    // gesture now that nothing is automatic, and it should not cost a screen.
     if (e.target.closest('.act-stop-enrich')) { cancelEnrichment(); return; }
-    if (e.target.closest('.act-copy-run')) {
-      var target = all.find(function (r) { return r.id === id; });
-      if (target) {
-        runReport(target).then(function (text) {
-          copyText(text, 'Run and device state copied');
-        });
-      }
-      return;
-    }
     if (e.target.closest('.act-quick-enrich')) {
       var rec = all.find(function (r) { return r.id === id; });
       if (!rec) return;
@@ -2750,14 +2891,49 @@
       put(rec).then(function () { enqueueEnrich(id); render(); });
       return;
     }
-    if (entry.classList.contains('editing')) return;
-    editingId = id;
-    render();
+    // Anywhere else on the tile opens it.
+    openEntry(id);
   });
 
-  listEl.addEventListener('input', function (e) {
-    if (e.target.classList.contains('edit-area')) autosize(e.target);
+  // Chips, the copy button and the delete inside the full-screen view. It is
+  // rendered as one block of HTML on every change, so the handlers that
+  // survive a re-render are delegated rather than bound per element.
+  $('evBody').addEventListener('click', function (e) {
+    var rec = viewedRecord();
+    if (!rec) return;
+    var del = e.target.closest('.act-tag-del');
+    if (del) {
+      rec.tags.splice(+del.getAttribute('data-i'), 1);
+      saveViewed(rec, 'tags');
+      return;
+    }
+    var hdel = e.target.closest('.act-hint-del');
+    if (hdel) {
+      (rec.hints || []).splice(+hdel.getAttribute('data-i'), 1);
+      saveViewed(rec, null);
+      return;
+    }
+    var star = e.target.closest('.ev-star');
+    if (star) {
+      var n = +star.getAttribute('data-star');
+      // Tapping the star you are already on clears the rating, which is the
+      // only way back to "no opinion" once the model has guessed one.
+      rec.rating = (rec.rating === n) ? null : n;
+      saveViewed(rec, 'rating');
+      return;
+    }
+    if (e.target.closest('.act-copy-run')) {
+      runReport(rec).then(function (t) { copyText(t, 'Run and device state copied'); });
+      return;
+    }
+    if (e.target.closest('.act-stop-enrich')) { cancelEnrichment(); return; }
   });
+
+  $('evBack').onclick = closeEntry;
+  $('evDelete').onclick = function () {
+    var rec = viewedRecord();
+    if (rec && confirm('Delete this entry?')) removeEntry(rec.id);
+  };
 
   $('exportBtn').onclick = exportBackup;
   $('importBtn').onclick = function () { $('fileInput').click(); };
@@ -2783,7 +2959,7 @@
         : '');
     if (!confirm(warn)) return;
     clearAll().then(function () {
-      all = []; editingId = null; render(); refreshStats(); maybeBanner(); closeSheet();
+      all = []; render(); refreshStats(); maybeBanner(); closeSheet();
       toast('Everything deleted');
     });
   };

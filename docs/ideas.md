@@ -77,6 +77,35 @@ The unhappy asymmetry: Audible is the one specifically wanted and the one least 
 
 ---
 
+## Ask the model to write something about an entry
+
+**Medium. Storage decided 15 Sep 2026, not built.**
+
+Not extraction — generation. "Summarise The Big Short", "list the top three
+characters". The model writes from what it knows, not from your note.
+
+*Decided: it lives in a field on the entry it came from, not as a new record.*
+Invariant 5 says the unit is an encounter, and a generated summary is not
+something you encountered — it stays attached to the thing you did. That also
+keeps model-written prose out of the log, out of search, and out of Dropbox as
+a file of its own.
+
+**The objection to answer before building this.** Everything in phase 2 so far
+extracts from text the user wrote, and refuses rather than invents — the `null`
+type is a normal outcome, low confidence withholds, `raw` is immutable. Asking
+a 1.5B model for the cast of a book inverts that: it will produce fluent,
+plausible, unverifiable names. In an app whose *purpose* is to quiz you later,
+storing confabulated facts is not a cosmetic problem — you would be tested on
+invented content and would have no way to tell. So generated text must be
+visibly model-written wherever it appears, must never feed the quiz queue
+without a person confirming it, and probably wants its own marker in the record
+rather than living among the extracted fields.
+
+**Open:** whether a generation worth keeping can be promoted to an entry of its
+own later. Worth watching how the field gets used first.
+
+---
+
 ## Smaller things
 
 *Nothing here yet.*

@@ -22,7 +22,7 @@ Vanilla HTML/CSS/JS in a single `index.html`. **No build step, no bundled depend
 
 ## Invariants — do not break these
 
-1. **`raw` is immutable.** AI enrichment writes to separate fields alongside the user's text, never over it. Fields the user edits by hand are recorded in `userEdited` and are never re-derived — there is no UI yet to hand-edit an extracted field, so this gate exists but isn't reachable from the UI.
+1. **`raw` is immutable.** AI enrichment writes to separate fields alongside the user's text, never over it. Fields the user edits by hand are recorded in `userEdited` and are never re-derived. **Reachable since 15 September 2026:** tapping a tile opens the entry's own full screen, where type, title, when, rating and tags are all editable, and every hand-edit records the field. `raw` itself is *not* recorded in `userEdited` — that list is about fields the model fills, and the user's own sentence was never one of them.
 2. **Records already use the full v2 schema** — `raw`, `capturedAt`, `enrichment`, `type`, `title`, `occurredAt`, `tags`, `rating`, `details`, `links`, `userEdited`, `media`, timestamps, `deleted`. Everything except the user's text is null/empty in v0. This exists so no captured data ever needs migrating. Don't strip unused fields.
 3. **Deletes are tombstones** (`deleted: true`), never removals. Required for sync to propagate deletes correctly later.
 4. **Capture never blocks.** No spinner, no network, no required field, no type picker. Save is instant and works offline. Enrichment is always async and always optional.
@@ -46,7 +46,7 @@ The enrichment questioner and the quiz questioner are **the same component** at 
 
 ## Testing
 
-127 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
+130 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
 
 ```bash
 python3 test/smoke.py            # all

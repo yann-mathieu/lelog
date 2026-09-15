@@ -127,6 +127,30 @@ def records(page):
     """)
 
 
+def open_entry(page, selector=".entry"):
+    """Tap a tile. An entry has a screen of its own now, not an inline editor."""
+    page.locator(selector).first.click()
+    page.wait_for_selector("#entryView:not([hidden])")
+
+
+def close_entry(page):
+    page.click("#evBack")
+    page.wait_for_selector("#entryView", state="hidden")
+
+
+def edit_raw(page, text):
+    """Rewrite the note from the full-screen view and save it."""
+    page.fill("#evRaw", text)
+    page.click("#evSave:not([disabled])")
+    page.wait_for_selector("#evSave[disabled]")
+
+
+def delete_viewed(page):
+    page.once("dialog", lambda d: d.accept())
+    page.click("#evDelete")
+    page.wait_for_selector("#entryView", state="hidden")
+
+
 def open_sheet(page):
     page.click("#settingsBtn")
     page.wait_for_selector("#sheet.open")
@@ -221,11 +245,9 @@ def test_edit_rewrites_raw_and_bumps_updatedat(page, base_url):
 
     before = records(page)[0]
 
-    page.click(".entry .raw")
-    page.wait_for_selector(".entry.editing .edit-area")
-    page.fill(".edit-area", "coffee at ten belles, the filter was excellent")
-    page.click(".act-save")
-    page.wait_for_selector(".entry.editing", state="detached")
+    open_entry(page)
+    edit_raw(page, "coffee at ten belles, the filter was excellent")
+    close_entry(page)
 
     assert texts(page) == ["coffee at ten belles, the filter was excellent"]
 
@@ -242,11 +264,10 @@ def test_edit_can_be_cancelled(page, base_url):
     boot(page, base_url)
     capture(page, "leave me alone")
 
-    page.click(".entry .raw")
-    page.wait_for_selector(".edit-area")
-    page.fill(".edit-area", "clobbered")
-    page.click(".act-cancel")
-    page.wait_for_selector(".entry.editing", state="detached")
+    open_entry(page)
+    # Typed but never saved: leaving must not commit it.
+    page.fill("#evRaw", "clobbered")
+    close_entry(page)
 
     assert texts(page) == ["leave me alone"]
     assert records(page)[0]["raw"] == "leave me alone"
@@ -258,10 +279,8 @@ def test_delete_is_a_tombstone_not_a_removal(page, base_url):
     capture(page, "keep this one")
     capture(page, "delete this one")
 
-    page.once("dialog", lambda d: d.accept())
-    page.click(".entry:has-text('delete this one') .raw")
-    page.wait_for_selector(".edit-area")
-    page.click(".act-delete")
+    open_entry(page, ".entry:has-text('delete this one')")
+    delete_viewed(page)
     page.wait_for_function("() => document.querySelectorAll('.entry').length === 1")
 
     # Gone from the list...
@@ -309,9 +328,8 @@ def test_search_does_not_find_tombstones(page, base_url):
     capture(page, "a secret worth forgetting")
 
     page.once("dialog", lambda d: d.accept())
-    page.click(".entry .raw")
-    page.wait_for_selector(".edit-area")
-    page.click(".act-delete")
+    open_entry(page, ".entry")
+    delete_viewed(page)
     page.wait_for_function("() => document.querySelectorAll('.entry').length === 0")
 
     page.fill("#search", "secret")
@@ -367,9 +385,8 @@ def test_export_includes_tombstones(page, base_url):
     capture(page, "doomed")
 
     page.once("dialog", lambda d: d.accept())
-    page.click(".entry:has-text('doomed') .raw")
-    page.wait_for_selector(".edit-area")
-    page.click(".act-delete")
+    open_entry(page, ".entry:has-text('doomed')")
+    delete_viewed(page)
     page.wait_for_function("() => document.querySelectorAll('.entry').length === 1")
 
     payload, _, _ = export_backup(page)
@@ -420,11 +437,9 @@ def test_import_merges_and_keeps_the_newer_copy(page, base_url):
     shared_id = payload["memories"][0]["id"]
 
     # Edit locally so the on-device copy is strictly newer than the backup.
-    page.click(".entry .raw")
-    page.wait_for_selector(".edit-area")
-    page.fill(".edit-area", "shared entry, edited locally")
-    page.click(".act-save")
-    page.wait_for_selector(".entry.editing", state="detached")
+    open_entry(page, ".entry")
+    edit_raw(page, "shared entry, edited locally")
+    close_entry(page)
 
     capture(page, "local only entry")
 
@@ -447,11 +462,9 @@ def test_import_of_a_newer_backup_wins(page, base_url):
     boot(page, base_url)
     capture(page, "original text")
 
-    page.click(".entry .raw")
-    page.wait_for_selector(".edit-area")
-    page.fill(".edit-area", "newer text")
-    page.click(".act-save")
-    page.wait_for_selector(".entry.editing", state="detached")
+    open_entry(page, ".entry")
+    edit_raw(page, "newer text")
+    close_entry(page)
 
     payload, path, _ = export_backup(page)
 
@@ -1273,11 +1286,9 @@ def test_push_is_incremental_and_uses_the_stored_rev(page, base_url):
 
     # Edit one, and only that one goes up — with update(rev), not add.
     close_sheet(page)
-    page.click(".entry:has-text('second') .raw")
-    page.wait_for_selector(".edit-area")
-    page.fill(".edit-area", "second, revised")
-    page.click(".act-save")
-    page.wait_for_selector(".entry.editing", state="detached")
+    open_entry(page, ".entry:has-text('second')")
+    edit_raw(page, "second, revised")
+    close_entry(page)
 
     open_sheet(page)
     wait_pending(page, 1)
@@ -1343,11 +1354,9 @@ def test_push_path_is_stable_across_an_edit(page, base_url):
 
     # Edit it today, which moves updatedAt into another year.
     close_sheet(page)
-    page.click(".entry .raw")
-    page.wait_for_selector(".edit-area")
-    page.fill(".edit-area", "edited this year")
-    page.click(".act-save")
-    page.wait_for_selector(".entry.editing", state="detached")
+    open_entry(page, ".entry")
+    edit_raw(page, "edited this year")
+    close_entry(page)
 
     open_sheet(page)
     do_push(page)
@@ -1376,9 +1385,8 @@ def test_push_uploads_tombstones(page, base_url):
 
     close_sheet(page)
     page.once("dialog", lambda d: d.accept())
-    page.click(".entry .raw")
-    page.wait_for_selector(".edit-area")
-    page.click(".act-delete")
+    open_entry(page, ".entry")
+    delete_viewed(page)
     page.wait_for_function("() => document.querySelectorAll('.entry').length === 0")
 
     open_sheet(page)
@@ -1462,11 +1470,9 @@ def test_push_does_not_clobber_a_conflicting_remote_copy(page, base_url):
     dbx.files[path] = ("rev999999999999", json.dumps({"raw": "theirs"}))
 
     close_sheet(page)
-    page.click(".entry .raw")
-    page.wait_for_selector(".edit-area")
-    page.fill(".edit-area", "mine, edited")
-    page.click(".act-save")
-    page.wait_for_selector(".entry.editing", state="detached")
+    open_entry(page, ".entry")
+    edit_raw(page, "mine, edited")
+    close_entry(page)
 
     open_sheet(page)
     do_push(page)
@@ -1782,9 +1788,8 @@ def test_a_delete_beats_an_edit_but_keeps_the_newer_text(page, base_url):
 
     # Deleted here, at the older time.
     page.once("dialog", lambda d: d.accept())
-    page.click(".entry .raw")
-    page.wait_for_selector(".edit-area")
-    page.click(".act-delete")
+    open_entry(page, ".entry")
+    delete_viewed(page)
     page.wait_for_function("() => document.querySelectorAll('.entry').length === 0")
     set_local(page, rid, updatedAt=OLD, deletedAt=OLD)
     page.reload()
@@ -2125,19 +2130,15 @@ def test_edit_and_delete_sync_by_themselves(page, base_url):
     assert wait_for_upload(page, 1)
     path = dbx.uploads[0]["path"]
 
-    page.click(".entry .raw")
-    page.wait_for_selector(".edit-area")
-    page.fill(".edit-area", "after")
-    page.click(".act-save")
-    page.wait_for_selector(".entry.editing", state="detached")
+    open_entry(page, ".entry")
+    edit_raw(page, "after")
+    close_entry(page)
 
     assert wait_for_upload(page, 2), "an edit did not sync on its own"
     assert dbx.json_at(path)["raw"] == "after"
 
-    page.once("dialog", lambda d: d.accept())
-    page.click(f".entry:has-text('after') .raw")
-    page.wait_for_selector(".edit-area")
-    page.click(".act-delete")
+    open_entry(page, ".entry:has-text('after')")
+    delete_viewed(page)
     page.wait_for_function("() => document.querySelectorAll('.entry').length === 1")
 
     assert wait_for_upload(page, 3), "a delete did not sync on its own"
@@ -2459,6 +2460,72 @@ def test_enrichment_does_not_apply_low_confidence(page, base_url):
 
 
 @test
+def test_a_label_set_by_hand_survives_re_enrichment(page, base_url):
+    """Invariant 1 has recorded hand-edited fields in userEdited since v0 and
+    nothing could ever write to it — the promise that an edit is never
+    re-derived was untested machinery. The entry's own screen is the first
+    surface that can make it, so this drives the real controls."""
+    stub_model_layer(page)
+    boot(page, base_url)
+    capture(page, "finished dune")
+
+    open_entry(page)
+    page.fill("#ev-title", "My Own Title")
+    page.dispatch_event("#ev-title", "change")
+    page.select_option("#ev-type", "film")
+    wait_for_record(page, lambda r: r["title"] == "My Own Title" and r["type"] == "film")
+
+    rec = records(page)[0]
+    assert sorted(rec["userEdited"]) == ["title", "type"], rec["userEdited"]
+
+    # The stub extractor says book / "Dune"; neither may land on a hand-set
+    # field, and the fields nobody touched must still be filled.
+    page.click("#evEnrich")
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done", timeout=15000)
+    assert rec["title"] == "My Own Title", "a hand-set title was re-derived"
+    assert rec["type"] == "film", "a hand-set type was re-derived"
+    assert rec["tags"] == ["scifi"], "a field nobody touched was not filled"
+
+
+@test
+def test_tags_can_be_added_and_removed_by_hand(page, base_url):
+    boot(page, base_url)
+    capture(page, "something worth tagging")
+
+    open_entry(page)
+    page.fill("#evTagInput", "paris")
+    page.click("#evTagAdd")
+    wait_for_record(page, lambda r: r["tags"] == ["paris"])
+
+    # Adding the same tag twice is a no-op, not a duplicate.
+    page.fill("#evTagInput", "PARIS")
+    page.click("#evTagAdd")
+    page.wait_for_timeout(300)
+    assert records(page)[0]["tags"] == ["paris"]
+
+    page.click(".act-tag-del")
+    wait_for_record(page, lambda r: r["tags"] == [])
+    assert "tags" in records(page)[0]["userEdited"]
+
+
+@test
+def test_the_rating_can_be_set_and_cleared(page, base_url):
+    """Tapping the star you are already on is the only way back to "no
+    opinion" once the model has guessed one for you."""
+    boot(page, base_url)
+    capture(page, "four out of five")
+
+    open_entry(page)
+    page.click('.ev-star[data-star="4"]')
+    wait_for_record(page, lambda r: r["rating"] == 4)
+
+    page.click('.ev-star[data-star="4"]')
+    assert wait_for_record(page, lambda r: r["rating"] is None), \
+        f'tapping the current star did not clear it: {records(page)[0]["rating"]}'
+    assert "rating" in records(page)[0]["userEdited"]
+
+
+@test
 def test_enrichment_never_overwrites_user_edited_field(page, base_url):
     boot(page, base_url)
     capture(page, "a book i am reading")
@@ -2615,10 +2682,9 @@ def test_a_hint_is_stored_and_reaches_the_extractor(page, base_url):
 
     boot(page, base_url)
     capture(page, "dinner out")
-    page.click(".entry .raw")
-    page.wait_for_selector(".edit-area")
-    page.fill(".hint-input", "mention the wine")
-    page.click(".act-enrich")
+    open_entry(page, ".entry")
+    page.fill("#evHint", "mention the wine")
+    page.click("#evEnrich")
 
     rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
     assert rec["hints"] == ["mention the wine"]
@@ -2643,9 +2709,8 @@ def test_enrich_button_re_runs_a_single_entry(page, base_url):
             rating: null, details: {}, confidence: 0.9
         }); }
     """)
-    page.click(".entry .raw")
-    page.wait_for_selector(".edit-area")
-    page.click(".act-enrich")
+    open_entry(page, ".entry")
+    page.click("#evEnrich")
 
     rec = wait_for_record(page, lambda r: r["title"] == "Second")
     assert rec is not None, "the per-entry Enrich button did not re-run extraction"
@@ -2655,13 +2720,12 @@ def test_enrich_button_re_runs_a_single_entry(page, base_url):
 def test_a_hint_can_be_removed(page, base_url):
     boot(page, base_url)
     capture(page, "something")
-    page.click(".entry .raw")
-    page.wait_for_selector(".edit-area")
-    page.fill(".hint-input", "focus on the food")
-    page.click(".act-enrich")
-    page.wait_for_function("() => !document.querySelector('.edit-area')")
+    open_entry(page, ".entry")
+    page.fill("#evHint", "focus on the food")
+    page.click("#evEnrich")
 
-    page.click(".entry .raw")
+    # Enriching keeps you on the entry now rather than returning you to the
+    # list, so the hint it just recorded appears without reopening anything.
     page.wait_for_selector(".chip.hint")
     page.click(".act-hint-del")
     page.wait_for_function("() => !document.querySelector('.chip.hint')")
@@ -2683,9 +2747,9 @@ def test_details_are_readable_on_the_entry(page, base_url):
     enrich(page)
     wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
 
-    page.click(".entry .raw")
+    open_entry(page)
     page.wait_for_selector(".ereadout")
-    readout = page.inner_text(".ereadout")
+    readout = page.inner_text("#evBody")
     assert "Ishiguro" in readout and "author" in readout
     assert "genre" in readout and "fiction" in readout
     # Which model produced this, and how sure it was.
@@ -2740,8 +2804,8 @@ def test_the_list_reports_model_load_and_token_progress(page, base_url):
     )
     assert "7 tokens" in page.inner_text(".estate.working")
 
-    # And the raw output so far is visible on the entry itself.
-    page.click(".entry .raw")
+    # And the raw output so far is visible on the entry's own screen.
+    open_entry(page)
     page.wait_for_selector("#liveStream:not([hidden])")
     assert '"type":"book"' in page.inner_text("#liveStream")
 
@@ -2818,9 +2882,8 @@ def test_a_failed_entry_carries_the_diagnosis_not_just_the_error(page, base_url)
 
     # The bare message alone is what sent this round-tripping for days.
     assert "Cache.add()" in rec["enrichment"]["error"]
-    page.click(".entry .raw")
-    page.wait_for_selector(".ereadout")
-    assert "Could not enrich" in page.inner_text(".ereadout")
+    open_entry(page)
+    assert "Could not enrich" in page.inner_text("#evState")
 
 
 @test
@@ -3783,12 +3846,6 @@ def test_an_ordinary_failure_keeps_the_engine(page, base_url):
 # without its conditions cannot be diagnosed, so every pass now keeps them.
 
 
-def open_entry(page, index=0):
-    """Tap an entry to open the readout, which is where the run is shown."""
-    page.locator(".entry .raw").nth(index).click()
-    page.wait_for_selector(".ereadout")
-
-
 def dev_details(page):
     page.add_init_script("localStorage.setItem('enrichDevDetails', '1');")
 
@@ -3862,17 +3919,17 @@ def test_the_run_is_hidden_until_you_ask_for_it(page, base_url):
 
     open_entry(page)
     assert page.locator(".erun-row").count() == 0
-    # But the compact line still carries the model and the confidence. Read
+    # But the one-line state still carries the model and the confidence. Read
     # the id off the record rather than naming a family, so changing the
     # default model is not a test failure.
     model = records(page)[0]["enrichment"]["model"]
-    assert model and model in page.locator(".ereadout-foot").inner_text()
+    assert model and model in page.inner_text("#evState")
 
-    # Turning it on redraws the list, so the entry already open gains the
-    # rows in place rather than needing to be opened again.
+    close_entry(page)
     open_sheet(page)
     page.check("#enrichDevDetails")
     close_sheet(page)
+    open_entry(page)
     page.wait_for_selector(".erun-row")
     labels = page.locator(".erun-row span").all_inner_texts()
     assert {"model", "grammar", "parsed", "confidence"} <= set(labels), labels
