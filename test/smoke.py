@@ -59,7 +59,7 @@ OPTIONAL_KEYS = {"deletedAt"}
 
 # The enrichment sub-object's own keys, from newRecord() in index.html.
 ENRICHMENT_KEYS = {"status", "model", "at", "confidence", "needsReview", "suggestion",
-                   "error", "ms", "msFirst", "grammar", "parse"}
+                   "error", "ms", "msFirst", "grammar", "parse", "output"}
 
 
 # ---------- server ----------
@@ -205,7 +205,7 @@ def test_capture_writes_the_full_v2_schema(page, base_url):
     assert rec["enrichment"] == {
         "status": "pending", "model": None, "at": None, "confidence": None,
         "needsReview": False, "suggestion": None, "error": None, "ms": None,
-        "msFirst": None, "grammar": None, "parse": None
+        "msFirst": None, "grammar": None, "parse": None, "output": None
     }
     assert (rec["type"], rec["title"], rec["occurredAt"], rec["rating"]) == \
         (None, None, None, None)
@@ -2916,6 +2916,56 @@ def test_a_whole_pass_through_the_real_model_layer(page, base_url):
     assert page.evaluate("() => window.__LELOG_SEEN_REQ__.max_tokens") == 220
     # And the model it recorded is the one the engine was actually built with.
     assert rec["enrichment"]["model"] == page.evaluate("() => window.__LELOG_SEEN_MODEL__")
+
+
+@test
+def test_a_messy_pass_keeps_what_the_model_actually_said(page, base_url):
+    """Every question left standing in this feature has ended at "what did it
+    actually say". Until now that was answerable only by the self-test, which
+    runs a fixed sentence rather than the entry you are looking at — so a
+    real entry coming back empty cost a round trip every single time."""
+    stub_model_layer(page)
+    page.add_init_script(model_says(json.dumps(
+        'here you go: {"type": "book", "title": "Dune", "tags": [],'
+        ' "rating": null, "details": {}, "confidence": 0.9}')))
+
+    boot(page, base_url)
+    capture(page, "finished dune")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+    assert rec["enrichment"]["parse"] != "as-is", rec["enrichment"]["parse"]
+    assert "here you go" in (rec["enrichment"]["output"] or ""), rec["enrichment"]
+
+
+@test
+def test_a_clean_pass_stores_no_output(page, base_url):
+    """A parse that needed nothing is fully described by the fields it
+    produced. Keeping the text too would put the model's noise in every
+    record, and in every export and every Dropbox file behind it."""
+    stub_model_layer(page)
+
+    boot(page, base_url)
+    capture(page, "finished dune")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+    assert rec["enrichment"]["parse"] == "as-is", rec["enrichment"]["parse"]
+    assert rec["enrichment"]["output"] is None, rec["enrichment"]["output"]
+
+
+@test
+def test_a_failed_pass_keeps_the_output_too(page, base_url):
+    """A failure is the case where the text matters most."""
+    stub_model_layer(page)
+    page.add_init_script(model_says(r"'not JSON at all, just prose'"))
+
+    boot(page, base_url)
+    capture(page, "a refusal")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "failed")
+    assert "just prose" in (rec["enrichment"]["output"] or ""), rec["enrichment"]
 
 
 @test

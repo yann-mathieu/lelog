@@ -503,6 +503,7 @@
     if (!('msFirst' in e)) e.msFirst = null;
     if (!('grammar' in e)) e.grammar = null;
     if (!('parse' in e)) e.parse = null;
+    if (!('output' in e)) e.output = null;
     return rec;
   }
 
@@ -1464,7 +1465,7 @@
   // time and then seconds of silent GPU work, so without this the only
   // honest thing the app could say was "enriching…" and hope.
   var live = { phase: '', pct: 0, tokens: 0, partial: '', startedAt: 0, firstTokenAt: 0,
-               grammar: null, parse: null };
+               grammar: null, parse: null, output: null };
   var liveTimer = null;
   var enrichCancel = false;
   var enrichAbort = null; // rejects the in-flight pass when you press Stop
@@ -1484,12 +1485,13 @@
     // extractor simply never reports them and they stay null.
     if (typeof p.grammar === 'string') live.grammar = p.grammar;
     if (typeof p.parse === 'string') live.parse = p.parse;
+    if (typeof p.output === 'string') live.output = p.output;
     paintLive();
   }
 
   function startLive() {
     live = { phase: 'starting', pct: 0, tokens: 0, partial: '', startedAt: Date.now(),
-             grammar: null, parse: null };
+             grammar: null, parse: null, output: null };
     clearInterval(liveTimer);
     // Ticks the elapsed seconds even while the model is quiet, which is the
     // difference between "working" and "hung" from the outside.
@@ -1500,7 +1502,7 @@
     clearInterval(liveTimer);
     liveTimer = null;
     live = { phase: '', pct: 0, tokens: 0, partial: '', startedAt: 0,
-             grammar: null, parse: null };
+             grammar: null, parse: null, output: null };
   }
 
   function liveLabel() {
@@ -1828,7 +1830,12 @@
       try {
         return parseModelJSON(text, trace);
       } finally {
-        report({ parse: trace.stage || 'unusable' });
+        // The output itself, not only the verdict on it. Every question left
+        // standing in this feature has ended at "what did it actually say",
+        // and until now that was answerable only by the self-test, which runs
+        // a fixed sentence rather than the entry you are looking at.
+        report({ parse: trace.stage || 'unusable', output: MODEL_OUTPUT_CAP
+          ? String(text == null ? '' : text).slice(0, MODEL_OUTPUT_CAP) : '' });
       }
     });
   }
@@ -1842,6 +1849,10 @@
   // in the app behaves differently for it; the self-test reports it, because
   // "parsed as-is" and "parsed after salvaging three fields out of the
   // wreckage" are the same outcome here and very different model behaviour.
+  // Enough to see the shape and where it went wrong, not so much that a
+  // looping model fills the record with its own noise.
+  var MODEL_OUTPUT_CAP = 600;
+
   function parseModelJSON(text, trace) {
     trace = trace || {};
     var raw = String(text == null ? '' : text);
@@ -2000,7 +2011,8 @@
       confidence: result.confidence, needsReview: band === 'medium', suggestion: null,
       error: null, ms: live.startedAt ? Date.now() - live.startedAt : null,
       msFirst: (live.startedAt && live.firstTokenAt) ? live.firstTokenAt - live.startedAt : null,
-      grammar: live.grammar, parse: live.parse
+      grammar: live.grammar, parse: live.parse,
+      output: (live.parse && live.parse !== 'as-is') ? live.output : null
     };
     if (rec.enrichment.ms) localStorage.setItem('enrichLastMs', String(rec.enrichment.ms));
     if (band === 'low' || result.type === null) {
@@ -2040,6 +2052,7 @@
     // a run that produced nothing.
     rec.enrichment.grammar = null;
     rec.enrichment.parse = null;
+    rec.enrichment.output = null;
     return put(rec).then(function () { render(); });
   }
 
@@ -2062,6 +2075,7 @@
         (live.startedAt && live.firstTokenAt) ? live.firstTokenAt - live.startedAt : null;
       rec.enrichment.grammar = live.grammar;
       rec.enrichment.parse = live.parse;
+      rec.enrichment.output = live.output;
       // On the record, not in a variable: the reason has to survive a reload
       // and belong to this entry rather than to whichever failed most recently.
       rec.enrichment.error = errorText(err) + (extra || '');
@@ -2100,7 +2114,7 @@
       raw: raw,
       capturedAt: now,
       captureSource: 'text',
-      enrichment: { status: 'pending', model: null, at: null, confidence: null, needsReview: false, suggestion: null, error: null, ms: null, msFirst: null, grammar: null, parse: null },
+      enrichment: { status: 'pending', model: null, at: null, confidence: null, needsReview: false, suggestion: null, error: null, ms: null, msFirst: null, grammar: null, parse: null, output: null },
       type: null, title: null, occurredAt: null,
       tags: [], rating: null, details: {}, links: [],
       // Things you have told the extractor about this entry. Kept out of raw
@@ -2115,7 +2129,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-10';
+  var APP_VERSION = 'log-v3-11';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -2282,6 +2296,7 @@
     // On screen the failure is already spelled out in the sentence above
     // these rows; in the copied report there is no sentence, so it goes in.
     if (withError && e.status === 'failed' && e.error) rows.push(['error', e.error, 'bad']);
+    if (e.output) rows.push(['output', JSON.stringify(e.output), 'warn']);
     return rows;
   }
 
