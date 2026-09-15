@@ -1403,12 +1403,32 @@
   // throws — an unrecognised guess degrades to "no guess" (§3.1: uncertainty
   // is allowed), it never blocks the record from reaching enrichment.status
   // 'done'.
+  // Even with tags last, a model that loops still writes a hundred of them.
+  // Twenty-four copies of "tack" are not twenty-four tags, and an entry is a
+  // sentence, not a corpus: trimmed, deduped case-insensitively, capped.
+  var MAX_TAGS = 8;
+
+  function cleanTags(tags) {
+    if (!Array.isArray(tags)) return [];
+    var seen = {}, out = [];
+    for (var i = 0; i < tags.length && out.length < MAX_TAGS; i++) {
+      if (typeof tags[i] !== 'string') continue;
+      var t = tags[i].trim();
+      if (!t) continue;
+      var k = t.toLowerCase();
+      if (seen[k] === 1) continue;
+      seen[k] = 1;
+      out.push(t);
+    }
+    return out;
+  }
+
   function validateExtraction(result) {
     var out = {
       type: TYPES.indexOf(result.type) !== -1 ? result.type : null,
       title: typeof result.title === 'string' ? result.title : null,
       occurredAt: typeof result.occurredAt === 'string' ? result.occurredAt : null,
-      tags: Array.isArray(result.tags) ? result.tags.filter(function (t) { return typeof t === 'string'; }) : [],
+      tags: cleanTags(result.tags),
       rating: (Number.isInteger(result.rating) && result.rating >= 1 && result.rating <= 5) ? result.rating : null,
       details: (result.details && typeof result.details === 'object') ? result.details : {},
       // null, not 0. "Did not say" and "said it is hopeless" are different
@@ -1723,10 +1743,24 @@
         // settles. Not one token, for the full 15-minute cap. anyOf compiles.
         title: { anyOf: [{ type: 'string' }, { type: 'null' }] },
         occurredAt: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-        tags: { type: 'array', items: { type: 'string' } },
         rating: { anyOf: [{ type: 'integer' }, { type: 'null' }] },
         details: { type: 'object' },
-        confidence: { type: 'number' }
+        confidence: { type: 'number' },
+        // Last on purpose, and the order is load-bearing. XGrammar reads
+        // `properties` with ordered_keys(), so declaration order is the order
+        // the model must emit in — verified by compiling both orders against
+        // the pinned 0.1.0 wasm. An unbounded array is where a small model
+        // goes to die: a phone wrote "type": null, "title": null and then
+        // 22 copies of "tack" inside tags, spending all 220 tokens before
+        // rating, details and confidence existed at all. That looked like a
+        // model refusing to fill details. It was starvation. With tags last,
+        // everything else is already committed when the looping starts, and
+        // the repair pass recovers it.
+        //
+        // maxItems is what one would reach for instead, and on this version
+        // it does nothing: 0.1.0 lists it under WarnUnsupportedKeywords, and
+        // adding it leaves the emitted grammar byte-identical.
+        tags: { type: 'array', items: { type: 'string' } }
       },
       required: ['type', 'title', 'tags', 'rating', 'details', 'confidence']
     });
@@ -2081,7 +2115,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-9';
+  var APP_VERSION = 'log-v3-10';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';

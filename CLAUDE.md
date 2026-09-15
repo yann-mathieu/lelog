@@ -46,7 +46,7 @@ The enrichment questioner and the quiz questioner are **the same component** at 
 
 ## Testing
 
-116 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
+118 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
 
 ```bash
 python3 test/smoke.py            # all
@@ -184,9 +184,13 @@ to catch, `completeWithFallback` useless. A union type
 and a test in `smoke.py` now rejects unions. Read the grammar it emits
 rather than reasoning about what strict mode ought to forbid: `details:
 { type: 'object' }` looks restrictive and in fact compiles to
-`basic_object`, which allows any key — `details` comes back `{}` because the
-model declines to fill it, which is a prompt problem wearing a schema
-costume. Variants can be compiled in isolation — the
+`basic_object`, which allows any key. **Property order in the schema is
+load-bearing** — xgrammar reads `properties` with `ordered_keys()`, so
+declaration order is emission order, and an unbounded array declared early
+starves everything after it: a phone spent all 220 tokens on 22 copies of
+`"tack"` inside `tags`, and `details` was empty because it was never
+reached. `tags` is last for that reason. `maxItems` would be the bound and
+is ignored on 0.1.0. Variants can be compiled in isolation — the
 xgrammar wasm is embedded in its npm package, so it needs no weights and no
 GPU, which is the cheapest real check in this whole feature.
 

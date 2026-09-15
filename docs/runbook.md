@@ -13,7 +13,7 @@ Written 13 September 2026, at `log-v3-8`.
 | | |
 |---|---|
 | version | `log-v3-8` |
-| tests | 116 / 116 passing |
+| tests | 118 / 118 passing |
 | app | `index.html`, ~3,000 lines, no build step |
 | default model | `llama-1b` → `q4f32_1`, always — the 16-bit build is never used |
 | verified | `llama-1b` and `smol-360m` both run end to end on desktop Chrome + NVIDIA, f32 |
@@ -45,7 +45,7 @@ itself needs no dependencies at all.
 ## Three things you can run
 
 ```bash
-# 116 tests. Offline, stubbed Dropbox, no GPU, no weights. ~6 minutes.
+# 118 tests. Offline, stubbed Dropbox, no GPU, no weights. ~6 minutes.
 ~/.venvs/lelog/bin/python test/smoke.py
 ~/.venvs/lelog/bin/python test/smoke.py search   # just matching names
 ```
@@ -307,17 +307,29 @@ has the hardware. The flag was wrong in both directions, so the app stopped
 reading it: every build is `q4f32_1`. Diagnostics still prints the claim,
 marked `(unused)`, because it is a fact about the device and not a lever.
 
-**`details` comes back `{}` every time, and the grammar is not why.** That
-was the first guess and it was wrong: `details: { type: 'object' }` compiles
-to xgrammar's `basic_object`, which permits `{"anyKey": anyValue, ...}`. The
-schema already allows free-form details. The model simply declines to fill
-them — `llama-1b` writes `"details": {}` with the keys available to it, on a
-note that plainly states a cuisine and a dish. So this is the prompt or the
-model, not the schema. The prompt names every type's keys in one dense line
-(`book author/genre/format; restaurant cuisine/...`), and a 1B model picking
-a type and then the right sub-list is evidently a step too far. Read the
-emitted grammar before blaming it — `Grammar.fromJSONSchema(...)` stringifies
-to the EBNF, and its wasm needs no weights and no GPU.
+**Solved: `details` came back `{}` because it was never reached.** Two
+guesses missed it. The first blamed the grammar; the second blamed the
+prompt. The self-test's verbatim output settled it — the phone produced
+
+```
+{"type": null, "title": null, "tags": ["One","tied","tack","tied","tack", ... ]
+```
+
+— 22 copies of `"tack"`, all 220 tokens gone inside the tags array, with
+`rating`, `details` and `confidence` never written at all. Not a refusal:
+starvation. XGrammar reads `properties` with `ordered_keys()`, so schema
+declaration order is the order the model must emit in, and an unbounded
+array declared early is a hole the budget falls into. `tags` is now last,
+so everything else is committed before the looping can start.
+
+`maxItems` is the keyword that ought to bound it, and on the pinned 0.1.0 it
+does nothing — listed under `WarnUnsupportedKeywords`, and adding it leaves
+the emitted grammar byte-identical. Compile both orders yourself before
+believing any of this: `Grammar.fromJSONSchema(...)` stringifies to EBNF and
+its wasm needs no weights and no GPU.
+
+Whether `details` now fills, rather than merely getting a turn, is still
+unknown — that needs a run on the device.
 
 **Small models classify confidently and wrongly.** `llama-1b` read a
 restaurant dinner as `type: book` and self-rated it 0.9, so it applies with

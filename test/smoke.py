@@ -2919,6 +2919,53 @@ def test_a_whole_pass_through_the_real_model_layer(page, base_url):
 
 
 @test
+def test_tags_are_last_so_they_cannot_starve_the_other_fields(page, base_url):
+    """XGrammar reads `properties` with ordered_keys(), so declaration order
+    is the order the model must emit in — checked by compiling both orders
+    against the pinned 0.1.0 wasm.
+
+    An unbounded array declared early is a budget hole. A phone produced
+    `"type": null, "title": null` and then 22 copies of "tack" inside tags,
+    spending all 220 tokens before rating, details and confidence existed.
+    That read as a model refusing to fill details; it was starvation.
+    """
+    stub_model_layer(page)
+
+    boot(page, base_url)
+    capture(page, "finished dune")
+    enrich(page)
+    wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+
+    schema = json.loads(
+        page.evaluate("() => window.__LELOG_SEEN_REQ__.response_format.schema"))
+    order = list(schema["properties"])
+    assert order[-1] == "tags", f"tags must be emitted last, got {order}"
+    for field in ("rating", "details", "confidence"):
+        assert order.index(field) < order.index("tags"), \
+            f"{field} is written after tags and can be starved by one: {order}"
+
+
+@test
+def test_a_runaway_tag_list_is_capped_and_deduped(page, base_url):
+    """Twenty-four copies of "tack" are not twenty-four tags. Ordering stops
+    a loop costing the other fields; this stops it reaching the record."""
+    stub_model_layer(page)
+    page.add_init_script(model_says(json.dumps(json.dumps({
+        "type": "book", "title": "Dune", "occurredAt": None,
+        "rating": 5, "details": {}, "confidence": 0.9,
+        "tags": ["One", " tied ", "tack", "tied", "TACK", ""] + ["tack"] * 30,
+    }))))
+
+    boot(page, base_url)
+    capture(page, "finished dune")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+    tags = rec["tags"]
+    assert tags == ["One", "tied", "tack"], tags
+
+
+@test
 def test_the_grammar_has_no_union_types(page, base_url):
     """A union type in the schema hangs enrichment for the full 15-minute cap.
 
