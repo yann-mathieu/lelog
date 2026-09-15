@@ -2919,6 +2919,76 @@ def test_a_whole_pass_through_the_real_model_layer(page, base_url):
 
 
 @test
+def test_nothing_in_the_schema_is_left_unbounded(page, base_url):
+    """XGrammar 0.1.0 ignores every bound it is given — maxLength, maxItems,
+    maxProperties, minimum, maximum are all in WarnUnsupportedKeywords. So a
+    bound has to be structural, and anything left open is somewhere this
+    model goes to loop: it spent a whole pass inside `tags`, and when that
+    moved to the end, a whole pass inside `details` writing
+    {"x": 0,": 0,": 0, ... until the tokens ran out.
+    """
+    stub_model_layer(page)
+
+    boot(page, base_url)
+    capture(page, "finished dune")
+    enrich(page)
+    wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+
+    schema = json.loads(
+        page.evaluate("() => window.__LELOG_SEEN_REQ__.response_format.schema"))
+    props = schema["properties"]
+
+    # An unbounded digit run returned "rating": 2448 from a phone.
+    assert "enum" in props["rating"], props["rating"]
+    assert props["rating"]["enum"] == [1, 2, 3, 4, 5, None], props["rating"]
+
+    # An open object is the loop. Closed, and naming every key the app knows.
+    details = props["details"]
+    assert details.get("additionalProperties") is False, details
+    for key in ("author", "cuisine", "director", "withWhom"):
+        assert key in details["properties"], f"{key} missing from details"
+
+
+@test
+def test_junk_that_the_grammar_cannot_reject_is_dropped(page, base_url):
+    """The grammar has one details rule for nine types and cannot express a
+    date at all, so the last filter is this one. A phone answered "film" for
+    every string field in turn, and "occurredAt": "film" reached the record."""
+    stub_model_layer(page)
+    page.add_init_script(model_says(json.dumps(json.dumps({
+        "type": "book", "title": "The Big Short", "occurredAt": "film",
+        "rating": 4, "confidence": 0.8, "tags": [],
+        # cuisine belongs to restaurant, not book; author does belong.
+        "details": {"author": " Michael Lewis ", "cuisine": "french", "genre": ""},
+    }))))
+
+    boot(page, base_url)
+    capture(page, "the big short, on audio")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+    assert rec["occurredAt"] is None, f'"film" is not a date: {rec["occurredAt"]}'
+    assert rec["details"] == {"author": "Michael Lewis"}, rec["details"]
+
+
+@test
+def test_a_real_date_still_survives(page, base_url):
+    """The date filter must not eat the thing it exists to protect."""
+    stub_model_layer(page)
+    page.add_init_script(model_says(json.dumps(json.dumps({
+        "type": "book", "title": "Dune", "occurredAt": "2026-09-04",
+        "rating": 5, "confidence": 0.9, "tags": [], "details": {},
+    }))))
+
+    boot(page, base_url)
+    capture(page, "finished dune")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+    assert rec["occurredAt"] == "2026-09-04", rec["occurredAt"]
+
+
+@test
 def test_a_messy_pass_keeps_what_the_model_actually_said(page, base_url):
     """Every question left standing in this feature has ended at "what did it
     actually say". Until now that was answerable only by the self-test, which

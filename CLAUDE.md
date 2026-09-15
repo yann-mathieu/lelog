@@ -46,7 +46,7 @@ The enrichment questioner and the quiz questioner are **the same component** at 
 
 ## Testing
 
-121 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
+124 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
 
 ```bash
 python3 test/smoke.py            # all
@@ -189,8 +189,17 @@ load-bearing** — xgrammar reads `properties` with `ordered_keys()`, so
 declaration order is emission order, and an unbounded array declared early
 starves everything after it: a phone spent all 220 tokens on 22 copies of
 `"tack"` inside `tags`, and `details` was empty because it was never
-reached. `tags` is last for that reason. `maxItems` would be the bound and
-is ignored on 0.1.0. Variants can be compiled in isolation — the
+reached. `tags` is last for that reason — and moving it there simply relocated the
+loop into `details`, which as `{ type: 'object' }` compiled to
+`basic_object` and let a phone write `{"x": 0,": 0,": 0, ...` until the
+tokens ran out. **0.1.0 ignores every bound there is** — `maxLength`,
+`maxItems`, `maxProperties`, `minimum`, `maximum` are all in
+`WarnUnsupportedKeywords` — so a bound must be structural: an `enum`, a
+closed `properties` set with `additionalProperties: false`, or nothing.
+`rating` is an enum because `{ type: 'integer' }` returned 2448; `details`
+names every key the app knows and forbids the rest. What the grammar
+still cannot say — that a date is a date, that `cuisine` belongs to a
+restaurant and not a book — `validateExtraction` drops. Variants can be compiled in isolation — the
 xgrammar wasm is embedded in its npm package, so it needs no weights and no
 GPU, which is the cheapest real check in this whole feature.
 

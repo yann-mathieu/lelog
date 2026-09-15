@@ -13,7 +13,7 @@ Written 13 September 2026, at `log-v3-8`.
 | | |
 |---|---|
 | version | `log-v3-8` |
-| tests | 121 / 121 passing |
+| tests | 124 / 124 passing |
 | app | `index.html`, ~3,000 lines, no build step |
 | default model | `llama-1b` → `q4f32_1`, always — the 16-bit build is never used |
 | verified | `llama-1b` and `smol-360m` both run end to end on desktop Chrome + NVIDIA, f32 |
@@ -45,7 +45,7 @@ itself needs no dependencies at all.
 ## Three things you can run
 
 ```bash
-# 121 tests. Offline, stubbed Dropbox, no GPU, no weights. ~6 minutes.
+# 124 tests. Offline, stubbed Dropbox, no GPU, no weights. ~6 minutes.
 ~/.venvs/lelog/bin/python test/smoke.py
 ~/.venvs/lelog/bin/python test/smoke.py search   # just matching names
 ```
