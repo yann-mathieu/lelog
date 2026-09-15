@@ -46,7 +46,7 @@ The enrichment questioner and the quiz questioner are **the same component** at 
 
 ## Testing
 
-124 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
+127 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
 
 ```bash
 python3 test/smoke.py            # all
@@ -202,6 +202,19 @@ still cannot say — that a date is a date, that `cuisine` belongs to a
 restaurant and not a book — `validateExtraction` drops. Variants can be compiled in isolation — the
 xgrammar wasm is embedded in its npm package, so it needs no weights and no
 GPU, which is the cheapest real check in this whole feature.
+
+**The schema is necessary and never sufficient.** Four rounds of closing
+grammar holes ended with `llama-1b` emitting valid, complete JSON that said
+`type: film, title: "film"` on an audiobook note. `qwen-1.5b` on the same
+device and prompt got the title exactly right and was faster, which is why
+it is the default. Before tuning a schema again, check the model can do the
+task at all. And check the prompt names every field the schema requires:
+`rating` was in `required` and unmentioned, so the grammar forced a number
+the model knew nothing about and a note expressing no opinion came back
+1/5; `tags` was mentioned only when a tag vocabulary existed, so it went
+silent on a fresh log — which is where `"One", "tied", "tack"` came from.
+Confidence remains worthless: every model tried reports 1.0 for everything,
+so the high/medium/low bands never fire and nothing is marked for review.
 
 **Look at UI before shipping it.** Drive the app with Playwright at a phone
 width (412×915) and screenshot the state being changed. A toast with no

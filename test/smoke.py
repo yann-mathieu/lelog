@@ -2919,6 +2919,71 @@ def test_a_whole_pass_through_the_real_model_layer(page, base_url):
 
 
 @test
+def test_the_prompt_explains_every_field_the_schema_demands(page, base_url):
+    """rating is in the schema's `required` list and was never mentioned in
+    the prompt, so the grammar demanded a number the model had been told
+    nothing about. A note expressing no opinion came back 1/5 — invented, and
+    worse than absent, since it reads as dislike."""
+    stub_model_layer(page)
+
+    boot(page, base_url)
+    capture(page, "the big short, on audio")
+    enrich(page)
+    wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+
+    prompt = page.evaluate(
+        "() => window.__LELOG_SEEN_REQ__.messages[0].content")
+    schema = json.loads(
+        page.evaluate("() => window.__LELOG_SEEN_REQ__.response_format.schema"))
+
+    assert "rating" in prompt, f"the schema requires rating, the prompt never says so:\n{prompt}"
+    assert "null" in prompt, "nothing tells the model that null is an answer"
+    # Every required field the model has to invent a value for gets a mention.
+    for field in schema["required"]:
+        if field in ("title",):        # the note itself is the instruction
+            continue
+        assert field in prompt, f"{field} is required but unexplained:\n{prompt}"
+
+
+@test
+def test_a_tag_that_repeats_the_type_or_title_is_dropped(page, base_url):
+    """A model handed "The Big Short" returned it as the title, as a tag and
+    as the show. Three chips reading the same words is noise."""
+    stub_model_layer(page)
+    page.add_init_script(model_says(json.dumps(json.dumps({
+        "type": "podcast", "title": "The Big Short", "occurredAt": None,
+        "rating": None, "confidence": 0.9, "details": {"show": "The Big Short"},
+        "tags": ["The Big Short", "podcast", "audiobook"],
+    }))))
+
+    boot(page, base_url)
+    capture(page, "the big short, on audio")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+    assert rec["tags"] == ["audiobook"], rec["tags"]
+
+
+@test
+def test_the_default_model_is_the_one_that_works(page, base_url):
+    """llama-1b read an audiobook note as type film, title "film". The 1.5B
+    got the title right and was faster. Someone who has already chosen keeps
+    their choice; this is only the fallback."""
+    stub_model_layer(page)
+    boot(page, base_url)
+
+    open_sheet(page)
+    assert page.input_value("#enrichModelSel") == "qwen-1.5b"
+
+    page.select_option("#enrichModelSel", "smol-360m")
+    page.reload()
+    page.wait_for_selector("#list")
+    open_sheet(page)
+    assert page.input_value("#enrichModelSel") == "smol-360m", \
+        "a stored choice must survive a change of default"
+
+
+@test
 def test_nothing_in_the_schema_is_left_unbounded(page, base_url):
     """XGrammar 0.1.0 ignores every bound it is given — maxLength, maxItems,
     maxProperties, minimum, maximum are all in WarnUnsupportedKeywords. So a
@@ -3797,8 +3862,11 @@ def test_the_run_is_hidden_until_you_ask_for_it(page, base_url):
 
     open_entry(page)
     assert page.locator(".erun-row").count() == 0
-    # But the compact line still carries the model and the confidence.
-    assert "Llama" in page.locator(".ereadout-foot").inner_text()
+    # But the compact line still carries the model and the confidence. Read
+    # the id off the record rather than naming a family, so changing the
+    # default model is not a test failure.
+    model = records(page)[0]["enrichment"]["model"]
+    assert model and model in page.locator(".ereadout-foot").inner_text()
 
     # Turning it on redraws the list, so the entry already open gains the
     # rows in place rather than needing to be opened again.

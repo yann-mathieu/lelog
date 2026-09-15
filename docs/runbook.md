@@ -13,10 +13,10 @@ Written 13 September 2026, at `log-v3-8`.
 | | |
 |---|---|
 | version | `log-v3-8` |
-| tests | 124 / 124 passing |
+| tests | 127 / 127 passing |
 | app | `index.html`, ~3,000 lines, no build step |
-| default model | `llama-1b` → `q4f32_1`, always — the 16-bit build is never used |
-| verified | `llama-1b` and `smol-360m` both run end to end on desktop Chrome + NVIDIA, f32 |
+| default model | `qwen-1.5b` → `q4f32_1`, always — the 16-bit build is never used |
+| verified | `qwen-1.5b` extracts a real title on an Adreno 7xx; `llama-1b` does not |
 | unverified | extraction quality on the phone; `details` has never come back filled |
 
 ---
@@ -45,7 +45,7 @@ itself needs no dependencies at all.
 ## Three things you can run
 
 ```bash
-# 124 tests. Offline, stubbed Dropbox, no GPU, no weights. ~6 minutes.
+# 127 tests. Offline, stubbed Dropbox, no GPU, no weights. ~6 minutes.
 ~/.venvs/lelog/bin/python test/smoke.py
 ~/.venvs/lelog/bin/python test/smoke.py search   # just matching names
 ```
@@ -328,14 +328,28 @@ the emitted grammar byte-identical. Compile both orders yourself before
 believing any of this: `Grammar.fromJSONSchema(...)` stringifies to EBNF and
 its wasm needs no weights and no GPU.
 
-Whether `details` now fills, rather than merely getting a turn, is still
-unknown — that needs a run on the device.
+Closing the holes worked, and it was the last thing the schema could do.
+The same note through `llama-1b` then parsed `as-is` for the first time —
+valid, complete JSON — and said `type: film, title: "film"`. Well-formed
+and meaningless. Under `qwen-1.5b` it became `podcast` / `"The Big Short"` /
+`show: The Big Short`: the title exactly right, `details` correctly shaped,
+and faster (27s against 35s). **The schema was genuinely broken four times
+over and fixing it was necessary; it was never going to be sufficient.**
+`qwen-1.5b` is the default for that reason.
 
-**Small models classify confidently and wrongly.** `llama-1b` read a
-restaurant dinner as `type: book` and self-rated it 0.9, so it applies with
-no review marker at all — worse than the 360M's garbage, which at least
-landed as medium. Tags shred proper nouns (`le`, `servan`) when the tag
-vocabulary is empty.
+**The prompt described four of the seven fields it demands.** `rating` sat
+in the schema's `required` list and was never mentioned, so the grammar
+forced a number the model had been told nothing about — a note expressing no
+opinion came back `1/5`, which reads as dislike. `tags` was mentioned only
+when a tag vocabulary already existed, so on a fresh log the one line that
+would have helped vanished, and `llama-1b` returned `"One", "tied", "tack",
+"tack"`. Both now always explained, along with the audiobook case that had
+`podcast` and `book` competing with nothing to separate them.
+
+**Confidence is still worthless.** Every model tried reports `1.0` for
+everything, including `title: "film"`. The high/medium/low bands therefore
+never fire and nothing is ever marked for review. Deriving a confidence the
+app can trust — or dropping the bands — is open.
 
 **The question queue.** Phase 2 shipped extraction but deferred the
 interactive review screen into phase 3, where it merges with the clarifying

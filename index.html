@@ -1303,7 +1303,14 @@
     { key: 'qwen-1.5b', label: 'Qwen2.5 1.5B — best extraction, heaviest (~1.6GB)',
       f16: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC', f32: 'Qwen2.5-1.5B-Instruct-q4f32_1-MLC' }
   ];
-  var DEFAULT_MODEL_KEY = 'llama-1b';
+  // Qwen 1.5B, not Llama 1B. On a Qualcomm Adreno 7xx the 1B read "I've
+  // listened to the audio book The Big Short" as type film, title "film",
+  // and nothing else; the 1.5B got the title exactly right, shaped details
+  // correctly for the type it chose, and did it in 27s against 35s. The
+  // extra ~0.7GB buys the difference between a wrong answer and a near one.
+  // Anyone who has already chosen a model keeps it — chosenModel() reads the
+  // stored key first and only falls back to this.
+  var DEFAULT_MODEL_KEY = 'qwen-1.5b';
   var enrichModelId = null; // the concrete id last attempted, for error text
   var enrichAdapter = '';   // what the GPU calls itself, likewise
   var lastEnrichFailure = ''; // why the most recent extraction gave up
@@ -1409,9 +1416,15 @@
   // sentence, not a corpus: trimmed, deduped case-insensitively, capped.
   var MAX_TAGS = 8;
 
-  function cleanTags(tags) {
+  function cleanTags(tags, type, title) {
     if (!Array.isArray(tags)) return [];
-    var seen = {}, out = [];
+    // The type and the title already have their own chips. A model handed
+    // "The Big Short" returned it as the title, as a tag, and as the show;
+    // three chips reading the same words is noise, not richness.
+    var seen = {};
+    if (typeof type === 'string') seen[type.trim().toLowerCase()] = 1;
+    if (typeof title === 'string') seen[title.trim().toLowerCase()] = 1;
+    var out = [];
     for (var i = 0; i < tags.length && out.length < MAX_TAGS; i++) {
       if (typeof tags[i] !== 'string') continue;
       var t = tags[i].trim();
@@ -1454,7 +1467,7 @@
       type: TYPES.indexOf(result.type) !== -1 ? result.type : null,
       title: typeof result.title === 'string' ? result.title : null,
       occurredAt: validDate(result.occurredAt),
-      tags: cleanTags(result.tags),
+      tags: cleanTags(result.tags, result.type, result.title),
       rating: (Number.isInteger(result.rating) && result.rating >= 1 && result.rating <= 5) ? result.rating : null,
       details: cleanDetails(result.details, TYPES.indexOf(result.type) !== -1 ? result.type : null),
       // null, not 0. "Did not say" and "said it is hopeless" are different
@@ -1824,9 +1837,25 @@
   // around a one-line note — the guide for all nine types, spelled out as
   // JSON, whichever type the note turned out to be.
   function buildPrompt(rec, ctx) {
-    var p = 'Extract JSON from a note.\ntype: one of ' + ctx.types.join('|') + ' or null.\n';
-    if (ctx.tags.length) p += 'tags: prefer existing ones — ' + ctx.tags.join(', ') + '.\n';
+    // rating, title and occurredAt were never mentioned here at all, while
+    // the schema lists rating as required — so the grammar demanded a number
+    // the model had been told nothing about, and a note expressing no opinion
+    // came back 1/5. Invented, and worse than absent: it reads as dislike.
+    var p = 'Extract JSON from a note.\n'
+      + 'Use only what the note says. Where it does not say, use null.\n'
+      + 'type: one of ' + ctx.types.join('|')
+      + ' or null. An audio book is a book, format audiobook.\n';
+    // Said always, not only when a vocabulary exists. tags is required by the
+    // schema, and on a fresh log there are no existing tags to prefer — so
+    // this line vanished exactly when the model most needed telling, and it
+    // duly returned "One", "tied", "tack", "tack", "tack".
+    p += 'tags: a few short topic words'
+      + (ctx.tags.length ? ', preferring these — ' + ctx.tags.join(', ') : '') + '.\n';
+    // The per-type key list stays. It looked redundant once the grammar named
+    // every key, but the grammar cannot say which key belongs to which type,
+    // and this line is why a 1.5B correctly produced show= on a podcast.
     p += 'details: keys for the type you pick — ' + compactHints(ctx.detailHints) + '.\n'
+      + 'rating: 1-5 only where the note judges it, null otherwise.\n'
       + 'confidence: 0-1, how sure you are.\n' + hintText(rec)
       + 'Note: "' + rec.raw + '"';
     return p;
@@ -2179,7 +2208,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-12';
+  var APP_VERSION = 'log-v3-13';
   var all = [], query = '', editingId = null;
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
