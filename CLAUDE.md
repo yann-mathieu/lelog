@@ -46,7 +46,7 @@ The enrichment questioner and the quiz questioner are **the same component** at 
 
 ## Testing
 
-130 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
+131 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
 
 ```bash
 python3 test/smoke.py            # all
@@ -215,6 +215,15 @@ the model knew nothing about and a note expressing no opinion came back
 silent on a fresh log — which is where `"One", "tied", "tack"` came from.
 Confidence remains worthless: every model tried reports 1.0 for everything,
 so the high/medium/low bands never fire and nothing is marked for review.
+
+**A wait that cannot say what it is doing looks like a hang.** WebLLM's
+`initProgressCallback` sends `{progress, timeElapsed, text}` and this app
+used only `progress` — which sits at or near 0 for minutes while shaders
+compile, so an Adreno reading a 1.5B from disk rendered as a frozen
+"loading model 0%" for two minutes. `text` is the field that separates
+downloading (the network is involved) from reading off disk from compiling
+(neither is). It is now carried on `live.text`, shortened for the tile
+badge by `loadingWord()`, and shown verbatim in the entry's own live panel.
 
 **Look at UI before shipping it.** Drive the app with Playwright at a phone
 width (412×915) and screenshot the state being changed. A toast with no

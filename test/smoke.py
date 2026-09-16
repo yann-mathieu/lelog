@@ -3269,7 +3269,49 @@ def test_model_load_progress_reaches_an_entry_trigger(page, base_url):
     capture(page, "watch it load")
     enrich(page)
 
-    page.wait_for_function("() => /loading model 50%/.test(document.body.textContent)")
+    # Against the badge, not document.body: the Settings sheet carries a
+    # static "Downloading model" label, which contains "loading model" and
+    # made this pass no matter what the badge actually said.
+    page.wait_for_selector(".estate.working")
+    page.wait_for_function(
+        "() => /50%/.test(document.querySelector('.estate.working').textContent)")
+
+
+@test
+def test_a_slow_load_says_which_kind_of_slow_it_is(page, base_url):
+    """"loading model 0%" sat on a phone for two minutes and looked hung. It
+    was not: WebLLM holds `progress` near zero while it compiles shaders, and
+    says so in the `text` this app was discarding. Downloading, reading from
+    disk and compiling are three different waits and only one of them means
+    the network is involved."""
+    stub_model_layer(page)
+    page.add_init_script("""
+        window.__LELOG_TEST_WEBLLM__.CreateMLCEngine = (id, opts) => {
+            opts.initProgressCallback(
+                { progress: 0, text: 'Loading GPU shader modules[12/163]' });
+            return new Promise(() => {});
+        };
+    """)
+
+    boot(page, base_url)
+    capture(page, "watch it load")
+    enrich(page)
+
+    page.wait_for_selector(".estate.working")
+    page.wait_for_function(
+        "() => /compiling shaders/.test(document.querySelector('.estate.working').textContent)")
+
+    # And the entry's own screen carries the step, what it is doing, and how
+    # long it has been at it — the self-test's shape, where a person waits.
+    open_entry(page)
+    # The panel is filled by paintLive on its own tick, so wait for content
+    # rather than for the element that will hold it.
+    page.wait_for_function(
+        "() => (document.querySelector('#evPhase') || {}).textContent")
+    assert "compiling shaders" in page.inner_text("#evPhase"), page.inner_text("#evPhase")
+    assert "163" in page.inner_text("#evDetail"), page.inner_text("#evDetail")
+    elapsed = page.inner_text("#evElapsed")
+    assert elapsed.endswith("s"), f"elapsed reads {elapsed!r}"
 
 
 @test

@@ -1571,7 +1571,7 @@
   // time and then seconds of silent GPU work, so without this the only
   // honest thing the app could say was "enriching…" and hope.
   var live = { phase: '', pct: 0, tokens: 0, partial: '', startedAt: 0, firstTokenAt: 0,
-               grammar: null, parse: null, output: null };
+               grammar: null, parse: null, output: null, text: '' };
   var liveTimer = null;
   var enrichCancel = false;
   var enrichAbort = null; // rejects the in-flight pass when you press Stop
@@ -1592,12 +1592,13 @@
     if (typeof p.grammar === 'string') live.grammar = p.grammar;
     if (typeof p.parse === 'string') live.parse = p.parse;
     if (typeof p.output === 'string') live.output = p.output;
+    if (typeof p.text === 'string') live.text = p.text;
     paintLive();
   }
 
   function startLive() {
     live = { phase: 'starting', pct: 0, tokens: 0, partial: '', startedAt: Date.now(),
-             grammar: null, parse: null, output: null };
+             grammar: null, parse: null, output: null, text: '' };
     clearInterval(liveTimer);
     // Ticks the elapsed seconds even while the model is quiet, which is the
     // difference between "working" and "hung" from the outside.
@@ -1608,13 +1609,13 @@
     clearInterval(liveTimer);
     liveTimer = null;
     live = { phase: '', pct: 0, tokens: 0, partial: '', startedAt: 0,
-             grammar: null, parse: null, output: null };
+             grammar: null, parse: null, output: null, text: '' };
   }
 
   function liveLabel() {
     var secs = live.startedAt ? Math.round((Date.now() - live.startedAt) / 1000) : 0;
     if (live.phase === 'loading') {
-      return 'loading model ' + live.pct + '%' + (secs ? ' · ' + secs + 's' : '');
+      return loadingWord() + ' ' + live.pct + '%' + (secs ? ' · ' + secs + 's' : '');
     }
     if (live.phase === 'running') {
       // Before the first token the model is reading the note, which on a
@@ -1626,6 +1627,18 @@
       return 'writing · ' + secs + 's · ' + live.tokens + ' tokens' + rate;
     }
     return 'starting · ' + secs + 's' + pace();
+  }
+
+  // WebLLM's own words, shortened to fit a row. Downloading, reading from
+  // disk and compiling shaders are three very different waits, and the last
+  // one holds `progress` at 0 while it runs — so a single "loading model 0%"
+  // makes the longest of the three look like a hang.
+  function loadingWord() {
+    var t = live.text || '';
+    if (/shader/i.test(t)) return 'compiling shaders';
+    if (/fetch/i.test(t)) return 'downloading model';
+    if (/cache/i.test(t)) return 'reading model from disk';
+    return 'loading model';
   }
 
   // What this device did last time, so "is this normal?" has an answer that
@@ -1645,6 +1658,33 @@
     if (foot) foot.textContent = liveLabel();
     var evState = document.getElementById('evState');
     if (evState && viewingId === enrichingId) evState.textContent = liveLabel();
+    var phase = document.getElementById('evPhase');
+    if (phase && viewingId === enrichingId) {
+      var secs = live.startedAt ? Math.round((Date.now() - live.startedAt) / 1000) : 0;
+      phase.textContent = live.phase === 'loading' ? loadingWord()
+        : live.phase === 'running' ? (live.tokens ? 'writing' : 'reading your note')
+        : 'starting';
+      var detail = document.getElementById('evDetail');
+      // WebLLM's own words while loading; the model's own pace once it writes.
+      if (detail) {
+        detail.textContent = live.phase === 'loading'
+          ? (live.text || live.pct + '%')
+          : live.tokens
+            ? live.tokens + ' tokens'
+              + (live.firstTokenAt
+                  ? ' \u00b7 ' + (live.tokens / Math.max(0.5, (Date.now() - live.firstTokenAt) / 1000)).toFixed(1) + '/s'
+                  : '')
+            : 'nothing yet';
+      }
+      var el = document.getElementById('evElapsed');
+      if (el) el.textContent = secs < 60 ? secs + 's'
+        : Math.floor(secs / 60) + 'm ' + (secs % 60) + 's';
+      var pace = document.getElementById('evPace');
+      if (pace) {
+        var last = +localStorage.getItem('enrichLastMs');
+        pace.textContent = last ? 'last pass took ' + Math.round(last / 1000) + 's' : '';
+      }
+    }
     var stream = document.getElementById('liveStream');
     if (stream) {
       stream.textContent = live.partial || '';
@@ -1953,7 +1993,13 @@
     // that is a several-hundred-megabyte download, and triggering it from an
     // entry used to show nothing at all until it finished.
     return getEnrichEngine(function (p) {
-      report({ phase: 'loading', pct: Math.round((p.progress || 0) * 100) });
+      // p.text is the only thing that separates a stalled load from a slow
+      // one: WebLLM reports "Fetching param cache[3/38]", "Loading model from
+      // cache[...]" and "Loading GPU shader modules[112/163]" — and during
+      // shader compilation `progress` sits at 0 for minutes, which this app
+      // rendered as a frozen "loading model 0%".
+      report({ phase: 'loading', pct: Math.round((p.progress || 0) * 100),
+               text: p.text || '' });
     }).then(function (engine) {
       report({ phase: 'running', tokens: 0, partial: '' });
       // A strict schema is compiled into a decoding grammar before the model
@@ -2278,7 +2324,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-15';
+  var APP_VERSION = 'log-v3-16';
   var all = [], query = '';
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -2598,18 +2644,31 @@
           + '<input class="hint-input" id="evHint" placeholder="Tell the AI what to add or focus on\u2026">'
           + '<button class="btn" id="evEnrich">Enrich</button>'
         + '</div>'
-        + '<p class="ev-note" id="evState">' + esc(entryStateLine(rec)) + '</p>'
-        // The model's output as it arrives. Proof of life on a pass that can
-        // take a minute, and the only way to see what it is producing rather
-        // than only the verdict on it.
         + (rec.id === enrichingId
-            ? '<pre class="live-stream" id="liveStream" hidden></pre>'
-              + '<button class="linkbtn act-stop-enrich" style="padding:6px 0;margin-left:0;color:var(--muted)">Stop</button>'
-            : '')
+            ? livePanel()
+            : '<p class="ev-note" id="evState">' + esc(entryStateLine(rec)) + '</p>')
         + (devDetails() ? runBlock(rec) : '')
       + '</div>';
 
     wireEntryView(rec);
+  }
+
+  // A pass takes a minute or several, and one frozen line cannot tell you
+  // whether it is working. The self-test earns its keep by naming each step
+  // as it happens; this is the same idea where a person actually waits, with
+  // the values written by paintLive rather than re-rendered.
+  function livePanel() {
+    return '<div class="erun">'
+      + '<div class="erun-row"><span>step</span><b id="evPhase"></b></div>'
+      + '<div class="erun-row"><span>doing</span><b id="evDetail"></b></div>'
+      + '<div class="erun-row"><span>elapsed</span><b id="evElapsed"></b></div>'
+      + '<pre class="live-stream" id="liveStream" hidden></pre>'
+      + '<div class="erun-foot">'
+        // margin-left:auto on .act-stop-enrich is for the tile's meta row,
+        // where it belongs at the far end. Here it reads as adrift.
+        + '<button class="act-copy-run act-stop-enrich" type="button" style="margin-left:0">Stop</button>'
+        + '<em id="evPace"></em>'
+      + '</div></div>';
   }
 
   function entryStateLine(rec) {
