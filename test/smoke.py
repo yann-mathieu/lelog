@@ -51,7 +51,7 @@ ROOT = Path(__file__).resolve().parent.parent
 V2_KEYS = {
     "id", "schemaVersion", "raw", "capturedAt", "captureSource", "enrichment",
     "type", "title", "occurredAt", "tags", "rating", "details", "links",
-    "hints", "userEdited", "media", "createdAt", "updatedAt", "deleted",
+    "hints", "generated", "userEdited", "media", "createdAt", "updatedAt", "deleted",
 }
 
 # Only ever present on a tombstoned record.
@@ -2457,6 +2457,99 @@ def test_enrichment_does_not_apply_low_confidence(page, base_url):
     assert rec["title"] is None
     assert rec["enrichment"]["suggestion"]["type"] == "idea"
     assert page.locator(".chips").count() == 0
+
+
+def stub_ask(page, answer):
+    """Replace the generation call. Same idea as the extractor seam, and a
+    separate one on purpose: asking and extracting are different jobs."""
+    page.add_init_script("""
+        window.__LELOG_TEST_ASK__ = (rec, question, report) => {
+            window.__LELOG_ASKED__ = { raw: rec.raw, question };
+            return Promise.resolve(%s);
+        };
+        localStorage.setItem('enrichmentEnabled', '1');
+    """ % json.dumps(answer))
+
+
+@test
+def test_a_question_is_answered_and_kept_on_the_entry(page, base_url):
+    """Generation, not extraction. The answer is the model's prose and is
+    stored apart from every field pulled out of the note."""
+    stub_ask(page, "Michael Lewis follows a handful of investors who bet "
+                   "against the US housing market.")
+    boot(page, base_url)
+    capture(page, "I've listened to the audio book The Big Short")
+
+    open_entry(page)
+    page.fill("#evAsk", "Summarise this book")
+    page.click("#evAskBtn")
+
+    rec = wait_for_record(page, lambda r: len(r.get("generated", [])) == 1,
+                          timeout=15000)
+    assert rec, "the answer was never stored"
+    g = rec["generated"][0]
+    assert g["ask"] == "Summarise this book"
+    assert "Michael Lewis" in g["text"]
+    assert g["model"], "the answer does not say which model wrote it"
+
+    # The question went to the model with the note attached.
+    asked = page.evaluate("() => window.__LELOG_ASKED__")
+    assert asked["question"] == "Summarise this book"
+    assert "Big Short" in asked["raw"]
+
+
+@test
+def test_an_answer_never_touches_the_labels(page, base_url):
+    """The whole reason this is a separate field. Extraction refuses when it
+    cannot tell; generation invents instead, so it must never be mistaken for
+    something your note said."""
+    stub_ask(page, "type: book. title: Something Else.")
+    boot(page, base_url)
+    capture(page, "I've listened to the audio book The Big Short")
+
+    open_entry(page)
+    page.fill("#evAsk", "What is this")
+    page.click("#evAskBtn")
+    wait_for_record(page, lambda r: len(r.get("generated", [])) == 1, timeout=15000)
+
+    rec = records(page)[0]
+    assert rec["type"] is None, rec["type"]
+    assert rec["title"] is None, rec["title"]
+    assert rec["tags"] == [] and rec["details"] == {}
+    assert rec["enrichment"]["status"] == "pending", rec["enrichment"]["status"]
+
+
+@test
+def test_an_answer_says_it_was_written_by_the_model(page, base_url):
+    """It will be confidently wrong sometimes. Whoever reads it later has to
+    be able to see, without thinking about it, that no human wrote it."""
+    stub_ask(page, "A book about the 2008 crash.")
+    boot(page, base_url)
+    capture(page, "the big short")
+
+    open_entry(page)
+    page.fill("#evAsk", "What is it about")
+    page.click("#evAskBtn")
+    page.wait_for_selector(".gen")
+
+    assert "written by" in page.inner_text(".gen-foot")
+    assert "confidently wrong" in page.inner_text("#evBody")
+
+
+@test
+def test_an_answer_can_be_deleted(page, base_url):
+    stub_ask(page, "Some prose.")
+    boot(page, base_url)
+    capture(page, "something")
+
+    open_entry(page)
+    page.fill("#evAsk", "Tell me more")
+    page.click("#evAskBtn")
+    page.wait_for_selector(".gen")
+
+    page.click(".act-gen-del")
+    assert wait_for_record(page, lambda r: r.get("generated") == []), \
+        "the answer was not deleted"
 
 
 @test

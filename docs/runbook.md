@@ -13,7 +13,7 @@ Written 13 September 2026, at `log-v3-8`.
 | | |
 |---|---|
 | version | `log-v3-8` |
-| tests | 131 / 131 passing |
+| tests | 135 / 135 passing |
 | app | `index.html`, ~3,000 lines, no build step |
 | default model | `qwen-1.5b` → `q4f32_1`, always — the 16-bit build is never used |
 | verified | `qwen-1.5b` extracts a real title on an Adreno 7xx; `llama-1b` does not |
@@ -45,7 +45,7 @@ itself needs no dependencies at all.
 ## Three things you can run
 
 ```bash
-# 131 tests. Offline, stubbed Dropbox, no GPU, no weights. ~6 minutes.
+# 135 tests. Offline, stubbed Dropbox, no GPU, no weights. ~6 minutes.
 ~/.venvs/lelog/bin/python test/smoke.py
 ~/.venvs/lelog/bin/python test/smoke.py search   # just matching names
 ```

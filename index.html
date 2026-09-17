@@ -295,6 +295,21 @@
   .ev-star.on { color: var(--accent); }
   .ev-note { margin: 4px 0 0; color: var(--faint); font-size: 12.5px; }
   .ev-actions { display: flex; gap: 9px; align-items: center; margin-top: 11px; }
+  /* The model's own words. Set apart from everything else on the screen,
+     because everything else came out of a note you wrote and this did not. */
+  .gen {
+    border: 1px solid var(--border); border-left: 2px solid var(--warn);
+    border-radius: 11px; padding: 11px 13px; margin-bottom: 10px;
+    background: var(--surface);
+  }
+  .gen-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 7px; }
+  .gen-ask { flex: 1; min-width: 0; color: var(--muted); font-size: 12.5px; }
+  .act-gen-del {
+    background: none; border: none; color: var(--faint); cursor: pointer;
+    font-size: 17px; line-height: 1; padding: 0 2px;
+  }
+  .gen-text { font-size: 14.5px; line-height: 1.55; white-space: pre-wrap; }
+  .gen-foot { margin-top: 8px; color: var(--faint); font-size: 11.5px; }
 
   .sheet {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
@@ -562,6 +577,7 @@
   // and the write path top them up rather than trusting the source.
   function normalise(rec) {
     if (!Array.isArray(rec.hints)) rec.hints = [];
+    if (!Array.isArray(rec.generated)) rec.generated = [];
     var e = rec.enrichment;
     if (!e) e = rec.enrichment = { status: 'pending', model: null, at: null, confidence: null };
     if (typeof e.needsReview !== 'boolean') e.needsReview = false;
@@ -1657,9 +1673,11 @@
     var foot = document.getElementById('liveFoot');
     if (foot) foot.textContent = liveLabel();
     var evState = document.getElementById('evState');
-    if (evState && viewingId === enrichingId) evState.textContent = liveLabel();
+    if (evState && (viewingId === enrichingId || viewingId === askingId)) {
+      evState.textContent = liveLabel();
+    }
     var phase = document.getElementById('evPhase');
-    if (phase && viewingId === enrichingId) {
+    if (phase && (viewingId === enrichingId || viewingId === askingId)) {
       var secs = live.startedAt ? Math.round((Date.now() - live.startedAt) / 1000) : 0;
       phase.textContent = live.phase === 'loading' ? loadingWord()
         : live.phase === 'running' ? (live.tokens ? 'writing' : 'reading your note')
@@ -2288,6 +2306,90 @@
     return put(rec);
   };
 
+  // ---------- asking the model to write something ----------
+  //
+  // Not extraction. Everything above pulls fields out of a note you wrote and
+  // refuses when it cannot; this asks the model for prose from what it knows.
+  // Different failure mode: it will not refuse, it will invent. So there is no
+  // grammar, no validation, nothing applied to the record's own fields, and
+  // the answer is stored and shown as the model's words rather than as a fact
+  // about your entry.
+
+  var ASK_MAX_TOKENS = 400;
+  var asking = false, askingId = null;
+
+  function askPrompt(rec, question) {
+    return 'Answer the question about this note. Be brief and concrete.\n'
+      + 'If you do not know, say so rather than guessing.\n'
+      + 'Note: "' + rec.raw + '"\n'
+      + 'Question: ' + question;
+  }
+
+  function realWebLLMAsk(rec, question, report) {
+    report = report || function () {};
+    return getEnrichEngine(function (p) {
+      report({ phase: 'loading', pct: Math.round((p.progress || 0) * 100),
+               text: p.text || '' });
+    }).then(function (engine) {
+      report({ phase: 'running', tokens: 0, partial: '' });
+      return completeWithFallback(engine, {
+        messages: [{ role: 'user', content: askPrompt(rec, question) }],
+        max_tokens: ASK_MAX_TOKENS
+      }, report);
+    });
+  }
+
+  function getAsker() {
+    return window.__LELOG_TEST_ASK__ || realWebLLMAsk;
+  }
+
+  function askAboutEntry(rec, question) {
+    var q = String(question || '').trim();
+    if (!q || asking) return Promise.resolve();
+    // One GPU, one job. A question racing an extraction would measure neither
+    // honestly and could exhaust the device's memory mid-pass.
+    if (enrichRunning) { toast('Wait for the enrichment to finish'); return Promise.resolve(); }
+    if (!enrichmentEnabled()) { toast('Turn on enrichment in Settings'); return Promise.resolve(); }
+
+    asking = true;
+    askingId = rec.id;
+    startLive();
+    enrichCancel = false;
+    var t = Date.now();
+    renderEntryView();
+
+    return Promise.resolve().then(function () {
+      return getAsker()(rec, q, reportProgress);
+    }).then(function (text) {
+      var answer = String(text == null ? '' : text).trim();
+      if (!answer) throw new Error('The model returned nothing.');
+      rec.generated = (rec.generated || []).concat([{
+        id: ulid(), ask: q, text: answer,
+        // The id the engine actually resolved, or the one it would resolve if
+        // nothing has loaded yet. Since every build is q4f32_1 the two agree,
+        // except right after a model change in Settings — where the loaded
+        // one is the truthful answer and comes first.
+        model: enrichModelId || chosenModel().f32 || null,
+        at: new Date().toISOString(), ms: Date.now() - t
+      }]);
+      rec.updatedAt = new Date().toISOString();
+      return put(rec);
+    }).catch(function (e) {
+      console.error('ask failed', e);
+      toast(errorText(e).slice(0, 120));
+    }).then(function () {
+      asking = false; askingId = null; enrichCancel = false;
+      stopLive();
+      renderEntryView(); scheduleSync();
+    });
+  }
+
+  function removeGenerated(rec, id) {
+    rec.generated = (rec.generated || []).filter(function (g) { return g.id !== id; });
+    rec.updatedAt = new Date().toISOString();
+    return put(rec).then(function () { renderEntryView(); scheduleSync(); });
+  }
+
   // ---------- ids ----------
   var B32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
   function ulid() {
@@ -2316,6 +2418,10 @@
       // — your sentence stays your sentence — but fed into every extraction
       // pass, so they survive re-enrichment and a change of model.
       hints: [],
+      // Prose the model wrote when asked a question, kept apart from every
+      // extracted field. These are the model's words, not yours and not
+      // drawn from your note, so they never mix with the labels.
+      generated: [],
       userEdited: [], media: [],
       createdAt: now, updatedAt: now, deleted: false
     };
@@ -2324,7 +2430,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-16';
+  var APP_VERSION = 'log-v3-17';
   var all = [], query = '';
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -2638,7 +2744,19 @@
           + '<div class="ereadout">' + detailRows + '</div></div>' : '')
 
       + '<div class="ev-sec">'
-        + '<h3>Ask the model</h3>'
+        + '<h3>Ask a question</h3>'
+        + generatedList(rec)
+        + '<div class="hint-row">'
+          + '<input class="hint-input" id="evAsk" placeholder="Summarise this book\u2026">'
+          + '<button class="btn" id="evAskBtn"' + (asking ? ' disabled' : '') + '>Ask</button>'
+        + '</div>'
+        + (rec.id === askingId ? livePanel()
+            : '<p class="ev-note">The model writes this from what it knows, not from your'
+              + ' note. It can be confidently wrong. Nothing here touches the labels.</p>')
+      + '</div>'
+
+      + '<div class="ev-sec">'
+        + '<h3>Redo the labels</h3>'
         + (hintChips ? '<div class="chips">' + hintChips + '</div>' : '')
         + '<div class="hint-row">'
           + '<input class="hint-input" id="evHint" placeholder="Tell the AI what to add or focus on\u2026">'
@@ -2669,6 +2787,22 @@
         + '<button class="act-copy-run act-stop-enrich" type="button" style="margin-left:0">Stop</button>'
         + '<em id="evPace"></em>'
       + '</div></div>';
+  }
+
+  function generatedList(rec) {
+    var items = rec.generated || [];
+    if (!items.length) return '';
+    return items.map(function (g) {
+      return '<div class="gen">'
+        + '<div class="gen-head">'
+          + '<span class="gen-ask">' + esc(g.ask) + '</span>'
+          + '<button class="act-gen-del" data-id="' + esc(g.id) + '" aria-label="Delete this answer">\u00d7</button>'
+        + '</div>'
+        + '<div class="gen-text">' + esc(g.text) + '</div>'
+        + '<div class="gen-foot">written by ' + esc(g.model || 'the model')
+          + (g.ms ? ' \u00b7 ' + Math.round(g.ms / 1000) + 's' : '') + '</div>'
+      + '</div>';
+    }).join('');
   }
 
   function entryStateLine(rec) {
@@ -2721,6 +2855,10 @@
       rec.tags = rec.tags.concat([t]);
       el.value = '';
       saveViewed(rec, 'tags');
+    };
+    $('evAskBtn').onclick = function () {
+      askAboutEntry(rec, $('evAsk').value);
+      $('evAsk').value = '';
     };
     $('evEnrich').onclick = function () {
       enrichFromView(rec, $('evRaw').value, $('evHint').value);
@@ -2966,6 +3104,8 @@
       saveViewed(rec, 'tags');
       return;
     }
+    var gdel = e.target.closest('.act-gen-del');
+    if (gdel) { removeGenerated(rec, gdel.getAttribute('data-id')); return; }
     var hdel = e.target.closest('.act-hint-del');
     if (hdel) {
       (rec.hints || []).splice(+hdel.getAttribute('data-i'), 1);
