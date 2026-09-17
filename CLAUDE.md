@@ -8,6 +8,17 @@ Running and debugging it by hand — setup, `test/live.py`, reading a self-test 
 
 Unscheduled ideas live in **`docs/ideas.md`** — things worth building, not yet committed to, with the reasoning attached. Add to it freely; don't treat anything in it as agreed work.
 
+## How to write here
+
+Keep it simple. Short sentences. Plain words. Say the thing and stop.
+
+This goes for replies in chat, commit messages, comments and docs. If a
+sentence has three clauses, cut it into two sentences. If a word is fancy,
+use the plain one. Skip the wind-up.
+
+Asked for on 17 September 2026, after a long run of replies that were hard
+work to read.
+
 ## Current state
 
 **Phases 0 and 1 shipped, in daily use since August 2026.** One text box, list, search, edit, soft delete, export/import, and Dropbox sync. Installable PWA, works offline.
