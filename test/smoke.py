@@ -2499,6 +2499,65 @@ def test_a_question_is_answered_and_kept_on_the_entry(page, base_url):
 
 
 @test
+def test_an_answer_survives_a_sync_landing_mid_question(page, base_url):
+    """Sync does `all = rows` on every pass, replacing every record object.
+    A question takes 45 seconds, so the record held across it goes stale: the
+    answer was written to the old object and saved, then the screen redrew
+    from the new one and showed nothing. It only appeared on reopening."""
+    page.add_init_script("""
+        window.__LELOG_TEST_ASK__ = (rec, q, report) => new Promise(res => {
+            // A sync lands while the model is still working.
+            window.__LELOG_REPLACE_ALL__().then(
+                () => setTimeout(() => res('A book about the 2008 crash.'), 50));
+        });
+        localStorage.setItem('enrichmentEnabled', '1');
+    """)
+    boot(page, base_url)
+    capture(page, "the big short")
+
+    open_entry(page)
+    page.fill("#evAsk", "Summarise this book")
+    page.click("#evAskBtn")
+
+    rec = wait_for_record(page, lambda r: len(r.get("generated", [])) == 1,
+                          timeout=15000)
+    assert rec, "the answer was never saved"
+    # On screen without reopening the entry.
+    page.wait_for_selector(".gen", timeout=5000)
+    assert "2008 crash" in page.inner_text(".gen-text")
+
+
+@test
+def test_an_extraction_survives_a_sync_landing_mid_pass(page, base_url):
+    """Same staleness on the enrichment path, where it is worse: putting a
+    stale record can write old fields over a newer copy that just synced."""
+    stub_model_layer(page)
+    page.add_init_script("""
+        const mk = window.__LELOG_TEST_WEBLLM__.CreateMLCEngine;
+        window.__LELOG_TEST_WEBLLM__.CreateMLCEngine = (id, opts) =>
+            mk(id, opts).then(engine => {
+                const real = engine.chat.completions.create;
+                engine.chat.completions.create = (req) =>
+                    window.__LELOG_REPLACE_ALL__().then(() => real.call(engine.chat.completions, req));
+                return engine;
+            });
+    """)
+    boot(page, base_url)
+    capture(page, "finished dune")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done",
+                          timeout=15000)
+    assert rec, "the extraction never landed"
+    assert rec["title"] == "Dune", rec["title"]
+    # On the tile too. The database is right either way — a stale record still
+    # saves the correct data. What breaks is the screen, which redraws from
+    # the list the sync replaced.
+    page.wait_for_selector(".chip.title", timeout=5000)
+    assert "Dune" in page.inner_text(".chip.title")
+
+
+@test
 def test_an_answer_never_touches_the_labels(page, base_url):
     """The whole reason this is a separate field. Extraction refuses when it
     cannot tell; generation invents instead, so it must never be mistaken for

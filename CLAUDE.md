@@ -68,7 +68,7 @@ The enrichment questioner and the quiz questioner are **the same component** at 
 
 ## Testing
 
-135 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
+137 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
 
 ```bash
 python3 test/smoke.py            # all
@@ -246,6 +246,17 @@ compile, so an Adreno reading a 1.5B from disk rendered as a frozen
 downloading (the network is involved) from reading off disk from compiling
 (neither is). It is now carried on `live.text`, shortened for the tile
 badge by `loadingWord()`, and shown verbatim in the entry's own live panel.
+
+**A record held across a model call can be a corpse.** Sync does `all = rows`
+on every pass. That swaps every object in the list for a fresh one read back
+from IndexedDB. A pass takes 45 seconds, so a `rec` captured before it is
+often detached by the end. Writing to it saves the right data and then the
+screen redraws from the new object and shows nothing — which is how an answer
+landed on disk and not on screen. On the enrichment path it is worse: putting
+a stale record can write old fields over a newer copy that just synced down.
+Re-find by id (`freshRecord`) before any write that follows an await. Tests
+reproduce it with `window.__LELOG_REPLACE_ALL__`, and they must assert on the
+screen — the database is correct either way.
 
 **Look at UI before shipping it.** Drive the app with Playwright at a phone
 width (412×915) and screenshot the state being changed. A toast with no

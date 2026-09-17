@@ -1423,6 +1423,19 @@
     return localStorage.getItem('enrichmentEnabled') === '1';
   }
 
+  // A record held across a model call can be a corpse. Sync does `all = rows`
+  // on every pass, replacing every object with a fresh one read back from
+  // IndexedDB, and a pass takes 45 seconds. Writing to the old object saves
+  // the right data and then renders from the new one — which is how an answer
+  // landed on disk and not on screen. Worse on the enrichment path: putting a
+  // stale object can write old fields over a newer copy that just synced down.
+  // So re-find by id before any write that follows an await.
+  function freshRecord(rec) {
+    if (!rec) return null;
+    var live = all.find(function (r) { return r.id === rec.id; });
+    return live || rec;
+  }
+
   function chosenModel() {
     var key = localStorage.getItem('enrichModel') || DEFAULT_MODEL_KEY;
     for (var i = 0; i < MODELS.length; i++) if (MODELS[i].key === key) return MODELS[i];
@@ -2216,7 +2229,9 @@
     if (rec.userEdited.indexOf(field) === -1) rec.userEdited.push(field);
   }
 
-  function applyExtraction(rec, result) {
+  function applyExtraction(stale, result) {
+    var rec = freshRecord(stale);
+    if (!rec || rec.deleted) return Promise.resolve();
     var band = confidenceBand(result.confidence);
     var now = new Date().toISOString();
     rec.enrichment = {
@@ -2269,7 +2284,9 @@
     return put(rec).then(function () { render(); });
   }
 
-  function markEnrichmentFailed(rec, err) {
+  function markEnrichmentFailed(stale, err) {
+    var rec = freshRecord(stale);
+    if (!rec || rec.deleted) return Promise.resolve();
     var now = new Date().toISOString();
     console.error('enrichment failed for', rec.id, err);
     if (isDeviceLost(errorText(err))) discardEnrichEngine();
@@ -2300,6 +2317,13 @@
   // Test-only hook, alongside __LELOG_TEST_EXTRACTOR__ above. Not reachable
   // from the UI; exists so smoke.py can seed the userEdited gate directly,
   // since there is no UI yet to hand-edit an extracted field to test through.
+  // Exactly what a sync pass does mid-flight: re-read every record from
+  // IndexedDB and replace the in-memory list. Held references go stale here
+  // and nowhere else, so this is the seam that can reproduce it.
+  window.__LELOG_REPLACE_ALL__ = function () {
+    return getAll().then(function (rows) { all = rows; render(); });
+  };
+
   window.__LELOG_SEED_USER_EDITED__ = function (id, field, value) {
     var rec = all.find(function (r) { return r.id === id; });
     markUserEdited(rec, field, value);
@@ -2363,6 +2387,8 @@
     }).then(function (text) {
       var answer = String(text == null ? '' : text).trim();
       if (!answer) throw new Error('The model returned nothing.');
+      rec = freshRecord(rec);
+      if (!rec || rec.deleted) return;
       rec.generated = (rec.generated || []).concat([{
         id: ulid(), ask: q, text: answer,
         // The id the engine actually resolved, or the one it would resolve if
@@ -2430,7 +2456,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-17';
+  var APP_VERSION = 'log-v3-18';
   var all = [], query = '';
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
