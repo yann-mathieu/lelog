@@ -263,7 +263,9 @@
     max-width: 720px; width: 100%; margin: 0 auto;
   }
   .ev-sec { margin-bottom: 22px; }
-  .ev-sec > h3 {
+  /* Not `> h3`: the labels heading sits inside a row with its buttons, and a
+     direct-child selector dropped it back to the browser's default h3. */
+  .ev-sec h3 {
     margin: 0 0 9px; font-size: 12px; font-weight: 600; letter-spacing: .07em;
     text-transform: uppercase; color: var(--faint);
   }
@@ -308,8 +310,29 @@
     background: none; border: none; color: var(--faint); cursor: pointer;
     font-size: 17px; line-height: 1; padding: 0 2px;
   }
+  .gen.mine { border-left-color: var(--accent-dim); }
   .gen-text { font-size: 14.5px; line-height: 1.55; white-space: pre-wrap; }
   .gen-foot { margin-top: 8px; color: var(--faint); font-size: 11.5px; }
+  .note-acts { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 9px; }
+  .note-edit { min-height: 110px; font-size: 14.5px; }
+  /* Older text, kept because iterating is the point and an iteration that
+     comes back worse has to be survivable. */
+  .note-hist { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 9px; }
+  .note-ver { display: flex; gap: 10px; align-items: flex-start; margin-bottom: 9px; }
+  .note-ver-text {
+    flex: 1; min-width: 0; color: var(--faint); font-size: 12.5px;
+    line-height: 1.5; white-space: pre-wrap;
+  }
+  .ev-mini {
+    background: none; border: 1px solid var(--border); border-radius: 100px;
+    color: var(--muted); font: inherit; font-size: 12px; cursor: pointer;
+    padding: 4px 11px; flex: 0 0 auto;
+  }
+  .ev-mini:active { background: var(--surface-2); color: var(--accent); }
+  .ev-mini[disabled] { opacity: .45; }
+  .ev-labels-head { display: flex; align-items: center; gap: 8px; margin-bottom: 9px; }
+  .ev-labels-head h3 { flex: 1; min-width: 0; }
+  .ev-summary { margin: 0; color: var(--muted); font-size: 14px; word-break: break-word; }
 
   .sheet {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
@@ -577,7 +600,23 @@
   // and the write path top them up rather than trusting the source.
   function normalise(rec) {
     if (!Array.isArray(rec.hints)) rec.hints = [];
-    if (!Array.isArray(rec.generated)) rec.generated = [];
+    if (!Array.isArray(rec.notes)) rec.notes = [];
+    // `generated` was the one-shot version of notes, alive for a day. An
+    // answer becomes a note whose question is its title.
+    if (Array.isArray(rec.generated)) {
+      rec.generated.forEach(function (g) {
+        rec.notes.push({
+          id: g.id || ulid(), title: g.ask || 'Note', text: g.text || '',
+          by: 'model', model: g.model || null, at: g.at || rec.updatedAt,
+          ms: g.ms || null, history: []
+        });
+      });
+      delete rec.generated;
+    }
+    rec.notes.forEach(function (n) {
+      if (!Array.isArray(n.history)) n.history = [];
+      if (!n.by) n.by = 'model';
+    });
     var e = rec.enrichment;
     if (!e) e = rec.enrichment = { status: 'pending', model: null, at: null, confidence: null };
     if (typeof e.needsReview !== 'boolean') e.needsReview = false;
@@ -2341,15 +2380,26 @@
 
   var ASK_MAX_TOKENS = 400;
   var asking = false, askingId = null;
+  // Which note is open for editing, being rewritten, showing its versions,
+  // or waiting on the model. Only one of each at a time.
+  var noteEditId = null, noteRedoId = null, noteHistId = null, noteBusyId = null;
+  var labelsOpen = false;
 
-  function askPrompt(rec, question) {
-    return 'Answer the question about this note. Be brief and concrete.\n'
+  function askPrompt(rec, question, previous) {
+    var p = 'Answer the question about this note. Be brief and concrete.\n'
       + 'If you do not know, say so rather than guessing.\n'
-      + 'Note: "' + rec.raw + '"\n'
-      + 'Question: ' + question;
+      + 'Note: "' + rec.raw + '"\n';
+    // A redo is the same call with the last answer in front of it. The model
+    // is rewriting something, not starting again, which is what "make it
+    // shorter" has to mean.
+    if (previous) {
+      p += 'Your previous answer:\n' + previous + '\n'
+        + 'Rewrite it, following the instruction below.\n';
+    }
+    return p + 'Instruction: ' + question;
   }
 
-  function realWebLLMAsk(rec, question, report) {
+  function realWebLLMAsk(rec, question, report, previous) {
     report = report || function () {};
     return getEnrichEngine(function (p) {
       report({ phase: 'loading', pct: Math.round((p.progress || 0) * 100),
@@ -2357,7 +2407,7 @@
     }).then(function (engine) {
       report({ phase: 'running', tokens: 0, partial: '' });
       return completeWithFallback(engine, {
-        messages: [{ role: 'user', content: askPrompt(rec, question) }],
+        messages: [{ role: 'user', content: askPrompt(rec, question, previous) }],
         max_tokens: ASK_MAX_TOKENS
       }, report);
     });
@@ -2367,51 +2417,100 @@
     return window.__LELOG_TEST_ASK__ || realWebLLMAsk;
   }
 
-  function askAboutEntry(rec, question) {
-    var q = String(question || '').trim();
+  function findNote(rec, id) {
+    return (rec.notes || []).find(function (n) { return n.id === id; }) || null;
+  }
+
+  // Every change to a note keeps the text it replaced. Iterating is the point
+  // of notes, and an iteration that comes back worse has to be survivable.
+  function pushVersion(note) {
+    note.history = (note.history || []).concat([{
+      text: note.text, by: note.by, model: note.model, at: note.at
+    }]);
+  }
+
+  function runNote(rec, instruction, noteId) {
+    var q = String(instruction || '').trim();
     if (!q || asking) return Promise.resolve();
-    // One GPU, one job. A question racing an extraction would measure neither
-    // honestly and could exhaust the device's memory mid-pass.
-    if (enrichRunning) { toast('Wait for the enrichment to finish'); return Promise.resolve(); }
+    if (enrichRunning) { toast('Wait for the labels to finish'); return Promise.resolve(); }
     if (!enrichmentEnabled()) { toast('Turn on enrichment in Settings'); return Promise.resolve(); }
 
+    var previous = noteId ? (findNote(rec, noteId) || {}).text : '';
     asking = true;
     askingId = rec.id;
+    noteBusyId = noteId || 'new';
     startLive();
     enrichCancel = false;
     var t = Date.now();
     renderEntryView();
 
     return Promise.resolve().then(function () {
-      return getAsker()(rec, q, reportProgress);
+      return getAsker()(rec, q, reportProgress, previous);
     }).then(function (text) {
       var answer = String(text == null ? '' : text).trim();
       if (!answer) throw new Error('The model returned nothing.');
+      // Re-find after the await: sync replaces every record object, and a
+      // pass takes long enough that the one captured here is often detached.
       rec = freshRecord(rec);
       if (!rec || rec.deleted) return;
-      rec.generated = (rec.generated || []).concat([{
-        id: ulid(), ask: q, text: answer,
-        // The id the engine actually resolved, or the one it would resolve if
-        // nothing has loaded yet. Since every build is q4f32_1 the two agree,
-        // except right after a model change in Settings — where the loaded
-        // one is the truthful answer and comes first.
-        model: enrichModelId || chosenModel().f32 || null,
-        at: new Date().toISOString(), ms: Date.now() - t
-      }]);
+      var note = noteId ? findNote(rec, noteId) : null;
+      if (note) {
+        pushVersion(note);
+        note.text = answer;
+        note.by = 'model';
+        note.model = enrichModelId || chosenModel().f32 || null;
+        note.at = new Date().toISOString();
+        note.ms = Date.now() - t;
+      } else {
+        rec.notes = (rec.notes || []).concat([{
+          id: ulid(), title: q, text: answer, by: 'model',
+          model: enrichModelId || chosenModel().f32 || null,
+          at: new Date().toISOString(), ms: Date.now() - t, history: []
+        }]);
+      }
       rec.updatedAt = new Date().toISOString();
       return put(rec);
     }).catch(function (e) {
-      console.error('ask failed', e);
+      console.error('note failed', e);
       toast(errorText(e).slice(0, 120));
     }).then(function () {
-      asking = false; askingId = null; enrichCancel = false;
+      asking = false; askingId = null; noteBusyId = null;
+      noteRedoId = null;
+      enrichCancel = false;
       stopLive();
       renderEntryView(); scheduleSync();
     });
   }
 
-  function removeGenerated(rec, id) {
-    rec.generated = (rec.generated || []).filter(function (g) { return g.id !== id; });
+  function saveNoteText(rec, id, text) {
+    var note = findNote(rec, id);
+    if (!note) return;
+    var t = String(text).trim();
+    if (!t || t === note.text) { noteEditId = null; renderEntryView(); return; }
+    pushVersion(note);
+    note.text = t;
+    note.by = 'you';
+    note.at = new Date().toISOString();
+    noteEditId = null;
+    rec.updatedAt = note.at;
+    put(rec).then(function () { renderEntryView(); scheduleSync(); });
+  }
+
+  function restoreVersion(rec, id, i) {
+    var note = findNote(rec, id);
+    if (!note || !note.history[i]) return;
+    var old = note.history[i];
+    pushVersion(note);
+    note.text = old.text;
+    note.by = old.by;
+    note.model = old.model;
+    note.at = new Date().toISOString();
+    rec.updatedAt = note.at;
+    put(rec).then(function () { renderEntryView(); scheduleSync(); toast('Restored'); });
+  }
+
+  function removeNote(rec, id) {
+    rec.notes = (rec.notes || []).filter(function (n) { return n.id !== id; });
     rec.updatedAt = new Date().toISOString();
     return put(rec).then(function () { renderEntryView(); scheduleSync(); });
   }
@@ -2444,10 +2543,12 @@
       // — your sentence stays your sentence — but fed into every extraction
       // pass, so they survive re-enrichment and a change of model.
       hints: [],
-      // Prose the model wrote when asked a question, kept apart from every
-      // extracted field. These are the model's words, not yours and not
-      // drawn from your note, so they never mix with the labels.
-      generated: [],
+      // Notes about this entry. Several per entry — a summary, the main
+      // characters — each one written by the model or by you, edited by hand
+      // or redone by the model, with the versions it has been through. Kept
+      // apart from every extracted field: these are not facts your note
+      // stated, so they never mix with the labels.
+      notes: [],
       userEdited: [], media: [],
       createdAt: now, updatedAt: now, deleted: false
     };
@@ -2456,7 +2557,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-18';
+  var APP_VERSION = 'log-v3-19';
   var all = [], query = '';
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -2660,6 +2761,8 @@
     var rec = all.find(function (r) { return r.id === id; });
     if (!rec || rec.deleted) return;
     viewingId = id;
+    noteEditId = noteRedoId = noteHistId = null;
+    labelsOpen = false;
     renderEntryView();
     $('entryView').hidden = false;
     // Same trick the settings sheet uses, so Android's back button leaves the
@@ -2742,52 +2845,32 @@
         + '<textarea class="ev-raw" id="evRaw">' + esc(rec.raw) + '</textarea>'
         + '<div class="ev-actions">'
           + '<button class="btn" id="evSave" disabled>Save</button>'
-          + '<span class="ev-note" id="evSaveNote"></span>'
         + '</div>'
       + '</div>'
 
       + '<div class="ev-sec">'
-        + '<h3>Labels</h3>'
-        + labelField(rec, 'type', 'type',
-            '<select class="ev-select" id="ev-type">' + typeOpts + '</select>')
-        + labelField(rec, 'title', 'title',
-            '<input class="ev-input" id="ev-title" value="' + esc(rec.title || '')
-            + '" placeholder="none">')
-        + labelField(rec, 'occurredAt', 'when',
-            '<input class="ev-input" id="ev-occurredAt" value="' + esc(rec.occurredAt || '')
-            + '" placeholder="YYYY-MM-DD">')
-        + labelField(rec, 'rating', 'rating', '<div class="ev-stars">' + stars + '</div>')
-        + '<div class="ev-field' + (rec.userEdited.indexOf('tags') !== -1 ? ' edited' : '')
-          + '" style="align-items:flex-start"><label>tags</label><div style="flex:1;min-width:0">'
-          + (tagChips ? '<div class="chips">' + tagChips + '</div>' : '')
-          + '<div class="hint-row"><input class="hint-input" id="evTagInput" placeholder="Add a tag\u2026">'
-          + '<button class="btn ghost" id="evTagAdd">Add</button></div>'
-        + '</div></div>'
-        + '<p class="ev-note">A label you set by hand is never rewritten by the model.</p>'
-      + '</div>'
-
-      + (detailRows ? '<div class="ev-sec"><h3>Details</h3>'
-          + '<div class="ereadout">' + detailRows + '</div></div>' : '')
-
-      + '<div class="ev-sec">'
-        + '<h3>Ask a question</h3>'
-        + generatedList(rec)
+        + '<h3>Notes</h3>'
+        + notesList(rec)
+        + (noteBusyId === 'new' ? livePanel() : '')
         + '<div class="hint-row">'
           + '<input class="hint-input" id="evAsk" placeholder="Summarise this book\u2026">'
-          + '<button class="btn" id="evAskBtn"' + (asking ? ' disabled' : '') + '>Ask</button>'
+          + '<button class="btn" id="evAskBtn"' + (asking ? ' disabled' : '') + '>Add</button>'
         + '</div>'
-        + (rec.id === askingId ? livePanel()
-            : '<p class="ev-note">The model writes this from what it knows, not from your'
-              + ' note. It can be confidently wrong. Nothing here touches the labels.</p>')
+        + '<p class="ev-note">Ask for a note and the model writes it. You can edit it'
+          + ' yourself afterwards, or ask again to change it. It can be confidently wrong.</p>'
       + '</div>'
 
       + '<div class="ev-sec">'
-        + '<h3>Redo the labels</h3>'
-        + (hintChips ? '<div class="chips">' + hintChips + '</div>' : '')
-        + '<div class="hint-row">'
-          + '<input class="hint-input" id="evHint" placeholder="Tell the AI what to add or focus on\u2026">'
-          + '<button class="btn" id="evEnrich">Enrich</button>'
+        + '<div class="ev-labels-head">'
+          + '<h3 style="margin:0">Labels</h3>'
+          + '<button class="ev-mini" id="evLabelsToggle">'
+            + (labelsOpen ? 'Done' : 'Edit') + '</button>'
+          + '<button class="ev-mini" id="evEnrich"' + (enrichRunning ? ' disabled' : '')
+            + '>Enrich</button>'
         + '</div>'
+        + (labelsOpen ? labelEditors(rec, typeOpts, stars, tagChips, hintChips)
+            : '<p class="ev-summary">' + esc(labelSummary(rec)) + '</p>')
+        + (detailRows ? '<div class="ereadout" style="margin-top:9px">' + detailRows + '</div>' : '')
         + (rec.id === enrichingId
             ? livePanel()
             : '<p class="ev-note" id="evState">' + esc(entryStateLine(rec)) + '</p>')
@@ -2815,18 +2898,88 @@
       + '</div></div>';
   }
 
-  function generatedList(rec) {
-    var items = rec.generated || [];
+  function labelSummary(rec) {
+    var bits = [rec.type || 'no type'];
+    if (rec.title) bits.push('\u201c' + rec.title + '\u201d');
+    if (rec.rating) bits.push(rec.rating + '/5');
+    if (rec.tags.length) bits.push(rec.tags.join(', '));
+    return bits.join(' \u00b7 ');
+  }
+
+  function labelEditors(rec, typeOpts, stars, tagChips, hintChips) {
+    return labelField(rec, 'type', 'type',
+        '<select class="ev-select" id="ev-type">' + typeOpts + '</select>')
+      + labelField(rec, 'title', 'title',
+          '<input class="ev-input" id="ev-title" value="' + esc(rec.title || '')
+          + '" placeholder="none">')
+      + labelField(rec, 'occurredAt', 'when',
+          '<input class="ev-input" id="ev-occurredAt" value="' + esc(rec.occurredAt || '')
+          + '" placeholder="YYYY-MM-DD">')
+      + labelField(rec, 'rating', 'rating', '<div class="ev-stars">' + stars + '</div>')
+      + '<div class="ev-field' + (rec.userEdited.indexOf('tags') !== -1 ? ' edited' : '')
+        + '" style="align-items:flex-start"><label>tags</label><div style="flex:1;min-width:0">'
+        + (tagChips ? '<div class="chips">' + tagChips + '</div>' : '')
+        + '<div class="hint-row"><input class="hint-input" id="evTagInput" placeholder="Add a tag\u2026">'
+        + '<button class="btn ghost" id="evTagAdd">Add</button></div>'
+      + '</div></div>'
+      + (hintChips ? '<div class="chips">' + hintChips + '</div>' : '')
+      + '<div class="hint-row">'
+        + '<input class="hint-input" id="evHint" placeholder="Tell the AI what to focus on\u2026">'
+      + '</div>'
+      + '<p class="ev-note">A label you set by hand is never rewritten by the model.</p>';
+  }
+
+  // One card per note. Everything you can do to a note is on the card, and
+  // only one card is ever open for editing, rewriting or history.
+  function notesList(rec) {
+    var items = rec.notes || [];
     if (!items.length) return '';
-    return items.map(function (g) {
-      return '<div class="gen">'
+    return items.map(function (n) {
+      var body = noteEditId === n.id
+        ? '<textarea class="ev-raw note-edit" id="noteEdit" data-id="' + esc(n.id) + '">'
+            + esc(n.text) + '</textarea>'
+          + '<div class="ev-actions">'
+            + '<button class="btn act-note-save" data-id="' + esc(n.id) + '">Save</button>'
+            + '<button class="btn ghost act-note-cancel">Cancel</button>'
+          + '</div>'
+        : '<div class="gen-text">' + esc(n.text) + '</div>';
+
+      var redo = noteRedoId === n.id
+        ? '<div class="hint-row"><input class="hint-input note-redo" id="noteRedo"'
+            + ' placeholder="Shorter. Focus on the characters\u2026">'
+          + '<button class="btn act-note-go" data-id="' + esc(n.id) + '">Go</button></div>'
+        : '';
+
+      var hist = noteHistId === n.id && n.history.length
+        ? '<div class="note-hist">' + n.history.slice().reverse().map(function (h, i) {
+            var idx = n.history.length - 1 - i;
+            return '<div class="note-ver">'
+              + '<div class="note-ver-text">' + esc(h.text) + '</div>'
+              + '<button class="ev-mini act-note-restore" data-id="' + esc(n.id)
+              + '" data-i="' + idx + '">Restore</button></div>';
+          }).join('') + '</div>'
+        : '';
+
+      return '<div class="gen' + (n.by === 'you' ? ' mine' : '') + '">'
         + '<div class="gen-head">'
-          + '<span class="gen-ask">' + esc(g.ask) + '</span>'
-          + '<button class="act-gen-del" data-id="' + esc(g.id) + '" aria-label="Delete this answer">\u00d7</button>'
+          + '<span class="gen-ask">' + esc(n.title) + '</span>'
+          + '<button class="act-gen-del" data-id="' + esc(n.id) + '" aria-label="Delete this note">\u00d7</button>'
         + '</div>'
-        + '<div class="gen-text">' + esc(g.text) + '</div>'
-        + '<div class="gen-foot">written by ' + esc(g.model || 'the model')
-          + (g.ms ? ' \u00b7 ' + Math.round(g.ms / 1000) + 's' : '') + '</div>'
+        + body
+        + (noteBusyId === n.id ? livePanel() : '')
+        + '<div class="gen-foot">'
+          + (n.by === 'you' ? 'edited by you' : 'written by ' + esc(n.model || 'the model'))
+          + (n.history.length ? ' \u00b7 ' + (n.history.length + 1) + ' versions' : '')
+        + '</div>'
+        + '<div class="note-acts">'
+          + '<button class="ev-mini act-note-edit" data-id="' + esc(n.id) + '">Edit</button>'
+          + '<button class="ev-mini act-note-redo" data-id="' + esc(n.id) + '">Ask again</button>'
+          + (n.history.length
+              ? '<button class="ev-mini act-note-hist" data-id="' + esc(n.id) + '">'
+                + (noteHistId === n.id ? 'Hide versions' : 'Versions') + '</button>'
+              : '')
+        + '</div>'
+        + redo + hist
       + '</div>';
     }).join('');
   }
@@ -2860,6 +3013,23 @@
       saveViewed(rec, null).then(function () { toast('Updated'); });
     };
 
+    // Notes are what this screen is for, so their wiring goes in before
+    // anything that can return early. Adding a note used to be bound after
+    // the labels guard, which meant it did nothing at all until you happened
+    // to open the labels first.
+    $('evAskBtn').onclick = function () {
+      runNote(rec, $('evAsk').value, null);
+      $('evAsk').value = '';
+    };
+    $('evEnrich').onclick = function () {
+      var hint = $('evHint');
+      enrichFromView(rec, $('evRaw').value, hint ? hint.value : '');
+    };
+    $('evLabelsToggle').onclick = function () {
+      labelsOpen = !labelsOpen;
+      renderEntryView();
+    };
+    if (!labelsOpen) return;
     $('ev-type').onchange = function () {
       rec.type = this.value || null;
       saveViewed(rec, 'type');
@@ -2881,13 +3051,6 @@
       rec.tags = rec.tags.concat([t]);
       el.value = '';
       saveViewed(rec, 'tags');
-    };
-    $('evAskBtn').onclick = function () {
-      askAboutEntry(rec, $('evAsk').value);
-      $('evAsk').value = '';
-    };
-    $('evEnrich').onclick = function () {
-      enrichFromView(rec, $('evRaw').value, $('evHint').value);
     };
   }
 
@@ -3131,7 +3294,45 @@
       return;
     }
     var gdel = e.target.closest('.act-gen-del');
-    if (gdel) { removeGenerated(rec, gdel.getAttribute('data-id')); return; }
+    if (gdel) { removeNote(rec, gdel.getAttribute('data-id')); return; }
+    var nedit = e.target.closest('.act-note-edit');
+    if (nedit) {
+      noteEditId = nedit.getAttribute('data-id');
+      noteRedoId = null;
+      renderEntryView();
+      return;
+    }
+    if (e.target.closest('.act-note-cancel')) { noteEditId = null; renderEntryView(); return; }
+    var nsave = e.target.closest('.act-note-save');
+    if (nsave) {
+      saveNoteText(rec, nsave.getAttribute('data-id'), $('noteEdit').value);
+      return;
+    }
+    var nredo = e.target.closest('.act-note-redo');
+    if (nredo) {
+      var id = nredo.getAttribute('data-id');
+      noteRedoId = noteRedoId === id ? null : id;
+      noteEditId = null;
+      renderEntryView();
+      return;
+    }
+    var ngo = e.target.closest('.act-note-go');
+    if (ngo) {
+      runNote(rec, $('noteRedo').value, ngo.getAttribute('data-id'));
+      return;
+    }
+    var nhist = e.target.closest('.act-note-hist');
+    if (nhist) {
+      var hid = nhist.getAttribute('data-id');
+      noteHistId = noteHistId === hid ? null : hid;
+      renderEntryView();
+      return;
+    }
+    var nres = e.target.closest('.act-note-restore');
+    if (nres) {
+      restoreVersion(rec, nres.getAttribute('data-id'), +nres.getAttribute('data-i'));
+      return;
+    }
     var hdel = e.target.closest('.act-hint-del');
     if (hdel) {
       (rec.hints || []).splice(+hdel.getAttribute('data-i'), 1);

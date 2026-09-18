@@ -25,16 +25,28 @@ work to read.
 
 **Phase 2's first slice shipped 4 September 2026:** on-device extraction (WebLLM/WebGPU, opt-in from Settings), filling type, title, tags, rating and per-type `details`. Nothing leaves the phone — no cloud API. High/medium-confidence extractions apply (medium gets a quiet review marker); low-confidence guesses sit unapplied in `enrichment.suggestion`. A model that does not report a confidence at all is treated as medium rather than as zero — small models are poor at self-rating, and discarding a correct extraction over a missing meta-field is worse than applying it with a marker. Model output is parsed forgivingly for the same reason (`parseModelJSON`): code fences and narration are stripped, truncated JSON is closed, and a broken document has its intact fields salvaged, because a minute of a phone's work should not be lost to one character. Settings carries a **self-test** that runs the whole real path once on a fixed sample sentence and reports every step, so a device failure arrives as one paste rather than one symptom per round trip. Every pass also records the conditions it ran under — `enrichment.grammar`, `enrichment.parse`, and, whenever the parse was not clean, the model's own output verbatim in `enrichment.output` — which Settings can render under each entry as a full run block with a one-tap **Copy run + device**; three round trips in September 2026 were spent recovering facts the device had known at the time and thrown away. No entity resolution, no interactive review queue yet — see the roadmap.
 
-**Asking the model to write something shipped 17 September 2026.** Open an
-entry and ask a question. The model answers in prose and the answer is kept
-in `generated` on the record. This is not extraction and does not behave like
-it. Extraction pulls fields out of your note and refuses when it cannot;
-asking gets prose from what the model knows, and it will not refuse — it will
-invent. So there is no grammar, no validation, and nothing is applied to any
-field. Answers are shown apart from the labels, marked with the model that
-wrote them, and the screen says they can be confidently wrong. Keep it that
-way: when the quiz arrives, nothing in `generated` should reach it without a
-person confirming it first.
+**Notes shipped 18 September 2026.** An entry has three layers now. Your raw
+text at the source. Labels the model extracts from it. And **notes** — several
+per entry, in `notes` on the record. A book gets a summary and a list of its
+characters, each its own note.
+
+A note is a living thing, not a transcript. Ask for one and the model writes
+the first draft. Then edit it by hand, or ask again ("shorter", "focus on the
+characters") and the model rewrites *that note* rather than adding another.
+Every change keeps the text it replaced in `note.history`, and any version can
+be restored — iterating is the point, and an iteration that comes back worse
+has to be survivable.
+
+Notes are not extraction and must not behave like it. Extraction pulls fields
+out of your note and refuses when it cannot tell; a note is prose from what
+the model knows, and it will not refuse — it will invent. So there is no
+grammar, no validation, and nothing a note says is ever applied to a field.
+Notes are marked with who wrote them, and the screen says they can be
+confidently wrong. Keep it that way: when the quiz arrives, nothing in `notes`
+should reach it without a person confirming it first.
+
+**Labels stay manual, and small.** They sit collapsed to one summary line with
+an Edit and an Enrich button, because notes are what the screen is for.
 
 **Enrichment is manual, per entry, by deliberate choice (7 September 2026).** Capture does not enqueue it and launching does not sweep a backlog: you enrich an entry from its row when you want it, or everything at once from Settings. This departs from §2.5 of the architecture doc, which has capture queue enrichment automatically. Entries staying raw for ever is a normal outcome, so `enrichment.status: 'pending'` means "never asked for", not "queued", and the UI reports it quietly rather than as work outstanding. Instructions to the extractor live in `hints` on the record and are replayed on every later pass.
 
@@ -45,7 +57,7 @@ Vanilla HTML/CSS/JS in a single `index.html`. **No build step, no bundled depend
 ## Invariants — do not break these
 
 1. **`raw` is immutable.** AI enrichment writes to separate fields alongside the user's text, never over it. Fields the user edits by hand are recorded in `userEdited` and are never re-derived. **Reachable since 15 September 2026:** tapping a tile opens the entry's own full screen, where type, title, when, rating and tags are all editable, and every hand-edit records the field. `raw` itself is *not* recorded in `userEdited` — that list is about fields the model fills, and the user's own sentence was never one of them.
-2. **Records already use the full v2 schema** — `raw`, `capturedAt`, `enrichment`, `type`, `title`, `occurredAt`, `tags`, `rating`, `details`, `links`, `hints`, `generated`, `userEdited`, `media`, timestamps, `deleted`. Everything except the user's text is null/empty in v0. This exists so no captured data ever needs migrating. Don't strip unused fields.
+2. **Records already use the full v2 schema** — `raw`, `capturedAt`, `enrichment`, `type`, `title`, `occurredAt`, `tags`, `rating`, `details`, `links`, `hints`, `notes`, `userEdited`, `media`, timestamps, `deleted`. Everything except the user's text is null/empty in v0. This exists so no captured data ever needs migrating. Don't strip unused fields.
 3. **Deletes are tombstones** (`deleted: true`), never removals. Required for sync to propagate deletes correctly later.
 4. **Capture never blocks.** No spinner, no network, no required field, no type picker. Save is instant and works offline. Enrichment is always async and always optional.
 5. **This is a log, not a diary.** No streaks, no calendar view, no "how was your day?" prompt, no visible gaps for missed days. The unit is an *encounter*, not a day. See §1.1 of the architecture doc.
@@ -68,7 +80,7 @@ The enrichment questioner and the quiz questioner are **the same component** at 
 
 ## Testing
 
-137 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
+141 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
 
 ```bash
 python3 test/smoke.py            # all

@@ -51,7 +51,7 @@ ROOT = Path(__file__).resolve().parent.parent
 V2_KEYS = {
     "id", "schemaVersion", "raw", "capturedAt", "captureSource", "enrichment",
     "type", "title", "occurredAt", "tags", "rating", "details", "links",
-    "hints", "generated", "userEdited", "media", "createdAt", "updatedAt", "deleted",
+    "hints", "notes", "userEdited", "media", "createdAt", "updatedAt", "deleted",
 }
 
 # Only ever present on a tombstoned record.
@@ -136,6 +136,19 @@ def open_entry(page, selector=".entry"):
 def close_entry(page):
     page.click("#evBack")
     page.wait_for_selector("#entryView", state="hidden")
+
+
+def open_labels(page):
+    """Labels are one summary line until you ask to edit them. Notes are what
+    this screen is for; labels are a footnote you correct."""
+    page.click("#evLabelsToggle")
+    page.wait_for_selector("#ev-type")
+
+
+def add_note(page, ask):
+    page.fill("#evAsk", ask)
+    page.click("#evAskBtn")
+    page.wait_for_selector(".gen")
 
 
 def edit_raw(page, text):
@@ -2484,11 +2497,11 @@ def test_a_question_is_answered_and_kept_on_the_entry(page, base_url):
     page.fill("#evAsk", "Summarise this book")
     page.click("#evAskBtn")
 
-    rec = wait_for_record(page, lambda r: len(r.get("generated", [])) == 1,
+    rec = wait_for_record(page, lambda r: len(r.get("notes", [])) == 1,
                           timeout=15000)
     assert rec, "the answer was never stored"
-    g = rec["generated"][0]
-    assert g["ask"] == "Summarise this book"
+    g = rec["notes"][0]
+    assert g["title"] == "Summarise this book"
     assert "Michael Lewis" in g["text"]
     assert g["model"], "the answer does not say which model wrote it"
 
@@ -2519,7 +2532,7 @@ def test_an_answer_survives_a_sync_landing_mid_question(page, base_url):
     page.fill("#evAsk", "Summarise this book")
     page.click("#evAskBtn")
 
-    rec = wait_for_record(page, lambda r: len(r.get("generated", [])) == 1,
+    rec = wait_for_record(page, lambda r: len(r.get("notes", [])) == 1,
                           timeout=15000)
     assert rec, "the answer was never saved"
     # On screen without reopening the entry.
@@ -2558,6 +2571,107 @@ def test_an_extraction_survives_a_sync_landing_mid_pass(page, base_url):
 
 
 @test
+def test_a_note_can_be_edited_by_hand(page, base_url):
+    """A note is a living thing, not a transcript. You get the first draft
+    from the model and then it is yours."""
+    stub_ask(page, "A book about 2008.")
+    boot(page, base_url)
+    capture(page, "the big short")
+
+    open_entry(page)
+    add_note(page, "Summarise this book")
+
+    page.click(".act-note-edit")
+    page.fill("#noteEdit", "My own words about it.")
+    page.click(".act-note-save")
+
+    rec = wait_for_record(page, lambda r: r["notes"] and r["notes"][0]["by"] == "you")
+    assert rec, "the hand edit was not saved"
+    n = rec["notes"][0]
+    assert n["text"] == "My own words about it."
+    assert [h["text"] for h in n["history"]] == ["A book about 2008."]
+    assert "edited by you" in page.inner_text(".gen-foot")
+
+
+@test
+def test_asking_again_rewrites_the_same_note(page, base_url):
+    """This is the whole point of notes over one-shot answers. "Shorter"
+    should change the note you are looking at, not leave four answers to the
+    same question stacked on the entry."""
+    page.add_init_script("""
+        window.__LELOG_ASKS__ = [];
+        window.__LELOG_TEST_ASK__ = (rec, q, report, previous) => {
+            window.__LELOG_ASKS__.push({ q, previous: previous || '' });
+            return Promise.resolve('Draft ' + window.__LELOG_ASKS__.length);
+        };
+        localStorage.setItem('enrichmentEnabled', '1');
+    """)
+    boot(page, base_url)
+    capture(page, "the big short")
+
+    open_entry(page)
+    add_note(page, "Summarise this book")
+
+    page.click(".act-note-redo")
+    page.fill("#noteRedo", "Shorter")
+    page.click(".act-note-go")
+
+    rec = wait_for_record(page, lambda r: r["notes"] and r["notes"][0]["text"] == "Draft 2",
+                          timeout=15000)
+    assert rec, "asking again did not rewrite the note"
+    assert len(rec["notes"]) == 1, "a second note was created instead"
+    assert rec["notes"][0]["title"] == "Summarise this book", "the title changed"
+    assert [h["text"] for h in rec["notes"][0]["history"]] == ["Draft 1"]
+
+    # The model was handed the text it is rewriting, not just the instruction.
+    asks = page.evaluate("() => window.__LELOG_ASKS__")
+    assert asks[1]["q"] == "Shorter"
+    assert asks[1]["previous"] == "Draft 1", asks[1]
+
+
+@test
+def test_an_old_version_can_be_restored(page, base_url):
+    """An iteration that comes back worse has to be survivable."""
+    stub_ask(page, "The first draft.")
+    boot(page, base_url)
+    capture(page, "the big short")
+
+    open_entry(page)
+    add_note(page, "Summarise this book")
+
+    page.click(".act-note-edit")
+    page.fill("#noteEdit", "A worse draft.")
+    page.click(".act-note-save")
+    wait_for_record(page, lambda r: r["notes"][0]["text"] == "A worse draft.")
+
+    page.click(".act-note-hist")
+    page.click(".act-note-restore")
+
+    rec = wait_for_record(page, lambda r: r["notes"][0]["text"] == "The first draft.")
+    assert rec, "the old version was not restored"
+    # Restoring is itself a version, so the worse draft is not lost either.
+    assert "A worse draft." in [h["text"] for h in rec["notes"][0]["history"]]
+
+
+@test
+def test_several_notes_live_on_one_entry(page, base_url):
+    """A book gets a summary and a list of characters. Both belong to it."""
+    stub_ask(page, "Some prose.")
+    boot(page, base_url)
+    capture(page, "the big short")
+
+    open_entry(page)
+    add_note(page, "Summarise this book")
+    page.fill("#evAsk", "List the main characters")
+    page.click("#evAskBtn")
+
+    rec = wait_for_record(page, lambda r: len(r["notes"]) == 2, timeout=15000)
+    assert rec, "the second note was not added"
+    assert [n["title"] for n in rec["notes"]] == [
+        "Summarise this book", "List the main characters"]
+
+
+@test
 def test_an_answer_never_touches_the_labels(page, base_url):
     """The whole reason this is a separate field. Extraction refuses when it
     cannot tell; generation invents instead, so it must never be mistaken for
@@ -2569,7 +2683,7 @@ def test_an_answer_never_touches_the_labels(page, base_url):
     open_entry(page)
     page.fill("#evAsk", "What is this")
     page.click("#evAskBtn")
-    wait_for_record(page, lambda r: len(r.get("generated", [])) == 1, timeout=15000)
+    wait_for_record(page, lambda r: len(r.get("notes", [])) == 1, timeout=15000)
 
     rec = records(page)[0]
     assert rec["type"] is None, rec["type"]
@@ -2607,7 +2721,7 @@ def test_an_answer_can_be_deleted(page, base_url):
     page.wait_for_selector(".gen")
 
     page.click(".act-gen-del")
-    assert wait_for_record(page, lambda r: r.get("generated") == []), \
+    assert wait_for_record(page, lambda r: r.get("notes") == []), \
         "the answer was not deleted"
 
 
@@ -2622,6 +2736,7 @@ def test_a_label_set_by_hand_survives_re_enrichment(page, base_url):
     capture(page, "finished dune")
 
     open_entry(page)
+    open_labels(page)
     page.fill("#ev-title", "My Own Title")
     page.dispatch_event("#ev-title", "change")
     page.select_option("#ev-type", "film")
@@ -2645,6 +2760,7 @@ def test_tags_can_be_added_and_removed_by_hand(page, base_url):
     capture(page, "something worth tagging")
 
     open_entry(page)
+    open_labels(page)
     page.fill("#evTagInput", "paris")
     page.click("#evTagAdd")
     wait_for_record(page, lambda r: r["tags"] == ["paris"])
@@ -2668,6 +2784,7 @@ def test_the_rating_can_be_set_and_cleared(page, base_url):
     capture(page, "four out of five")
 
     open_entry(page)
+    open_labels(page)
     page.click('.ev-star[data-star="4"]')
     wait_for_record(page, lambda r: r["rating"] == 4)
 
@@ -2835,6 +2952,7 @@ def test_a_hint_is_stored_and_reaches_the_extractor(page, base_url):
     boot(page, base_url)
     capture(page, "dinner out")
     open_entry(page, ".entry")
+    open_labels(page)
     page.fill("#evHint", "mention the wine")
     page.click("#evEnrich")
 
@@ -2873,6 +2991,7 @@ def test_a_hint_can_be_removed(page, base_url):
     boot(page, base_url)
     capture(page, "something")
     open_entry(page, ".entry")
+    open_labels(page)
     page.fill("#evHint", "focus on the food")
     page.click("#evEnrich")
 
