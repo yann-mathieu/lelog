@@ -323,6 +323,11 @@
     flex: 1; min-width: 0; color: var(--faint); font-size: 12.5px;
     line-height: 1.5; white-space: pre-wrap;
   }
+  /* What was asked for this version. A hand edit has none, which is the
+     honest answer: the text changed and nobody asked for it. */
+  .note-ver-ask {
+    display: block; color: var(--muted); font-style: italic; margin-bottom: 3px;
+  }
   .ev-mini {
     background: none; border: 1px solid var(--border); border-radius: 100px;
     color: var(--muted); font: inherit; font-size: 12px; cursor: pointer;
@@ -608,14 +613,25 @@
         rec.notes.push({
           id: g.id || ulid(), title: g.ask || 'Note', text: g.text || '',
           by: 'model', model: g.model || null, at: g.at || rec.updatedAt,
-          ms: g.ms || null, history: []
+          ms: g.ms || null,
+          turns: [{ ask: g.ask || null, text: g.text || '', by: 'model',
+                    model: g.model || null, at: g.at || rec.updatedAt }]
         });
       });
       delete rec.generated;
     }
     rec.notes.forEach(function (n) {
-      if (!Array.isArray(n.history)) n.history = [];
       if (!n.by) n.by = 'model';
+      if (Array.isArray(n.turns)) return;
+      // `history` held past texts with no record of what was asked for them,
+      // which is exactly the gap turns exist to close. Old versions keep
+      // their text and admit they do not know the instruction.
+      n.turns = (n.history || []).map(function (h) {
+        return { ask: null, text: h.text, by: h.by || 'model',
+                 model: h.model || null, at: h.at || n.at };
+      }).concat([{ ask: n.title || null, text: n.text, by: n.by,
+                   model: n.model || null, at: n.at }]);
+      delete n.history;
     });
     var e = rec.enrichment;
     if (!e) e = rec.enrichment = { status: 'pending', model: null, at: null, confidence: null };
@@ -2385,21 +2401,38 @@
   var noteEditId = null, noteRedoId = null, noteHistId = null, noteBusyId = null;
   var labelsOpen = false;
 
-  function askPrompt(rec, question, previous) {
-    var p = 'Answer the question about this note. Be brief and concrete.\n'
+  // One note is one conversation. Every instruction you have given it and
+  // every draft that came back, in order, so "add the dates" still knows you
+  // asked for it short two turns ago. The previous shape sent the current
+  // text and one instruction, which made each redo start from nothing.
+  //
+  // Bounded, because prefill is what costs seconds on a phone and a 1.5B
+  // handles a long context badly. The opening message always goes — it
+  // carries your note and the original ask — then the most recent exchanges.
+  var ASK_MAX_TURNS = 3;
+
+  function askMessages(rec, note, question) {
+    var opening = 'Answer the question about this note. Be brief and concrete.\n'
       + 'If you do not know, say so rather than guessing.\n'
-      + 'Note: "' + rec.raw + '"\n';
-    // A redo is the same call with the last answer in front of it. The model
-    // is rewriting something, not starting again, which is what "make it
-    // shorter" has to mean.
-    if (previous) {
-      p += 'Your previous answer:\n' + previous + '\n'
-        + 'Rewrite it, following the instruction below.\n';
-    }
-    return p + 'Instruction: ' + question;
+      + 'Note: "' + rec.raw + '"\n'
+      + 'Question: ' + ((note && note.title) || question);
+
+    var msgs = [{ role: 'user', content: opening }];
+    var turns = (note && note.turns) || [];
+    var recent = turns.slice(-ASK_MAX_TURNS);
+    recent.forEach(function (t, i) {
+      // The first turn's answer replies to the opening message; later ones
+      // need the instruction that asked for them.
+      if (t.ask && !(i === 0 && turns.length <= ASK_MAX_TURNS && t.ask === note.title)) {
+        msgs.push({ role: 'user', content: t.ask });
+      }
+      msgs.push({ role: 'assistant', content: t.text });
+    });
+    if (note) msgs.push({ role: 'user', content: question });
+    return msgs;
   }
 
-  function realWebLLMAsk(rec, question, report, previous) {
+  function realWebLLMAsk(rec, question, report, note) {
     report = report || function () {};
     return getEnrichEngine(function (p) {
       report({ phase: 'loading', pct: Math.round((p.progress || 0) * 100),
@@ -2407,7 +2440,7 @@
     }).then(function (engine) {
       report({ phase: 'running', tokens: 0, partial: '' });
       return completeWithFallback(engine, {
-        messages: [{ role: 'user', content: askPrompt(rec, question, previous) }],
+        messages: askMessages(rec, note, question),
         max_tokens: ASK_MAX_TOKENS
       }, report);
     });
@@ -2423,10 +2456,18 @@
 
   // Every change to a note keeps the text it replaced. Iterating is the point
   // of notes, and an iteration that comes back worse has to be survivable.
-  function pushVersion(note) {
-    note.history = (note.history || []).concat([{
-      text: note.text, by: note.by, model: note.model, at: note.at
+  // Every version is a turn, and a turn carries the instruction that asked
+  // for it. A hand edit or a restore has no instruction, which is exactly
+  // what the model should see: the text changed, nobody asked for it.
+  function addTurn(note, ask, text, by, model) {
+    note.turns = (note.turns || []).concat([{
+      ask: ask || null, text: text, by: by, model: model || null,
+      at: new Date().toISOString()
     }]);
+    note.text = text;
+    note.by = by;
+    if (model) note.model = model;
+    note.at = note.turns[note.turns.length - 1].at;
   }
 
   function runNote(rec, instruction, noteId) {
@@ -2435,7 +2476,6 @@
     if (enrichRunning) { toast('Wait for the labels to finish'); return Promise.resolve(); }
     if (!enrichmentEnabled()) { toast('Turn on enrichment in Settings'); return Promise.resolve(); }
 
-    var previous = noteId ? (findNote(rec, noteId) || {}).text : '';
     asking = true;
     askingId = rec.id;
     noteBusyId = noteId || 'new';
@@ -2445,7 +2485,7 @@
     renderEntryView();
 
     return Promise.resolve().then(function () {
-      return getAsker()(rec, q, reportProgress, previous);
+      return getAsker()(rec, q, reportProgress, noteId ? findNote(rec, noteId) : null);
     }).then(function (text) {
       var answer = String(text == null ? '' : text).trim();
       if (!answer) throw new Error('The model returned nothing.');
@@ -2453,20 +2493,16 @@
       // pass takes long enough that the one captured here is often detached.
       rec = freshRecord(rec);
       if (!rec || rec.deleted) return;
+      var model = enrichModelId || chosenModel().f32 || null;
       var note = noteId ? findNote(rec, noteId) : null;
       if (note) {
-        pushVersion(note);
-        note.text = answer;
-        note.by = 'model';
-        note.model = enrichModelId || chosenModel().f32 || null;
-        note.at = new Date().toISOString();
+        addTurn(note, q, answer, 'model', model);
         note.ms = Date.now() - t;
       } else {
-        rec.notes = (rec.notes || []).concat([{
-          id: ulid(), title: q, text: answer, by: 'model',
-          model: enrichModelId || chosenModel().f32 || null,
-          at: new Date().toISOString(), ms: Date.now() - t, history: []
-        }]);
+        note = { id: ulid(), title: q, text: '', by: 'model', model: model,
+                 at: null, ms: Date.now() - t, turns: [] };
+        addTurn(note, q, answer, 'model', model);
+        rec.notes = (rec.notes || []).concat([note]);
       }
       rec.updatedAt = new Date().toISOString();
       return put(rec);
@@ -2487,10 +2523,7 @@
     if (!note) return;
     var t = String(text).trim();
     if (!t || t === note.text) { noteEditId = null; renderEntryView(); return; }
-    pushVersion(note);
-    note.text = t;
-    note.by = 'you';
-    note.at = new Date().toISOString();
+    addTurn(note, null, t, 'you', null);
     noteEditId = null;
     rec.updatedAt = note.at;
     put(rec).then(function () { renderEntryView(); scheduleSync(); });
@@ -2498,13 +2531,9 @@
 
   function restoreVersion(rec, id, i) {
     var note = findNote(rec, id);
-    if (!note || !note.history[i]) return;
-    var old = note.history[i];
-    pushVersion(note);
-    note.text = old.text;
-    note.by = old.by;
-    note.model = old.model;
-    note.at = new Date().toISOString();
+    var old = note && note.turns[i];
+    if (!old) return;
+    addTurn(note, null, old.text, old.by, old.model);
     rec.updatedAt = note.at;
     put(rec).then(function () { renderEntryView(); scheduleSync(); toast('Restored'); });
   }
@@ -2557,7 +2586,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-19';
+  var APP_VERSION = 'log-v3-20';
   var all = [], query = '';
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -2950,11 +2979,14 @@
           + '<button class="btn act-note-go" data-id="' + esc(n.id) + '">Go</button></div>'
         : '';
 
-      var hist = noteHistId === n.id && n.history.length
-        ? '<div class="note-hist">' + n.history.slice().reverse().map(function (h, i) {
-            var idx = n.history.length - 1 - i;
+    var past = (n.turns || []).slice(0, -1);
+      var hist = noteHistId === n.id && past.length
+        ? '<div class="note-hist">' + past.slice().reverse().map(function (h, i) {
+            var idx = past.length - 1 - i;
             return '<div class="note-ver">'
-              + '<div class="note-ver-text">' + esc(h.text) + '</div>'
+              + '<div class="note-ver-text">'
+                + (h.ask ? '<span class="note-ver-ask">' + esc(h.ask) + '</span>' : '')
+                + esc(h.text) + '</div>'
               + '<button class="ev-mini act-note-restore" data-id="' + esc(n.id)
               + '" data-i="' + idx + '">Restore</button></div>';
           }).join('') + '</div>'
@@ -2969,12 +3001,12 @@
         + (noteBusyId === n.id ? livePanel() : '')
         + '<div class="gen-foot">'
           + (n.by === 'you' ? 'edited by you' : 'written by ' + esc(n.model || 'the model'))
-          + (n.history.length ? ' \u00b7 ' + (n.history.length + 1) + ' versions' : '')
+          + (past.length ? ' \u00b7 ' + (past.length + 1) + ' versions' : '')
         + '</div>'
         + '<div class="note-acts">'
           + '<button class="ev-mini act-note-edit" data-id="' + esc(n.id) + '">Edit</button>'
           + '<button class="ev-mini act-note-redo" data-id="' + esc(n.id) + '">Ask again</button>'
-          + (n.history.length
+          + (past.length
               ? '<button class="ev-mini act-note-hist" data-id="' + esc(n.id) + '">'
                 + (noteHistId === n.id ? 'Hide versions' : 'Versions') + '</button>'
               : '')

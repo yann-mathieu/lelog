@@ -2589,7 +2589,7 @@ def test_a_note_can_be_edited_by_hand(page, base_url):
     assert rec, "the hand edit was not saved"
     n = rec["notes"][0]
     assert n["text"] == "My own words about it."
-    assert [h["text"] for h in n["history"]] == ["A book about 2008."]
+    assert [t["text"] for t in n["turns"][:-1]] == ["A book about 2008."]
     assert "edited by you" in page.inner_text(".gen-foot")
 
 
@@ -2600,8 +2600,8 @@ def test_asking_again_rewrites_the_same_note(page, base_url):
     same question stacked on the entry."""
     page.add_init_script("""
         window.__LELOG_ASKS__ = [];
-        window.__LELOG_TEST_ASK__ = (rec, q, report, previous) => {
-            window.__LELOG_ASKS__.push({ q, previous: previous || '' });
+        window.__LELOG_TEST_ASK__ = (rec, q, report, note) => {
+            window.__LELOG_ASKS__.push({ q, previous: note ? JSON.parse(JSON.stringify(note)) : null });
             return Promise.resolve('Draft ' + window.__LELOG_ASKS__.length);
         };
         localStorage.setItem('enrichmentEnabled', '1');
@@ -2621,12 +2621,113 @@ def test_asking_again_rewrites_the_same_note(page, base_url):
     assert rec, "asking again did not rewrite the note"
     assert len(rec["notes"]) == 1, "a second note was created instead"
     assert rec["notes"][0]["title"] == "Summarise this book", "the title changed"
-    assert [h["text"] for h in rec["notes"][0]["history"]] == ["Draft 1"]
+    assert [t["text"] for t in rec["notes"][0]["turns"][:-1]] == ["Draft 1"]
 
-    # The model was handed the text it is rewriting, not just the instruction.
+    # The model was handed the note it is rewriting, not just the instruction.
     asks = page.evaluate("() => window.__LELOG_ASKS__")
     assert asks[1]["q"] == "Shorter"
-    assert asks[1]["previous"] == "Draft 1", asks[1]
+    assert asks[1]["previous"]["text"] == "Draft 1", asks[1]
+
+
+@test
+def test_iterating_on_a_note_is_a_conversation(page, base_url):
+    """Say "shorter", then "add the dates", and the second instruction has to
+    still know about the first. The previous shape sent the current text and
+    one instruction, so every redo started from nothing.
+
+    Through the module seam, so the real message array is built and checked.
+    """
+    stub_model_layer(page)
+    page.add_init_script("""
+        let n = 0;
+        const mk = window.__LELOG_TEST_WEBLLM__.CreateMLCEngine;
+        window.__LELOG_TEST_WEBLLM__.CreateMLCEngine = (id, opts) =>
+            mk(id, opts).then(engine => {
+                engine.chat.completions.create = (req) => {
+                    // completeWithFallback tries streaming first and falls back,
+                    // so every ask reaches here twice. Refuse the stream and
+                    // count only the call that actually answers.
+                    if (req.stream) return Promise.reject(new Error('no stream'));
+                    window.__LELOG_SEEN_REQ__ = JSON.parse(JSON.stringify(req));
+                    return Promise.resolve(
+                        { choices: [{ message: { content: 'Draft ' + (++n) } }] });
+                };
+                return engine;
+            });
+    """)
+    boot(page, base_url)
+    capture(page, "the big short")
+
+    open_entry(page)
+    add_note(page, "Summarise this book")
+
+    for instruction in ("Shorter", "Now add the dates"):
+        page.click(".act-note-redo")
+        page.fill("#noteRedo", instruction)
+        page.click(".act-note-go")
+        page.wait_for_function(
+            "n => (document.querySelector('.gen-text')||{}).textContent === n",
+            arg="Draft %d" % (2 if instruction == "Shorter" else 3))
+
+    msgs = page.evaluate("() => window.__LELOG_SEEN_REQ__.messages")
+    roles = [m["role"] for m in msgs]
+    assert roles == ["user", "assistant", "user", "assistant", "user"], roles
+
+    # The opening message carries the note and the original question.
+    assert "the big short" in msgs[0]["content"]
+    assert "Summarise this book" in msgs[0]["content"]
+    # Both drafts came back as the assistant, and the earlier instruction is
+    # still in the conversation when the later one is asked.
+    assert msgs[1]["content"] == "Draft 1"
+    assert msgs[2]["content"] == "Shorter"
+    assert msgs[3]["content"] == "Draft 2"
+    assert msgs[4]["content"] == "Now add the dates"
+
+
+@test
+def test_the_conversation_is_bounded(page, base_url):
+    """Prefill is what costs seconds on a phone, and a 1.5B handles a long
+    context badly. The opening message always goes; the rest is the most
+    recent exchanges, not all of them."""
+    stub_model_layer(page)
+    page.add_init_script("""
+        let n = 0;
+        const mk = window.__LELOG_TEST_WEBLLM__.CreateMLCEngine;
+        window.__LELOG_TEST_WEBLLM__.CreateMLCEngine = (id, opts) =>
+            mk(id, opts).then(engine => {
+                engine.chat.completions.create = (req) => {
+                    // completeWithFallback tries streaming first and falls back,
+                    // so every ask reaches here twice. Refuse the stream and
+                    // count only the call that actually answers.
+                    if (req.stream) return Promise.reject(new Error('no stream'));
+                    window.__LELOG_SEEN_REQ__ = JSON.parse(JSON.stringify(req));
+                    return Promise.resolve(
+                        { choices: [{ message: { content: 'Draft ' + (++n) } }] });
+                };
+                return engine;
+            });
+    """)
+    boot(page, base_url)
+    capture(page, "the big short")
+
+    open_entry(page)
+    add_note(page, "Summarise this book")
+    for i in range(5):
+        page.click(".act-note-redo")
+        page.fill("#noteRedo", "Again %d" % i)
+        page.click(".act-note-go")
+        page.wait_for_function(
+            "n => (document.querySelector('.gen-text')||{}).textContent === n",
+            arg="Draft %d" % (i + 2))
+
+    msgs = page.evaluate("() => window.__LELOG_SEEN_REQ__.messages")
+    assert len(msgs) <= 8, "the conversation grows without limit: %d" % len(msgs)
+    assert msgs[0]["role"] == "user" and "the big short" in msgs[0]["content"]
+    # Still ends with the newest instruction, and the draft before it.
+    assert msgs[-1]["content"] == "Again 4"
+    assert msgs[-2]["content"] == "Draft 5"
+    # And every version is kept on the record, whatever the model was sent.
+    assert len(records(page)[0]["notes"][0]["turns"]) == 6
 
 
 @test
@@ -2650,7 +2751,7 @@ def test_an_old_version_can_be_restored(page, base_url):
     rec = wait_for_record(page, lambda r: r["notes"][0]["text"] == "The first draft.")
     assert rec, "the old version was not restored"
     # Restoring is itself a version, so the worse draft is not lost either.
-    assert "A worse draft." in [h["text"] for h in rec["notes"][0]["history"]]
+    assert "A worse draft." in [t["text"] for t in rec["notes"][0]["turns"][:-1]]
 
 
 @test

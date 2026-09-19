@@ -33,9 +33,16 @@ characters, each its own note.
 A note is a living thing, not a transcript. Ask for one and the model writes
 the first draft. Then edit it by hand, or ask again ("shorter", "focus on the
 characters") and the model rewrites *that note* rather than adding another.
-Every change keeps the text it replaced in `note.history`, and any version can
-be restored — iterating is the point, and an iteration that comes back worse
-has to be survivable.
+**One note is one conversation.** `note.turns` holds every version and the
+instruction that asked for it, and a redo sends the whole thing as a real
+messages array — so "add the dates" still knows you asked for it short two
+turns ago. It is bounded (`ASK_MAX_TURNS`): the opening message always goes,
+carrying your note and the original question, then the most recent exchanges.
+Prefill is what costs seconds on a phone and a 1.5B handles long context
+badly. Every version is kept on the record whatever the model is sent, and
+any of them can be restored — iterating is the point, and an iteration that
+comes back worse has to be survivable. A hand edit is a turn with no
+instruction, which is the honest thing for the model to see.
 
 Notes are not extraction and must not behave like it. Extraction pulls fields
 out of your note and refuses when it cannot tell; a note is prose from what
@@ -80,7 +87,7 @@ The enrichment questioner and the quiz questioner are **the same component** at 
 
 ## Testing
 
-141 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
+143 Playwright tests in `test/smoke.py`. No test runner, no framework — the file serves the repo on an ephemeral port, drives it with headless Chromium, and gives each test a fresh browser context. Dropbox endpoints are stubbed, so it runs offline and never touches a real account. On-device enrichment is stubbed the same way, via `window.__LELOG_TEST_EXTRACTOR__` — no test touches real WebGPU or downloads real model weights.
 
 ```bash
 python3 test/smoke.py            # all
