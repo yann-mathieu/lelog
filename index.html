@@ -328,6 +328,10 @@
   .note-ver-ask {
     display: block; color: var(--muted); font-style: italic; margin-bottom: 3px;
   }
+  /* The version you are reading, listed with the rest so its instruction
+     shows, but not offered as something to restore. */
+  .note-ver.now .note-ver-text { color: var(--text); }
+  .note-ver-now { color: var(--faint); font-size: 12px; padding: 4px 2px; flex: 0 0 auto; }
   .ev-mini {
     background: none; border: 1px solid var(--border); border-radius: 100px;
     color: var(--muted); font: inherit; font-size: 12px; cursor: pointer;
@@ -2534,6 +2538,9 @@
     var old = note && note.turns[i];
     if (!old) return;
     addTurn(note, null, old.text, old.by, old.model);
+    // Not an instruction — ask stays null so the model never sees a turn
+    // nobody typed. The flag is for the screen only.
+    note.turns[note.turns.length - 1].restored = true;
     rec.updatedAt = note.at;
     put(rec).then(function () { renderEntryView(); scheduleSync(); toast('Restored'); });
   }
@@ -2586,7 +2593,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-20';
+  var APP_VERSION = 'log-v3-21';
   var all = [], query = '';
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -2960,6 +2967,16 @@
 
   // One card per note. Everything you can do to a note is on the card, and
   // only one card is ever open for editing, rewriting or history.
+  // What was asked for a version. Three things have no instruction: a hand
+  // edit, a restore, and a note written before turns existed. Say which,
+  // rather than leaving a blank where the prompt should be.
+  function askLabel(t) {
+    if (t.restored) return 'restored an earlier version';
+    if (t.ask) return t.ask;
+    if (t.by === 'you') return 'edited by hand';
+    return 'instruction not recorded';
+  }
+
   function notesList(rec) {
     var items = rec.notes || [];
     if (!items.length) return '';
@@ -2979,16 +2996,24 @@
           + '<button class="btn act-note-go" data-id="' + esc(n.id) + '">Go</button></div>'
         : '';
 
-    var past = (n.turns || []).slice(0, -1);
+      var turns = n.turns || [];
+      var past = turns.slice(0, -1);
+      // Every turn, newest first — the current one included. The instruction
+      // that produced the text you are reading is the one you most want to
+      // see, and leaving it out was the whole complaint.
       var hist = noteHistId === n.id && past.length
-        ? '<div class="note-hist">' + past.slice().reverse().map(function (h, i) {
-            var idx = past.length - 1 - i;
-            return '<div class="note-ver">'
+        ? '<div class="note-hist">' + turns.slice().reverse().map(function (h, i) {
+            var idx = turns.length - 1 - i;
+            var now = idx === turns.length - 1;
+            return '<div class="note-ver' + (now ? ' now' : '') + '">'
               + '<div class="note-ver-text">'
-                + (h.ask ? '<span class="note-ver-ask">' + esc(h.ask) + '</span>' : '')
+                + '<span class="note-ver-ask">' + esc(askLabel(h)) + '</span>'
                 + esc(h.text) + '</div>'
-              + '<button class="ev-mini act-note-restore" data-id="' + esc(n.id)
-              + '" data-i="' + idx + '">Restore</button></div>';
+              + (now
+                  ? '<span class="note-ver-now">Now</span>'
+                  : '<button class="ev-mini act-note-restore" data-id="' + esc(n.id)
+                    + '" data-i="' + idx + '">Restore</button>')
+              + '</div>';
           }).join('') + '</div>'
         : '';
 
@@ -3001,7 +3026,7 @@
         + (noteBusyId === n.id ? livePanel() : '')
         + '<div class="gen-foot">'
           + (n.by === 'you' ? 'edited by you' : 'written by ' + esc(n.model || 'the model'))
-          + (past.length ? ' \u00b7 ' + (past.length + 1) + ' versions' : '')
+          + (past.length ? ' \u00b7 ' + turns.length + ' versions' : '')
         + '</div>'
         + '<div class="note-acts">'
           + '<button class="ev-mini act-note-edit" data-id="' + esc(n.id) + '">Edit</button>'

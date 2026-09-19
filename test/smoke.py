@@ -2755,6 +2755,89 @@ def test_an_old_version_can_be_restored(page, base_url):
 
 
 @test
+def test_versions_show_the_instruction_that_made_each_one(page, base_url):
+    """Iterating is a conversation, so the list has to say what was asked —
+    including for the version on screen, which is the one you just asked for."""
+    page.add_init_script("""
+        window.__LELOG_TEST_ASK__ = (rec, question) => {
+            window.__N__ = (window.__N__ || 0) + 1;
+            return Promise.resolve('Draft ' + window.__N__);
+        };
+        localStorage.setItem('enrichmentEnabled', '1');
+    """)
+    boot(page, base_url)
+    capture(page, "the big short")
+
+    open_entry(page)
+    add_note(page, "Summarise this book")
+    page.click(".act-note-redo")
+    page.fill("#noteRedo", "Make it shorter")
+    page.click(".act-note-go")
+    page.wait_for_function(
+        "() => (document.querySelector('.gen-text')||{}).textContent === 'Draft 2'")
+
+    page.click(".act-note-hist")
+    page.wait_for_selector(".note-hist")
+    asks = page.eval_on_selector_all(
+        ".note-hist .note-ver-ask", "els => els.map(e => e.textContent)")
+    # Newest first, and the current draft is listed with the rest.
+    assert asks == ["Make it shorter", "Summarise this book"], asks
+    now = page.text_content(".note-ver.now .note-ver-text")
+    assert now.endswith("Draft 2"), now
+    assert page.locator(".note-ver.now .act-note-restore").count() == 0, \
+        "the version on screen is offered as something to restore"
+
+    # A hand edit had no instruction. Say that, rather than leaving a blank.
+    page.click(".act-note-edit")
+    page.fill("#noteEdit", "Mine.")
+    page.click(".act-note-save")
+    wait_for_record(page, lambda r: r["notes"][0]["text"] == "Mine.")
+    # The list is still open; the hand edit is simply the newest version now.
+    page.wait_for_function(
+        "() => (document.querySelector('.note-ver.now .note-ver-ask')||{})"
+        ".textContent === 'edited by hand'")
+
+
+@test
+def test_a_migrated_note_admits_it_lost_the_instruction(page, base_url):
+    """Notes written before turns existed have no record of what was asked.
+    The line says so instead of going blank."""
+    stub_ask(page, "Some prose.")
+    boot(page, base_url)
+    capture(page, "the big short")
+    page.evaluate("""() => new Promise(res => {
+        const req = indexedDB.open('memvault');
+        req.onsuccess = () => {
+            const db = req.result;
+            const st = db.transaction('memories', 'readwrite')
+                         .objectStore('memories');
+            st.getAll().onsuccess = e => {
+                const r = e.target.result[0];
+                r.notes = [{ id: 'n1', title: 'Summarise this book',
+                             text: 'The second draft.', by: 'model',
+                             model: 'old-model', at: r.capturedAt,
+                             turns: [{ ask: null, text: 'The first draft.',
+                                       by: 'model', model: 'old-model',
+                                       at: r.capturedAt },
+                                     { ask: null, text: 'The second draft.',
+                                       by: 'model', model: 'old-model',
+                                       at: r.capturedAt }] }];
+                st.put(r).onsuccess = () => res(true);
+            };
+        };
+    })""")
+    page.reload()
+    boot(page, base_url)
+
+    open_entry(page)
+    page.click(".act-note-hist")
+    page.wait_for_selector(".note-hist")
+    asks = page.eval_on_selector_all(
+        ".note-hist .note-ver-ask", "els => els.map(e => e.textContent)")
+    assert asks == ["instruction not recorded", "instruction not recorded"], asks
+
+
+@test
 def test_several_notes_live_on_one_entry(page, base_url):
     """A book gets a summary and a list of characters. Both belong to it."""
     stub_ask(page, "Some prose.")
