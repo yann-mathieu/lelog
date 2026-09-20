@@ -2685,6 +2685,85 @@ def test_iterating_on_a_note_is_a_conversation(page, base_url):
 
 
 @test
+def test_the_note_prompt_asks_about_the_thing_not_the_log_line(page, base_url):
+    """Six drafts in a row came back restating the log line, because the
+    prompt made that line the subject and told the model not to guess.
+    Extraction refuses; a note is prose from what the model knows."""
+    stub_model_layer(page)
+    page.add_init_script("""
+        const mk = window.__LELOG_TEST_WEBLLM__.CreateMLCEngine;
+        window.__LELOG_TEST_WEBLLM__.CreateMLCEngine = (id, opts) =>
+            mk(id, opts).then(engine => {
+                engine.chat.completions.create = (req) => {
+                    if (req.stream) return Promise.reject(new Error('no stream'));
+                    window.__LELOG_SEEN_REQ__ = JSON.parse(JSON.stringify(req));
+                    return Promise.resolve(
+                        { choices: [{ message: { content: 'Some prose.' } }] });
+                };
+                return engine;
+            });
+    """)
+    boot(page, base_url)
+    capture(page, "listened to the audiobook of The Big Short")
+
+    open_entry(page)
+    add_note(page, "List the main characters")
+
+    opening = page.evaluate("() => window.__LELOG_SEEN_REQ__.messages[0].content")
+    assert "listened to the audiobook of The Big Short" in opening
+    assert "List the main characters" in opening
+    # The two lines that produced the restatements must not come back.
+    assert "Answer the question about this note" not in opening
+    assert "If you do not know, say so rather than guessing" not in opening
+    # And the one that stops it summarising your own sentence must be there.
+    assert "not the text to summarise" in opening
+    assert "using what you know about it" in opening
+
+
+@test
+def test_the_note_prompt_names_the_labels_when_there_are_any(page, base_url):
+    """Once the labels are in, the model gets the title and type outright
+    instead of having to read them back out of the sentence."""
+    stub_model_layer(page)
+    page.add_init_script("""
+        const mk = window.__LELOG_TEST_WEBLLM__.CreateMLCEngine;
+        window.__LELOG_TEST_WEBLLM__.CreateMLCEngine = (id, opts) =>
+            mk(id, opts).then(engine => {
+                engine.chat.completions.create = (req) => {
+                    if (req.stream) return Promise.reject(new Error('no stream'));
+                    window.__LELOG_SEEN_REQ__ = JSON.parse(JSON.stringify(req));
+                    return Promise.resolve(
+                        { choices: [{ message: { content: 'Some prose.' } }] });
+                };
+                return engine;
+            });
+    """)
+    boot(page, base_url)
+    capture(page, "listened to the audiobook of The Big Short")
+    page.evaluate("""() => new Promise(res => {
+        const req = indexedDB.open('memvault');
+        req.onsuccess = () => {
+            const st = req.result.transaction('memories', 'readwrite')
+                          .objectStore('memories');
+            st.getAll().onsuccess = e => {
+                const r = e.target.result[0];
+                r.type = 'book';
+                r.title = 'The Big Short';
+                st.put(r).onsuccess = () => res(true);
+            };
+        };
+    })""")
+    page.reload()
+    boot(page, base_url)
+
+    open_entry(page)
+    add_note(page, "List the main characters")
+
+    opening = page.evaluate("() => window.__LELOG_SEEN_REQ__.messages[0].content")
+    assert 'It is about "The Big Short", a book.' in opening, opening
+
+
+@test
 def test_the_conversation_is_bounded(page, base_url):
     """Prefill is what costs seconds on a phone, and a 1.5B handles a long
     context badly. The opening message always goes; the rest is the most
