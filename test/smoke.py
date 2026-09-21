@@ -2711,19 +2711,22 @@ def test_the_note_prompt_asks_about_the_thing_not_the_log_line(page, base_url):
 
     opening = page.evaluate("() => window.__LELOG_SEEN_REQ__.messages[0].content")
     assert "listened to the audiobook of The Big Short" in opening
-    assert "List the main characters" in opening
     # The two lines that produced the restatements must not come back.
     assert "Answer the question about this note" not in opening
     assert "If you do not know, say so rather than guessing" not in opening
     # And the one that stops it summarising your own sentence must be there.
-    assert "not the text to summarise" in opening
-    assert "using what you know about it" in opening
+    assert "do not describe or summarise the sentence" in opening
+    assert "from what you know about it" in opening
+    # The task is the last line, bare. A labelled field at the end invited a
+    # 1.5B to keep filling the template in and copy the request into its answer.
+    assert opening.rstrip().endswith("List the main characters"), opening
+    assert "Question:" not in opening
 
 
 @test
 def test_the_note_prompt_names_the_labels_when_there_are_any(page, base_url):
-    """Once the labels are in, the model gets the title and type outright
-    instead of having to read them back out of the sentence."""
+    """Once the labels are in, the model gets the title outright instead of
+    having to read it back out of the sentence. The type stays out."""
     stub_model_layer(page)
     page.add_init_script("""
         const mk = window.__LELOG_TEST_WEBLLM__.CreateMLCEngine;
@@ -2760,7 +2763,49 @@ def test_the_note_prompt_names_the_labels_when_there_are_any(page, base_url):
     add_note(page, "List the main characters")
 
     opening = page.evaluate("() => window.__LELOG_SEEN_REQ__.messages[0].content")
-    assert 'It is about "The Big Short", a book.' in opening, opening
+    assert "It is about: The Big Short" in opening, opening
+    # The type is deliberately left out: it comes back wrong often enough
+    # (an audiobook typed as a podcast) that naming it misleads the model.
+    assert "book" not in opening.replace("audiobook", ""), opening
+
+
+@test
+def test_the_copied_run_carries_the_notes_prompt(page, base_url):
+    """A note that reads wrong is a question about the prompt behind it.
+    Until this there was no way to see one short of a photo of a phone."""
+    stub_model_layer(page)
+    dev_details(page)
+    page.add_init_script("""
+        window.__COPIED__ = null;
+        navigator.clipboard.writeText = t => { window.__COPIED__ = t; return Promise.resolve(); };
+        const mk = window.__LELOG_TEST_WEBLLM__.CreateMLCEngine;
+        window.__LELOG_TEST_WEBLLM__.CreateMLCEngine = (id, opts) =>
+            mk(id, opts).then(engine => {
+                engine.chat.completions.create = (req) => {
+                    if (req.stream) return Promise.reject(new Error('no stream'));
+                    return Promise.resolve(
+                        { choices: [{ message: { content: 'Some prose.' } }] });
+                };
+                return engine;
+            });
+    """)
+    boot(page, base_url)
+    capture(page, "listened to the audiobook of The Big Short")
+
+    open_entry(page)
+    add_note(page, "List the main characters")
+
+    # The labels were never run on this entry, so the block exists only
+    # because of the note — which is exactly the entry that comes out wrong.
+    page.click(".act-copy-run")
+    page.wait_for_function("() => window.__COPIED__")
+    report = page.evaluate("() => window.__COPIED__")
+
+    assert "--- note 1 of 1 ---" in report, report
+    assert "List the main characters" in report
+    assert "Some prose." in report
+    assert "prompt sent:" in report
+    assert "do not describe or summarise the sentence" in report
 
 
 @test

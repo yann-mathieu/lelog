@@ -1443,8 +1443,14 @@
       f16: 'Llama-3.2-1B-Instruct-q4f16_1-MLC', f32: 'Llama-3.2-1B-Instruct-q4f32_1-MLC' },
     { key: 'qwen-0.5b', label: 'Qwen2.5 0.5B — small (~1GB)',
       f16: 'Qwen2.5-0.5B-Instruct-q4f16_1-MLC', f32: 'Qwen2.5-0.5B-Instruct-q4f32_1-MLC' },
-    { key: 'qwen-1.5b', label: 'Qwen2.5 1.5B — best extraction, heaviest (~1.6GB)',
-      f16: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC', f32: 'Qwen2.5-1.5B-Instruct-q4f32_1-MLC' }
+    { key: 'qwen-1.5b', label: 'Qwen2.5 1.5B — best extraction (~1.6GB)',
+      f16: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC', f32: 'Qwen2.5-1.5B-Instruct-q4f32_1-MLC' },
+    // Notes are where size tells. Extraction leans on the grammar to hold
+    // the shape; prose about a book has no such scaffold — the model has to
+    // know the book and write. 2.9GB against 1.6GB, and WebLLM still marks
+    // it low_resource_required.
+    { key: 'qwen-3b', label: 'Qwen2.5 3B — best notes, largest (~2.9GB)',
+      f16: 'Qwen2.5-3B-Instruct-q4f16_1-MLC', f32: 'Qwen2.5-3B-Instruct-q4f32_1-MLC' }
   ];
   // Qwen 1.5B, not Llama 1B. On a Qualcomm Adreno 7xx the 1B read "I've
   // listened to the audio book The Big Short" as type film, title "film",
@@ -2422,17 +2428,21 @@
   // audiobook version of the book." The line names the subject. It is not
   // the material.
   function askMessages(rec, note, question) {
-    var what = rec.title
-      ? '"' + rec.title + '"' + (rec.type ? ', a ' + rec.type : '')
-      : null;
+    // The task goes last, on its own, as a plain instruction. Ending the
+    // message with a labelled field ("Question: ...") invited a 1.5B to keep
+    // filling the template in: the answer came back with the request copied
+    // into it. The type is left out on purpose — it is wrong often enough
+    // (an audiobook typed as a podcast) that naming it misleads the model,
+    // and the title alone already says which thing this is.
     var opening = 'You are writing a note for someone\'s personal log.\n'
-      + 'They logged this: "' + rec.raw + '"\n'
-      + (what ? 'It is about ' + what + '.\n' : '')
-      + 'Write about that thing itself, using what you know about it. The log '
-      + 'line only says which thing it is. It is not the text to summarise.\n'
-      + 'Write plain prose, a few sentences. No preamble, no headings.\n'
-      + 'Only if you have never heard of it, say so in one line.\n'
-      + 'Question: ' + ((note && note.title) || question);
+      + 'They logged: "' + rec.raw + '"\n'
+      + (rec.title ? 'It is about: ' + rec.title + '\n' : '')
+      + 'Write about that thing itself, from what you know about it. Their '
+      + 'sentence only names it; do not describe or summarise the sentence.\n'
+      + 'Plain prose, a few sentences. No headings, no preamble, and do not '
+      + 'repeat the request back.\n'
+      + 'If you have never heard of it, say only that.\n\n'
+      + ((note && note.title) || question);
 
     var msgs = [{ role: 'user', content: opening }];
     var turns = (note && note.turns) || [];
@@ -2449,6 +2459,12 @@
     return msgs;
   }
 
+  // What was actually sent. A note that comes back wrong is a question about
+  // the prompt, and there was no way to see one without a screenshot of a
+  // phone. lastAskPrompt is read straight after the call and stored on the
+  // turn, so the run report can show it.
+  var lastAskPrompt = '';
+
   function realWebLLMAsk(rec, question, report, note) {
     report = report || function () {};
     return getEnrichEngine(function (p) {
@@ -2456,8 +2472,12 @@
                text: p.text || '' });
     }).then(function (engine) {
       report({ phase: 'running', tokens: 0, partial: '' });
+      var msgs = askMessages(rec, note, question);
+      lastAskPrompt = msgs.map(function (m) {
+        return m.role + ': ' + m.content;
+      }).join('\n---\n');
       return completeWithFallback(engine, {
-        messages: askMessages(rec, note, question),
+        messages: msgs,
         max_tokens: ASK_MAX_TOKENS
       }, report);
     });
@@ -2476,9 +2496,10 @@
   // Every version is a turn, and a turn carries the instruction that asked
   // for it. A hand edit or a restore has no instruction, which is exactly
   // what the model should see: the text changed, nobody asked for it.
-  function addTurn(note, ask, text, by, model) {
+  function addTurn(note, ask, text, by, model, prompt) {
     note.turns = (note.turns || []).concat([{
       ask: ask || null, text: text, by: by, model: model || null,
+      prompt: prompt || null,
       at: new Date().toISOString()
     }]);
     note.text = text;
@@ -2512,13 +2533,14 @@
       if (!rec || rec.deleted) return;
       var model = enrichModelId || chosenModel().f32 || null;
       var note = noteId ? findNote(rec, noteId) : null;
+      var sent = lastAskPrompt;
       if (note) {
-        addTurn(note, q, answer, 'model', model);
+        addTurn(note, q, answer, 'model', model, sent);
         note.ms = Date.now() - t;
       } else {
         note = { id: ulid(), title: q, text: '', by: 'model', model: model,
                  at: null, ms: Date.now() - t, turns: [] };
-        addTurn(note, q, answer, 'model', model);
+        addTurn(note, q, answer, 'model', model, sent);
         rec.notes = (rec.notes || []).concat([note]);
       }
       rec.updatedAt = new Date().toISOString();
@@ -2606,7 +2628,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-22';
+  var APP_VERSION = 'log-v3-23';
   var all = [], query = '';
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -2728,8 +2750,15 @@
 
   function runBlock(r) {
     var e = r.enrichment;
-    if (e.status !== 'done' && e.status !== 'failed') return '';
-    var rows = runRows(e).map(function (kv) {
+    var notes = (r.notes || []).length;
+    // An entry whose labels were never run still has notes worth reporting,
+    // and without this there was no Copy button on exactly the entries that
+    // came out wrong.
+    if (e.status !== 'done' && e.status !== 'failed' && !notes) return '';
+    var extra = notes
+      ? [['notes', notes + (notes === 1 ? ' note' : ' notes') + ' \u00b7 prompt in the copy', '']]
+      : [];
+    var rows = runRows(e).concat(extra).map(function (kv) {
       return '<div class="erun-row"><span>' + esc(kv[0]) + '</span>' +
         '<b' + (kv[2] ? ' class="' + kv[2] + '"' : '') + '>' + esc(kv[1]) + '</b></div>';
     }).join('');
@@ -3678,6 +3707,25 @@
       }).join(' ') || 'none');
       if (e.suggestion) row('withheld', JSON.stringify(e.suggestion).slice(0, 300));
     }
+
+    // Notes go in too. An answer that reads wrong is almost always a
+    // question about the prompt behind it, and until this there was no way
+    // to see one short of a photograph of a phone.
+    (rec.notes || []).forEach(function (n, i) {
+      var last = (n.turns || [])[(n.turns || []).length - 1] || {};
+      lines.push('');
+      lines.push('--- note ' + (i + 1) + ' of ' + rec.notes.length + ' ---');
+      row('asked', n.title);
+      row('by', last.by === 'you' ? 'you' : (last.model || 'the model'));
+      row('versions', String((n.turns || []).length));
+      row('answer', JSON.stringify(n.text));
+      if (last.prompt) {
+        lines.push('prompt sent:');
+        lines.push(last.prompt);
+      } else {
+        row('prompt', 'not recorded');
+      }
+    });
 
     return diagnostics().then(function (d) {
       return lines.join('\n') + '\n\n--- device ---\n' + d;
