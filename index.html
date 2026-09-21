@@ -526,6 +526,7 @@
     </div>
     <p style="margin-bottom:0">
       <button class="linkbtn" id="reenrichBtn" hidden style="padding:8px 0">Re-enrich everything</button>
+      <button class="linkbtn" id="dropModelBtn" hidden style="padding:8px 0">Delete the downloaded model</button>
     </p>
   </section>
 
@@ -1443,15 +1444,16 @@
       f16: 'Llama-3.2-1B-Instruct-q4f16_1-MLC', f32: 'Llama-3.2-1B-Instruct-q4f32_1-MLC' },
     { key: 'qwen-0.5b', label: 'Qwen2.5 0.5B — small (~1GB)',
       f16: 'Qwen2.5-0.5B-Instruct-q4f16_1-MLC', f32: 'Qwen2.5-0.5B-Instruct-q4f32_1-MLC' },
-    { key: 'qwen-1.5b', label: 'Qwen2.5 1.5B — best extraction (~1.6GB)',
-      f16: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC', f32: 'Qwen2.5-1.5B-Instruct-q4f32_1-MLC' },
-    // Notes are where size tells. Extraction leans on the grammar to hold
-    // the shape; prose about a book has no such scaffold — the model has to
-    // know the book and write. 2.9GB against 1.6GB, and WebLLM still marks
-    // it low_resource_required.
-    { key: 'qwen-3b', label: 'Qwen2.5 3B — best notes, largest (~2.9GB)',
-      f16: 'Qwen2.5-3B-Instruct-q4f16_1-MLC', f32: 'Qwen2.5-3B-Instruct-q4f32_1-MLC' }
+    { key: 'qwen-1.5b', label: 'Qwen2.5 1.5B — best extraction, heaviest (~1.6GB)',
+      f16: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC', f32: 'Qwen2.5-1.5B-Instruct-q4f32_1-MLC' }
   ];
+  // Qwen2.5 3B was on this list for one deploy and took the tab down with
+  // it: Chrome's renderer on Android was killed outright — "Aw, Snap!" —
+  // trying to hold 2.9GB of weights. WebLLM marks it low_resource_required
+  // and that flag means nothing here, the same way shader-f16 means nothing.
+  // 1.6GB is the ceiling this phone has actually survived. Do not put a
+  // bigger model back without a device that has loaded one.
+  var REMOVED_MODEL_KEYS = ['qwen-3b'];
   // Qwen 1.5B, not Llama 1B. On a Qualcomm Adreno 7xx the 1B read "I've
   // listened to the audio book The Big Short" as type film, title "film",
   // and nothing else; the 1.5B got the title exactly right, shaped details
@@ -1501,9 +1503,17 @@
     return live || rec;
   }
 
+  // A stored key that no longer exists must land on the default, not on
+  // MODELS[0] — which is the smallest and weakest model, and an arbitrary
+  // place to end up. It is also forgotten, so Settings does not keep showing
+  // a choice that is gone.
   function chosenModel() {
     var key = localStorage.getItem('enrichModel') || DEFAULT_MODEL_KEY;
     for (var i = 0; i < MODELS.length; i++) if (MODELS[i].key === key) return MODELS[i];
+    try { localStorage.removeItem('enrichModel'); } catch (e) {}
+    for (var j = 0; j < MODELS.length; j++) {
+      if (MODELS[j].key === DEFAULT_MODEL_KEY) return MODELS[j];
+    }
     return MODELS[0];
   }
 
@@ -2496,12 +2506,19 @@
   // Every version is a turn, and a turn carries the instruction that asked
   // for it. A hand edit or a restore has no instruction, which is exactly
   // what the model should see: the text changed, nobody asked for it.
+  // The prompt is kept once per note, not once per turn. A turn's prompt
+  // embeds the turns before it, so storing one on each of them wrote the
+  // conversation into the record over and over — into every export and every
+  // file pushed to Dropbox. One copy of the most recent is what the run
+  // report needs, and it is bounded.
+  var PROMPT_KEPT = 2000;
+
   function addTurn(note, ask, text, by, model, prompt) {
     note.turns = (note.turns || []).concat([{
       ask: ask || null, text: text, by: by, model: model || null,
-      prompt: prompt || null,
       at: new Date().toISOString()
     }]);
+    if (prompt) note.prompt = String(prompt).slice(0, PROMPT_KEPT);
     note.text = text;
     note.by = by;
     if (model) note.model = model;
@@ -2628,7 +2645,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-23';
+  var APP_VERSION = 'log-v3-24';
   var all = [], query = '';
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -3563,6 +3580,7 @@
     $('enrichDisableBtn').hidden = !on;
     $('enrichStats').hidden = !on;
     $('reenrichBtn').hidden = !on;
+    $('dropModelBtn').hidden = !on;
     $('enrichNote').textContent = !supported
       ? "Your browser doesn't support on-device AI yet — entries still save and sync normally."
       : 'On-device AI fills in type, title, tags and details. Nothing runs on its own and nothing leaves your phone — enrich an entry from its row when you want it.';
@@ -3719,9 +3737,9 @@
       row('by', last.by === 'you' ? 'you' : (last.model || 'the model'));
       row('versions', String((n.turns || []).length));
       row('answer', JSON.stringify(n.text));
-      if (last.prompt) {
+      if (n.prompt) {
         lines.push('prompt sent:');
-        lines.push(last.prompt);
+        lines.push(n.prompt);
       } else {
         row('prompt', 'not recorded');
       }
@@ -4025,6 +4043,41 @@
     $('enrichError').hidden = true;
     refreshEnrichUI();
     if (enrichmentEnabled()) toast('Model changed');
+  };
+
+  // A download that dies partway leaves gigabytes in the Cache API with
+  // nothing in the app to free them. Chrome killed the tab on a 2.9GB model
+  // and the only way out was clearing the whole site's storage, which takes
+  // the entries with it. The weights are re-downloadable; the entries are not.
+  $('dropModelBtn').onclick = function () {
+    var btn = this;
+    if (!confirm('Delete the model from this device? Entries are untouched. '
+               + 'The next enrichment downloads it again.')) return;
+    btn.disabled = true;
+    discardEnrichEngine();
+    loadWebLLM().then(function (m) {
+      var drop = m.deleteModelAllInfoInCache;
+      if (!drop) throw new Error('This build cannot delete it.');
+      // Every model the app offers, not just the current choice — the one
+      // taking up the room is usually the one that failed.
+      return Promise.all(MODELS.map(function (mod) {
+        return Promise.resolve().then(function () { return drop(mod.f32); })
+          .catch(function () {})
+          .then(function () { return drop(mod.f16); })
+          .catch(function () {});
+      }).concat(REMOVED_MODEL_KEYS.length ? [
+        Promise.resolve()
+          .then(function () { return drop('Qwen2.5-3B-Instruct-q4f32_1-MLC'); })
+          .catch(function () {})
+      ] : []));
+    }).then(function () {
+      toast('Model deleted');
+    }).catch(function (e) {
+      toast(errorText(e).slice(0, 120));
+    }).then(function () {
+      btn.disabled = false;
+      refreshEnrichUI();
+    });
   };
 
   $('reenrichBtn').onclick = function () {

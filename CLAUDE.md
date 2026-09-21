@@ -244,6 +244,27 @@ restaurant and not a book — `validateExtraction` drops. Variants can be compil
 xgrammar wasm is embedded in its npm package, so it needs no weights and no
 GPU, which is the cheapest real check in this whole feature.
 
+**1.6GB is the ceiling this phone has survived.** Qwen2.5 3B was on the
+model list for exactly one deploy. Chrome's renderer on Android was killed
+outright — "Aw, Snap!" — holding 2.9GB of weights, and the tab took the
+whole app with it. WebLLM marks that model `low_resource_required: true`,
+which means as little here as `shader-f16` does. Do not put a bigger model
+back without a device that has actually loaded one. The reasoning that led
+there was still right — extraction leans on the grammar to hold its shape,
+and prose has no such scaffold, so notes are where size would tell — but
+there is no room for it on this phone. That is a real limit on how good a
+note can get, and it should be said plainly rather than worked around with
+another prompt.
+
+A model taken off the list leaves devices holding a stored key that no
+longer resolves. `chosenModel()` falls back to `DEFAULT_MODEL_KEY` and
+forgets the dead key; it used to fall back to `MODELS[0]`, which is the
+smallest and weakest model and an arbitrary place to land. **Settings →
+*Delete the downloaded model*** frees the Cache API for every model the app
+knows, including ones since removed. Before it existed, a download that died
+partway could only be cleared by wiping the site's storage, which takes the
+entries with it.
+
 **The schema is necessary and never sufficient.** Four rounds of closing
 grammar holes ended with `llama-1b` emitting valid, complete JSON that said
 `type: film, title: "film"` on an audiobook note. `qwen-1.5b` on the same

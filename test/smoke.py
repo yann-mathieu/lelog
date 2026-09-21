@@ -3231,6 +3231,55 @@ def test_model_choice_persists(page, base_url):
 
 
 @test
+def test_a_model_that_is_gone_falls_back_to_the_default(page, base_url):
+    """Qwen2.5 3B was on the list for one deploy and Chrome killed the tab
+    loading it. A device left holding that choice has to land on the model
+    that works, not on MODELS[0], which is the smallest and weakest."""
+    page.add_init_script("localStorage.setItem('enrichModel', 'qwen-3b');")
+    boot(page, base_url)
+    open_sheet(page)
+
+    opts = page.eval_on_selector_all(
+        "#enrichModelSel option", "els => els.map(e => e.value)")
+    assert "qwen-3b" not in opts, opts
+    assert page.input_value("#enrichModelSel") == "qwen-1.5b"
+    # And the dead key is forgotten, not left to be resolved again each time.
+    assert page.evaluate("() => localStorage.getItem('enrichModel')") is None
+
+
+@test
+def test_the_downloaded_model_can_be_deleted(page, base_url):
+    """A download that dies partway leaves gigabytes in the Cache API. The
+    only way out used to be clearing the site's storage, which takes the
+    entries with it."""
+    stub_model_layer(page)
+    page.add_init_script("""
+        window.__DROPPED__ = [];
+        const wait = () => new Promise(r => setTimeout(r, 0));
+        window.__LELOG_TEST_WEBLLM__.deleteModelAllInfoInCache = (id) => {
+            window.__DROPPED__.push(id);
+            return wait();
+        };
+    """)
+    page.add_init_script("localStorage.setItem('enrichmentEnabled', '1');")
+    boot(page, base_url)
+    open_sheet(page)
+    page.once("dialog", lambda d: d.accept())
+    page.click("#dropModelBtn")
+    page.wait_for_function("() => window.__DROPPED__.length > 0")
+
+    dropped = page.evaluate("() => window.__DROPPED__")
+    # Every model it offers, not only today's choice — the one filling the
+    # disk is usually the one that failed.
+    assert "Qwen2.5-1.5B-Instruct-q4f32_1-MLC" in dropped, dropped
+    assert "SmolLM2-360M-Instruct-q4f32_1-MLC" in dropped, dropped
+    # Including the one that was taken off the list.
+    assert "Qwen2.5-3B-Instruct-q4f32_1-MLC" in dropped, dropped
+    # The entries are not touched.
+    assert page.evaluate("() => window.__DROPPED__.length") == len(dropped)
+
+
+@test
 def test_version_is_visible_and_matches_the_service_worker(page, base_url):
     """The build id decides what a device is actually running, so it is shown
     at the top of Settings — and it is two constants in two files, which is
