@@ -244,6 +244,22 @@ restaurant and not a book — `validateExtraction` drops. Variants can be compil
 xgrammar wasm is embedded in its npm package, so it needs no weights and no
 GPU, which is the cheapest real check in this whole feature.
 
+**A backgrounded tab does no GPU work, and nothing in a page can change
+that.** Chrome on Android freezes a hidden tab, so a pass stops mid-way and
+whatever the driver says afterwards — a lost device, a pipeline error — is
+the symptom, not the cause. `diagnoseModelLoad` therefore checks
+`hiddenDuringPass` *before* `isDeviceLost`, or the report sends you
+debugging a fault in the phone that is not there. A Web Worker is no escape:
+a worker inside a frozen page is frozen too.
+
+What can be prevented is the ordinary version — you start a pass, put the
+phone down, the screen sleeps and the tab goes with it. `startLive` takes a
+`navigator.wakeLock` screen lock and `stopLive` gives it back; the browser
+releases it on hide, so it is taken again on return to visible. A pass
+begun in an already-hidden tab sets `hiddenDuringPass` at the start rather
+than waiting for an event that will never come. Switching apps is not
+coverable, so the live panel says so while there is still time to act on it.
+
 **1.6GB is the ceiling this phone has survived.** Qwen2.5 3B was on the
 model list for exactly one deploy. Chrome's renderer on Android was killed
 outright — "Aw, Snap!" — holding 2.9GB of weights, and the tab took the

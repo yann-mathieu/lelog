@@ -1411,6 +1411,10 @@
   }
 
   document.addEventListener('visibilitychange', function () {
+    // A pass that was interrupted is remembered, so a failure afterwards can
+    // name the reason instead of reporting whatever the driver said.
+    if (document.hidden && live.startedAt) hiddenDuringPass = true;
+    if (!document.hidden && live.startedAt) takeWakeLock();
     if (!document.hidden) opportunisticSync();
   });
   window.addEventListener('online', function () {
@@ -1700,9 +1704,41 @@
     paintLive();
   }
 
+  // Chrome on Android freezes a backgrounded tab, and a frozen tab does no
+  // GPU work — a pass simply stops mid-way and looks like a hang. Nothing in
+  // the page can prevent that; a Web Worker inside a frozen page is frozen
+  // too. What can be prevented is the ordinary version of it: you start a
+  // pass, put the phone down, the screen sleeps and the tab goes away with
+  // it. A screen wake lock holds that off for as long as the pass runs.
+  var wakeLock = null;
+  var hiddenDuringPass = false;
+
+  function takeWakeLock() {
+    if (!navigator.wakeLock || wakeLock || document.hidden) return;
+    Promise.resolve()
+      .then(function () { return navigator.wakeLock.request('screen'); })
+      .then(function (s) {
+        // The pass may already have finished while the request was in flight.
+        if (!live.startedAt) return s.release();
+        wakeLock = s;
+        s.addEventListener('release', function () { wakeLock = null; });
+      })
+      .catch(function () {});  // Denied or unsupported. The pass still runs.
+  }
+
+  function dropWakeLock() {
+    var s = wakeLock;
+    wakeLock = null;
+    if (s) { try { s.release(); } catch (e) {} }
+  }
+
   function startLive() {
     live = { phase: 'starting', pct: 0, tokens: 0, partial: '', startedAt: Date.now(),
              grammar: null, parse: null, output: null, text: '' };
+    // Not false: a pass started from an already-hidden tab was never going
+    // to run, and that is the case most in need of the explanation.
+    hiddenDuringPass = !!document.hidden;
+    takeWakeLock();
     clearInterval(liveTimer);
     // Ticks the elapsed seconds even while the model is quiet, which is the
     // difference between "working" and "hung" from the outside.
@@ -1712,6 +1748,7 @@
   function stopLive() {
     clearInterval(liveTimer);
     liveTimer = null;
+    dropWakeLock();
     live = { phase: '', pct: 0, tokens: 0, partial: '', startedAt: 0,
              grammar: null, parse: null, output: null, text: '' };
   }
@@ -1946,6 +1983,18 @@
 
   function diagnoseModelLoad(err) {
     var msg = errorText(err);
+    // Backgrounding comes first, because it explains the driver error rather
+    // than being explained by it. Chrome freezes a hidden tab on Android and
+    // the GPU work simply stops; whatever the driver then says about lost
+    // devices and pipelines is the symptom, and sends you off debugging a
+    // fault in your phone that is not there.
+    if (hiddenDuringPass) {
+      return Promise.resolve(' The browser was in the background while this ran.'
+        + ' Chrome freezes a hidden tab on Android and the model stops mid-pass —'
+        + ' nothing in a web page can keep working through that. Press Enrich'
+        + ' again and leave this screen open; the app now keeps the screen awake'
+        + ' for you while a pass runs, so you only need to not switch apps.');
+    }
     if (isDeviceLost(msg)) {
       return Promise.resolve(' Chrome took the GPU device back — usually Android'
         + ' reclaiming memory, or the tab left in the background too long. Not your'
@@ -2645,7 +2694,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-24';
+  var APP_VERSION = 'log-v3-25';
   var all = [], query = '';
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -2985,6 +3034,11 @@
       + '<div class="erun-row"><span>doing</span><b id="evDetail"></b></div>'
       + '<div class="erun-row"><span>elapsed</span><b id="evElapsed"></b></div>'
       + '<pre class="live-stream" id="liveStream" hidden></pre>'
+      // The wake lock covers the screen going to sleep. Switching apps it
+      // cannot cover, and a frozen tab does no GPU work, so say so while
+      // there is still time to act on it rather than afterwards.
+      + '<div class="erun-row"><span>keep</span><b>this app open · '
+        + 'switching apps stops the model</b></div>'
       + '<div class="erun-foot">'
         // margin-left:auto on .act-stop-enrich is for the tile's meta row,
         // where it belongs at the far end. Here it reads as adrift.

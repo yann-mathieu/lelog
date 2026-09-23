@@ -4467,6 +4467,87 @@ def test_a_lost_gpu_device_is_explained_not_pasted(page, base_url):
 
 
 @test
+def test_a_pass_holds_a_screen_wake_lock(page, base_url):
+    """The ordinary way a pass dies: you start it, put the phone down, the
+    screen sleeps and the tab goes with it. The lock is taken for the length
+    of the pass and given back the moment it ends."""
+    stub_model_layer(page)
+    page.add_init_script("""
+        window.__LOCKS__ = 0;
+        window.__RELEASED__ = 0;
+        // navigator.wakeLock is a read-only accessor in Chromium, so a plain
+        // assignment is dropped on the floor and the stub never runs.
+        Object.defineProperty(navigator, 'wakeLock', {
+            configurable: true,
+            get: () => ({
+                request: () => {
+                    window.__LOCKS__++;
+                    return Promise.resolve({
+                        release: () => { window.__RELEASED__++; return Promise.resolve(); },
+                        addEventListener: () => {}
+                    });
+                }
+            })
+        });
+    """)
+    boot(page, base_url)
+    capture(page, "the big short, on audio")
+    enrich(page)
+    wait_for_record(page, lambda r: r["enrichment"]["status"] == "done")
+
+    assert page.evaluate("() => window.__LOCKS__") >= 1, "no wake lock was taken"
+    page.wait_for_function("() => window.__RELEASED__ >= 1")
+
+
+@test
+def test_a_pass_without_wake_lock_support_still_runs(page, base_url):
+    """A browser with no wakeLock, or one that refuses the request, must not
+    take enrichment down with it."""
+    stub_model_layer(page)
+    page.add_init_script("""
+        Object.defineProperty(navigator, 'wakeLock', {
+            configurable: true,
+            get: () => ({ request: () => Promise.reject(new Error('nope')) })
+        });
+    """)
+    boot(page, base_url)
+    capture(page, "the big short, on audio")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "done",
+                          timeout=15000)
+    assert rec, "a refused wake lock stopped the pass"
+
+
+@test
+def test_backgrounding_is_named_as_the_cause_not_the_driver(page, base_url):
+    """Chrome freezes a hidden tab and the GPU work stops. Whatever the
+    driver then says about lost devices is the symptom, and sends you
+    debugging a fault in the phone that is not there."""
+    stub_model_layer(page)
+    page.add_init_script(engine_that_dies_once(DEVICE_LOST))
+    page.add_init_script("""
+        // Report the page as hidden the moment a pass starts, and fire the
+        // event the app listens on, the way Android does on minimise.
+        Object.defineProperty(document, 'hidden', { get: () => window.__HIDDEN__ });
+        window.__HIDDEN__ = false;
+    """)
+    boot(page, base_url)
+    capture(page, "the big short, on audio")
+    # Hidden before the pass starts, which is its own case: a pass begun in a
+    # backgrounded tab was never going to run at all.
+    page.evaluate("() => { window.__HIDDEN__ = true; }")
+    enrich(page)
+
+    rec = wait_for_record(page, lambda r: r["enrichment"]["status"] == "failed")
+    err = rec["enrichment"]["error"]
+    assert "in the background" in err, err
+    # The driver's own story must not be the one told, because it is the
+    # symptom and it points at the wrong repair.
+    assert "took the GPU device back" not in err, err
+
+
+@test
 def test_a_lost_device_does_not_strand_the_engine(page, base_url):
     """The engine was cached for the life of the page and only ever discarded
     when creation failed. One device loss therefore broke enrichment until a
