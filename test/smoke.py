@@ -2721,6 +2721,13 @@ def test_the_note_prompt_asks_about_the_thing_not_the_log_line(page, base_url):
     # 1.5B to keep filling the template in and copy the request into its answer.
     assert opening.rstrip().endswith("List the main characters"), opening
     assert "Question:" not in opening
+    # Qwen2.5-1.5B invented a description of a 2024 memoir out of its title,
+    # was told "that's not true", apologised and handed back the same claim.
+    # Both halves of that are addressed in the standing rules, which go in
+    # the opening message because it is the one always sent.
+    assert "A guess built out of the title is worse than nothing" in opening
+    assert "Never apologise" in opening
+    assert "take what they say as fact" in opening
 
 
 @test

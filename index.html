@@ -2500,7 +2500,10 @@
       + 'sentence only names it; do not describe or summarise the sentence.\n'
       + 'Plain prose, a few sentences. No headings, no preamble, and do not '
       + 'repeat the request back.\n'
-      + 'If you have never heard of it, say only that.\n\n'
+      + 'If you do not know this one, say so and stop. A guess built out of the '
+      + 'title is worse than nothing.\n'
+      + 'If they correct you, take what they say as fact and rewrite around it. '
+      + 'Never apologise, and never hand back a version they just rejected.\n\n'
       + ((note && note.title) || question);
 
     var msgs = [{ role: 'user', content: opening }];
@@ -2694,7 +2697,7 @@
   // ---------- state ----------
   // Must match CACHE in sw.js — that is what actually decides which build a
   // device is serving, and a test asserts the two agree so this can't drift.
-  var APP_VERSION = 'log-v3-25';
+  var APP_VERSION = 'log-v3-26';
   var all = [], query = '';
   var PENCIL_SVG = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>';
   var SPARK_SVG = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3Z"/><path d="M19 15l.7 1.8L21.5 18l-1.8.7L19 20.5l-.7-1.8L16.5 18l1.8-.7L19 15Z"/></svg>';
@@ -3105,7 +3108,7 @@
 
       var redo = noteRedoId === n.id
         ? '<div class="hint-row"><input class="hint-input note-redo" id="noteRedo"'
-            + ' placeholder="Shorter. Focus on the characters\u2026">'
+            + ' placeholder="Shorter. Or tell it what it got wrong\u2026">'
           + '<button class="btn act-note-go" data-id="' + esc(n.id) + '">Go</button></div>'
         : '';
 

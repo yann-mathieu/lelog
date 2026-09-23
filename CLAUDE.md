@@ -244,6 +244,30 @@ restaurant and not a book — `validateExtraction` drops. Variants can be compil
 xgrammar wasm is embedded in its npm package, so it needs no weights and no
 GPU, which is the cheapest real check in this whole feature.
 
+**A 1.5B does not know recent books, and it will not admit it.** The run
+report that finally settled this: "I've listened to the audio book The
+Trading Game, by Gary Stevenson." Gary Stevenson's *The Trading Game* is a
+2024 memoir about his years as a Citibank FX trader. `qwen-1.5b` called it
+"a financial strategy guide that teaches how to navigate the financial
+markets effectively" — invented whole from the title. Told "That's not
+true, think harder", it apologised and handed back the same claim.
+
+Two conclusions, and the first one is the important one. **The prompt was
+not the problem by then**, and three deploys were spent as though it were.
+Qwen2.5's training data predates the book, so no wording reaches a fact the
+model does not hold. Before changing the note prompt again, check whether
+the model could possibly know the thing being asked about. Notes are good
+for what the model actually knows — older or famous books, films, places,
+ideas — and for anything recent the facts have to come from the person, via
+the conversation, which is what the redo box is for. Its placeholder says so.
+
+Second, the apology-and-repeat loop is worth suppressing, and lives in the
+opening message because that is the one always sent: do not apologise, do
+not return a version they just rejected, take a correction as fact, and say
+you do not know rather than guessing from the title. Expect a 1.5B to take
+that last exit rarely — small models almost never do — so it is a mitigation,
+not a fix.
+
 **A backgrounded tab does no GPU work, and nothing in a page can change
 that.** Chrome on Android freezes a hidden tab, so a pass stops mid-way and
 whatever the driver says afterwards — a lost device, a pipeline error — is
